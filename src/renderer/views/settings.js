@@ -25,6 +25,12 @@ export function renderSettings(root, ctx, actions) {
 
   actions.replaceChildren(
     el('button', {
+      class: 'btn btn-ghost btn-sm' + (state.update?.status === 'checking' ? ' is-busy' : ''),
+      type: 'button',
+      disabled: !ctx.api || state.update?.status === 'checking' || state.update?.status === 'downloading' ? true : null,
+      on: { click: () => void ctx.checkForUpdates() },
+    }, [icon('refresh', 13), el('span', { text: state.update?.status === 'checking' ? '检查中…' : '检查更新' })]),
+    el('button', {
       class: 'btn btn-ghost btn-sm',
       type: 'button',
       on: { click: () => ctx.reload('settings') },
@@ -32,11 +38,66 @@ export function renderSettings(root, ctx, actions) {
   );
 
   root.replaceChildren(
+    updateCard(ctx),
     modelLimitsCard(ctx, { modelLimits, inject }),
     gatewayCard(ctx, { gateway, codex }),
     injectCard(ctx, { inject, codex }),
     aboutCard(ctx, { gateway, codex, inject, paths }),
   );
+}
+
+// ============ 软件更新 ==========
+function updateCard(ctx) {
+  const { el, icon, state } = ctx;
+  const update = state.update || {};
+  const current = update.currentVersion || (state.status && state.status.appVersion) || '0.0.0';
+  const hasVersion = !!update.version;
+  const busy = update.status === 'checking' || update.status === 'downloading';
+  const pending = ['available', 'downloaded'].includes(update.status);
+  const statusText = update.status === 'checking'
+    ? '正在检查 GitHub Release…'
+    : update.status === 'latest'
+      ? '当前已是最新版本'
+      : update.status === 'available'
+        ? `检测到新版本 v${update.version}`
+        : update.status === 'downloading'
+          ? `正在下载新版本 · ${Math.round(update.percent || 0)}%`
+          : update.status === 'downloaded'
+            ? '更新已下载，正在准备安装'
+            : update.status === 'error'
+              ? `更新失败：${update.error || '未知错误'}`
+              : update.enabled === false ? '当前运行模式不支持自动更新' : '尚未检查更新';
+  return el('section', { class: 'card' }, [
+    el('header', { class: 'card-head' }, [
+      icon('download', 14),
+      el('span', { class: 'card-title', text: '软件更新' }),
+      el('span', { class: 'chip ' + (pending ? 'chip-warn' : update.status === 'latest' ? 'chip-ok' : ''), text: `当前 v${current}` }),
+      el('span', { class: 'card-desc', text: '启动时只检查，不会自动下载；更新由你确认后开始' }),
+    ]),
+    el('div', { class: 'card-body' }, [
+      el('div', { class: 'setting' }, [
+        el('div', { class: 'setting-main' }, [
+          el('div', { class: 'setting-title', text: statusText }),
+          el('div', { class: 'setting-desc', text: hasVersion && pending
+            ? '可以现在更新，也可以稍后从左侧“设置”旁的更新提示进入。暂不更新不会影响当前版本使用。'
+            : '手动检查会立即请求 GitHub Release；发现新版本后会先询问是否更新。' }),
+        ]),
+        el('div', { class: 'setting-ctl' }, [
+          pending
+            ? el('button', {
+                class: 'btn btn-sm btn-warning',
+                type: 'button',
+                disabled: !ctx.api || busy ? true : null,
+                on: { click: () => void ctx.startUpdateDownload() },
+              }, [icon('download', 13), el('span', { text: update.status === 'downloaded' ? '继续安装' : '立即更新' })])
+            : null,
+        ]),
+      ]),
+      update.status === 'error'
+        ? el('div', { class: 'hint-error', text: '请检查网络连接后再次点击“检查更新”。' })
+        : null,
+    ]),
+  ]);
 }
 
 // ============ 模型上下文 ============

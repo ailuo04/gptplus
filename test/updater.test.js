@@ -17,40 +17,36 @@ test('开发模式跳过自动更新', async () => {
   const controller = setupAutoUpdater({
     app: { isPackaged: false },
     autoUpdater: createUpdater(),
-    dialog: {},
     isDev: true,
   });
   assert.equal(controller.enabled, false);
-  assert.equal(await controller.checkForUpdates(), null);
+  assert.equal((await controller.checkForUpdates()).status, 'disabled');
 });
 
-test('发现更新后自动下载，下载完成后可立即安装', async () => {
+test('发现更新后只记录版本，用户确认后才下载并安装', async () => {
   const updater = createUpdater();
   const logs = [];
   let installed = false;
-  let messageBoxCalls = 0;
+  let downloadCalls = 0;
+  updater.downloadUpdate = async () => { downloadCalls += 1; };
   updater.quitAndInstall = () => { installed = true; };
   const controller = setupAutoUpdater({
-    app: { isPackaged: true },
+    app: { isPackaged: true, getVersion: () => '0.1.0' },
     autoUpdater: updater,
-    dialog: {
-      showMessageBox: async () => {
-        messageBoxCalls += 1;
-        return { response: 0 };
-      },
-    },
     onLog: (entry) => logs.push(entry),
   });
 
   assert.equal(controller.enabled, true);
   await controller.checkForUpdates();
-  updater.emit('update-available');
+  updater.emit('update-available', { version: '0.1.1' });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(typeof updater.downloadUpdate, 'function');
+  assert.equal(downloadCalls, 0);
+  assert.equal(controller.getState().status, 'available');
 
+  await controller.downloadUpdate();
+  assert.equal(downloadCalls, 1);
   updater.emit('update-downloaded');
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(messageBoxCalls, 1);
+  await new Promise((resolve) => setTimeout(resolve, 300));
   assert.equal(installed, true);
-  assert.ok(logs.some((entry) => entry.msg.includes('发现新版本')));
+  assert.ok(logs.some((entry) => entry.msg.includes('等待用户选择')));
 });

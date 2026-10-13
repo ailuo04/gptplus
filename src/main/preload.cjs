@@ -78,9 +78,15 @@ contextBridge.exposeInMainWorld('gptplus', {
   getLogs: () => invoke('gptplus:logs:get'),
   getUsage: () => invoke('gptplus:usage:get'),
 
+  // 软件更新
+  getUpdateState: () => invoke('gptplus:update:state'),
+  checkForUpdates: () => invoke('gptplus:update:check'),
+  downloadUpdate: () => invoke('gptplus:update:download'),
+
   // 事件
   onStatus: (cb) => subscribe('gptplus:status', cb),
   onLog: (cb) => subscribe('gptplus:log', cb),
+  onUpdate: (cb) => subscribe('gptplus:update', cb),
   // 首屏已应用正确主题并完成基础页面渲染，通知主进程显示窗口。
   notifyReady: (theme) => {
     // 等主题样式至少经历一次浏览器绘制，再让主进程显示原生窗口。

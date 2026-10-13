@@ -27,6 +27,7 @@ const ICONS = Object.freeze({
     '<path d="M6.5 6.5A2 2 0 0 0 8 10a2 2 0 0 0 1.7-.9"/><path d="M4.1 4.5C2.6 5.5 1.9 8 1.9 8s2.3 3.6 6.1 3.6c.9 0 1.7-.2 2.4-.6"/>' +
     '<path d="M11 9.9c2-.9 3.1-1.9 3.1-1.9S12 4.4 8.2 4.4c-.5 0-1 .1-1.4.2"/><path d="M2.7 2.7l10.6 10.6"/></svg>',
   copy: SVG_OPEN + '<rect x="5.7" y="5.7" width="7.3" height="7.3" rx="1.6"/><path d="M10.3 5.7V4.3c0-.9-.7-1.6-1.6-1.6H4.3c-.9 0-1.6.7-1.6 1.6v4.4c0 .9.7 1.6 1.6 1.6h1.4"/></svg>',
+  download: SVG_OPEN + '<path d="M8 2.4v7.1M5.2 7.1L8 9.9l2.8-2.8M3 12.3h10"/></svg>',
   check: SVG_OPEN + '<path d="M3.4 8.4l3 3 6.2-6.9"/></svg>',
   x: SVG_OPEN + '<path d="M4.3 4.3l7.4 7.4M11.7 4.3l-7.4 7.4"/></svg>',
   folder: SVG_OPEN + '<path d="M2.4 4.3h4l1.3 1.6h5.9v6.3H2.4z"/></svg>',
@@ -187,7 +188,17 @@ const state = {
   logPaused: false,
   pendingRelaunch: false,
   relaunchNeeded: false,
-  loaded: { status: false, providers: false, models: false, modelLimits: false, gateway: false, inject: false, logs: false, usage: false },
+  update: {
+    enabled: false,
+    status: 'idle',
+    currentVersion: null,
+    version: null,
+    releaseDate: null,
+    percent: 0,
+    error: null,
+    lastCheckedAt: null,
+  },
+  loaded: { status: false, providers: false, models: false, modelLimits: false, gateway: false, inject: false, update: false, logs: false, usage: false },
 };
 
 const THEME_MODES = new Set(['dark', 'light', 'system']);
@@ -246,6 +257,8 @@ let themeSaveBusy = false;
 let networkSaveBusy = false;
 let networkFocusMode = null;
 let observedWriteAt = 0;
+let updatePromptedVersion = null;
+let updateModalSync = null;
 
 const dom = {};
 
@@ -440,6 +453,14 @@ async function loadStatus() {
   state.loaded.status = true;
 }
 
+/** 读取主进程维护的更新状态，确保启动时不会错过可用版本事件。 */
+async function loadUpdate() {
+  if (typeof api.getUpdateState !== 'function') return;
+  const next = await api.getUpdateState();
+  if (next && typeof next === 'object') handleUpdateState(next);
+  state.loaded.update = true;
+}
+
 async function loadProviders() {
   state.providers = await api.listProviders();
   state.loaded.providers = true;
@@ -540,6 +561,7 @@ const RELOAD_PLAN = {
     [loadModelLimits, '模型上下文设置'],
     [loadGateway, '网关状态'],
     [loadInject, '注入状态'],
+    [loadUpdate, '更新状态'],
     [loadStatus, '全局状态'],
   ],
   usage: [[loadUsage, '使用量统计']],
@@ -631,7 +653,7 @@ const VIEW_META = {
     title: '设置',
     sub: '本地网关、Codex 配置写入与客户端重启',
     render: renderSettings,
-    needs: ['modelLimits', 'gateway', 'inject', 'status'],
+    needs: ['modelLimits', 'gateway', 'inject', 'update', 'status'],
   },
 };
 
@@ -646,6 +668,7 @@ function renderChrome() {
   const modelBadge = dom.nav.querySelector('[data-badge="models"]');
   const usageBadge = dom.nav.querySelector('[data-badge="usage"]');
   const gatewayBadge = dom.nav.querySelector('[data-badge="gateway"]');
+  const updateBadge = dom.nav.querySelector('[data-badge="update"]');
   setAnimatedText(providerBadge, s ? String(s.providers) : '–');
   setAnimatedText(modelBadge, s ? String(s.models) : '–');
   const usageRows = Array.isArray(state.usage) && state.usage.length ? state.usage : state.logs;
@@ -655,6 +678,12 @@ function renderChrome() {
     setAnimatedText(gatewayBadge, s ? (running ? '运行' : '停') : '–');
     gatewayBadge.classList.toggle('is-run', running);
     gatewayBadge.classList.toggle('is-off', !!s && !running);
+  }
+  if (updateBadge) {
+    const hasUpdate = ['available', 'downloading', 'downloaded'].includes(state.update?.status);
+    setAnimatedText(updateBadge, hasUpdate ? '新' : '');
+    updateBadge.classList.toggle('is-update', hasUpdate);
+    updateBadge.hidden = !hasUpdate;
   }
 
   // 标题
@@ -799,6 +828,25 @@ function renderSidebarAction() {
       networkOption('direct', '直连', '不使用系统代理，直接连接模型提供商', 'zap'),
     ]),
   ]);
+  const update = state.update || {};
+  const updatePending = ['available', 'downloading', 'downloaded'].includes(update.status);
+  const updateNotice = updatePending
+    ? el('div', { class: 'sidebar-update-wrap' }, [
+        el('div', { class: 'sidebar-update-alert', attrs: { role: 'alert' } }, [
+          icon('zap', 14),
+          el('span', { text: update.status === 'downloading'
+            ? `正在下载新版本 v${update.version || ''}`
+            : `检测到新版本 v${update.version || ''}` }),
+        ]),
+        el('button', {
+          class: 'btn btn-sm sidebar-update-button ' + (update.status === 'available' ? 'btn-warning' : 'btn-ghost'),
+          type: 'button',
+          disabled: !api || update.status !== 'available' ? true : null,
+          title: update.status === 'available' ? '立即下载并安装新版本' : '更新正在处理中',
+          on: { click: () => void startUpdateDownload() },
+        }, [icon('download', 13), el('span', { text: update.status === 'downloading' ? `下载中 ${Math.round(update.percent || 0)}%` : '立即更新' })]),
+      ])
+    : null;
   const button = el('button', {
     class: 'btn btn-sm sidebar-relaunch ' + (pending || needed ? 'btn-danger' : 'btn-ghost'),
     type: 'button',
@@ -834,6 +882,7 @@ function renderSidebarAction() {
       ])
     : null;
   dom.sidebarActions.replaceChildren(
+    ...(updateNotice ? [updateNotice] : []),
     networkControl,
     el('div', { class: 'sidebar-relaunch-wrap' }, [warning, button]),
   );
@@ -842,6 +891,86 @@ function renderSidebarAction() {
     networkFocusMode = null;
     target?.focus();
   }
+}
+
+/** 用户明确选择更新时，开始下载；检测到版本本身不会触发这个函数。 */
+async function startUpdateDownload() {
+  if (!api || !['available', 'downloaded'].includes(state.update?.status)) return;
+  try {
+    const next = await api.downloadUpdate();
+    if (next && typeof next === 'object') handleUpdateState(next);
+    toast('已开始下载更新，下载完成后会自动重启安装', 'info');
+  } catch (err) {
+    toastError(err, '开始更新失败');
+  }
+}
+
+/** 手动检查更新，结果仍通过主进程事件统一回写到全局状态。 */
+async function checkForUpdates() {
+  if (!api || state.update?.status === 'checking' || state.update?.status === 'downloading') return;
+  try {
+    const next = await api.checkForUpdates();
+    if (next && typeof next === 'object') handleUpdateState(next);
+    if (next?.status === 'latest') toast('当前已是最新版本', 'ok');
+    else if (next?.status === 'checking') toast('正在检查更新…', 'info');
+  } catch (err) {
+    toastError(err, '检查更新失败');
+  }
+}
+
+/** 接收主进程更新事件，并在首次发现版本时弹出确认框。 */
+function handleUpdateState(next) {
+  if (!next || typeof next !== 'object') return;
+  state.update = { ...state.update, ...next };
+  renderChrome();
+  updateModalSync?.();
+  if (state.update.status === 'available' && state.update.version
+    && updatePromptedVersion !== state.update.version && !isModalOpen()) {
+    updatePromptedVersion = state.update.version;
+    openUpdateModal();
+  }
+}
+
+/** 更新确认弹窗：暂不更新只关闭弹窗，版本状态会继续留在左侧和设置页。 */
+function openUpdateModal() {
+  const update = state.update || {};
+  const title = el('h2', { text: '发现 gpt++ 新版本' });
+  const sub = el('div', { class: 'modal-sub', text: `当前 v${update.currentVersion || '—'} · 最新 v${update.version || '—'}` });
+  const status = el('div', { class: 'modal-body' });
+  const foot = el('div', { class: 'modal-foot' });
+  const modal = el('section', { class: 'modal', attrs: { role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'update-modal-title' } }, [
+    el('header', { class: 'modal-head' }, [el('div', {}, [el('h2', { text: '发现 gpt++ 新版本', attrs: { id: 'update-modal-title' } }), sub])]),
+    status,
+    foot,
+  ]);
+  const sync = () => {
+    const current = state.update || {};
+    status.replaceChildren(
+      el('div', { class: 'note note-warn' }, [
+        icon(current.status === 'downloading' ? 'download' : 'zap', 15),
+        el('div', { class: 'grow' }, [
+          el('div', { text: current.status === 'downloading' ? `正在下载 v${current.version || ''}` : current.status === 'downloaded' ? '更新已下载，正在准备安装' : `检测到最新版 v${current.version || ''}` }),
+          el('div', { class: 'faint', text: current.status === 'downloading' ? `下载进度 ${Math.round(current.percent || 0)}%，完成后会自动重启安装。` : '现在更新会下载并安装新版本；暂不更新不会影响当前使用。' }),
+        ]),
+      ]),
+    );
+    foot.replaceChildren();
+    if (current.status === 'available') {
+      foot.append(
+        el('button', { class: 'btn btn-ghost', type: 'button', on: { click: closeModal } }, [el('span', { text: '暂不更新' })]),
+        el('button', { class: 'btn btn-warning', type: 'button', on: { click: () => void startUpdateDownload() } }, [icon('download', 13), el('span', { text: '立即更新' })]),
+      );
+    } else if (current.status === 'downloading') {
+      foot.append(el('button', { class: 'btn btn-ghost', type: 'button', on: { click: closeModal } }, [el('span', { text: '后台下载' })]));
+    } else if (current.status === 'downloaded') {
+      foot.append(el('button', { class: 'btn btn-ghost', type: 'button', on: { click: closeModal } }, [el('span', { text: '关闭' })]));
+    } else {
+      foot.append(el('button', { class: 'btn btn-ghost', type: 'button', on: { click: closeModal } }, [el('span', { text: '关闭' })]));
+    }
+  };
+  updateModalSync = sync;
+  openModal(modal, { onClose: () => { updateModalSync = null; } });
+  sync();
 }
 
 /** 标记配置已写入磁盘，提醒用户重启 ChatGPT 客户端读取新配置。 */
@@ -1172,6 +1301,8 @@ const ctx = {
   renderChrome,
   renderCurrent,
   markRelaunchNeeded,
+  checkForUpdates,
+  startUpdateDownload,
   openModal,
   closeModal,
   isModalOpen,
@@ -1204,6 +1335,11 @@ function subscribe() {
     });
   } catch (err) {
     logLocal('warn', `订阅状态事件失败: ${describeError(err)}`);
+  }
+  try {
+    api.onUpdate((next) => handleUpdateState(next));
+  } catch (err) {
+    logLocal('warn', `订阅更新事件失败: ${describeError(err)}`);
   }
   try {
     api.onLog((entry) => {
@@ -1341,6 +1477,7 @@ async function boot() {
 
   // 默认页只依赖全局状态和提供商列表，先画出可交互页面。
   await ensureLoaded('providers');
+  await tryLoad(loadUpdate, '更新状态');
   renderChrome();
   renderCurrent(true, { preserveScrollTop: false });
   syncUsageAutoRefresh();
@@ -1352,6 +1489,7 @@ async function boot() {
   void Promise.all([
     ensureLoaded('models'),
     ensureLoaded('settings'),
+    tryLoad(loadUpdate, '更新状态'),
     tryLoad(loadLogs, '历史日志'),
     tryLoad(loadUsage, '使用量统计'),
   ]).then(() => {

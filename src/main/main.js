@@ -313,32 +313,32 @@ async function boot() {
     appVersion: app.getVersion(),
   });
 
+  // 更新只在收到用户明确操作后下载；启动检测本身只广播可用版本。
+  const updater = setupAutoUpdater({
+    app,
+    autoUpdater,
+    isDev,
+    isSmoke,
+    onState: (state) => broadcast('gptplus:update', state),
+    onLog: (entry) => {
+      ctx.log?.(entry);
+      broadcast('gptplus:log', entry);
+    },
+  });
+
   const { registerIpc } = require('../core/ipc.js');
   registerIpc({
     ipcMain,
     shell,
     dialog,
     ctx,
+    updater,
     onStatus: (s) => broadcast('gptplus:status', s),
     onLog: (e) => broadcast('gptplus:log', e),
   });
 
   createWindow();
   createTray();
-
-  // 正式安装版本从 GitHub Release 后台检查更新；开发和冒烟测试由 updater 自己跳过。
-  const updater = setupAutoUpdater({
-    app,
-    autoUpdater,
-    dialog,
-    getWindow: () => win,
-    isDev,
-    isSmoke,
-    onLog: (entry) => {
-      ctx.log?.(entry);
-      broadcast('gptplus:log', entry);
-    },
-  });
   if (updater.enabled) {
     setTimeout(() => { void updater.checkForUpdates(); }, 8000);
   }

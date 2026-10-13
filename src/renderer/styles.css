@@ -500,6 +500,7 @@ html.is-theme-switching .logs {
 .nav-item.is-active .nav-badge { color: var(--accent-hi); background: var(--accent-soft); }
 .nav-badge.is-run { color: var(--ok); background: var(--ok-soft); }
 .nav-badge.is-off { color: var(--fg-faint); background: var(--bg-inset); }
+.nav-badge.is-update { color: var(--warn); background: var(--warn-soft); border: 1px solid var(--warn-line); }
 .nav-badge.is-updated { animation: badge-update var(--dur-3) var(--ease-pop); }
 
 .sidebar-bottom {
@@ -605,6 +606,21 @@ html.is-theme-switching .logs {
   line-height: 1.45;
   animation: rise var(--dur-3) var(--ease-out) backwards;
 }
+.sidebar-update-wrap { display: flex; flex-direction: column; gap: 6px; }
+.sidebar-update-alert {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 7px 8px;
+  border: 1px solid var(--warn-line);
+  border-radius: var(--radius-sm);
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: var(--fs-meta);
+  font-weight: 650;
+  line-height: 1.45;
+}
+.sidebar-update-button { width: 100%; justify-content: flex-start; }
 
 /* 侧栏底部状态卡 */
 .sidebar-foot {

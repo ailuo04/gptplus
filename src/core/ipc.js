@@ -62,11 +62,11 @@ function withDerived(p) {
 }
 
 /**
- * @param {{ ipcMain:any, shell:any, dialog:any, ctx:any,
+ * @param {{ ipcMain:any, shell:any, dialog:any, ctx:any, updater?:any,
  *           onStatus?:(s:any)=>void, onLog?:(e:any)=>void }} deps
  */
 function registerIpc(deps) {
-  const { ipcMain, shell, dialog, ctx, onStatus = () => {}, onLog = () => {} } = deps;
+  const { ipcMain, shell, dialog, ctx, updater, onStatus = () => {}, onLog = () => {} } = deps;
   const { store } = ctx;
 
   const handle = (channel, fn) => {
@@ -102,6 +102,9 @@ function registerIpc(deps) {
 
   // ---- 状态 ----
   handle('gptplus:status:get', () => ctx.status());
+  handle('gptplus:update:state', () => updater?.getState?.() || { enabled: false, status: 'disabled' });
+  handle('gptplus:update:check', () => updater?.checkForUpdates?.() || { enabled: false, status: 'disabled' });
+  handle('gptplus:update:download', () => updater?.downloadUpdate?.() || { enabled: false, status: 'disabled' });
   handle('gptplus:theme:get', () => store.get().theme);
   handle('gptplus:theme:set', (patch = {}) => {
     const raw = typeof patch === 'string' ? patch : patch && patch.theme;

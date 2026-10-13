@@ -595,6 +595,8 @@ test('设置页覆盖网关、探活、目录与还原注入', () => {
   assert.match(src, /openCodexFolder/, '设置页必须调用 openCodexFolder');
   assert.match(src, /setInject\(\{\s*enabled:\s*false\s*\}\)/, '必须有还原注入动作');
   assert.match(src, /setModelLimits/, '设置页必须调用 setModelLimits');
+  assert.match(src, /checkForUpdates/, '设置页必须提供手动检查更新入口');
+  assert.match(src, /startUpdateDownload/, '设置页必须提供手动安装更新入口');
   assert.match(src, /上下文窗口 Token/, '设置页必须提供上下文窗口设置');
   assert.match(src, /自动压缩阈值 Token/, '设置页必须提供自动压缩设置');
   assert.match(src, /codex\.configPath/, '需要展示 codex.configPath');
@@ -911,8 +913,18 @@ function makeApi(state, calls) {
       return { ok: true };
     },
     getLogs: async () => [],
+    getUpdateState: async () => state.update || { enabled: false, status: 'idle' },
+    checkForUpdates: async () => {
+      calls.push(['checkForUpdates']);
+      return state.update || { enabled: false, status: 'idle' };
+    },
+    downloadUpdate: async () => {
+      calls.push(['downloadUpdate']);
+      return state.update || { enabled: false, status: 'idle' };
+    },
     onStatus: () => () => {},
     onLog: () => () => {},
+    onUpdate: () => () => {},
   };
 }
 
