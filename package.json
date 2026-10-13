@@ -1,0 +1,84 @@
+{
+  "name": "gptplus",
+  "productName": "gpt++",
+  "version": "0.1.0",
+  "description": "为 ChatGPT 桌面客户端管理自定义模型提供商：本地网关 + 模型目录注入",
+  "main": "src/main/main.js",
+  "private": true,
+  "author": "ailuo",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ailuo04/gptplus.git"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9",
+    "undici": "^6.29.0"
+  },
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "pack": "electron-builder --dir",
+    "dist": "node tools/build-release.cjs",
+    "dist:unsigned": "electron-builder --win nsis --publish never",
+    "verify:signature": "node tools/verify-signature.cjs",
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.js\"",
+    "test:core": "node --test test/core.test.js",
+    "test:gateway": "node --test test/gateway.test.js",
+    "test:renderer": "node --test test/renderer.test.js",
+    "verify": "node tools/verify-e2e.cjs",
+    "verify:picker": "node tools/verify-picker.cjs",
+    "verify:final": "node tools/verify-final.cjs",
+    "smoke": "electron . --smoke-dump probe/smoke.json --smoke-shot probe/smoke.png"
+  },
+  "devDependencies": {
+    "electron": "38.4.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.ailuo.gptplus",
+    "productName": "gpt++",
+    "executableName": "gpt-plus",
+    "publish": {
+      "provider": "github",
+      "owner": "ailuo04",
+      "repo": "gptplus",
+      "releaseType": "release"
+    },
+    "asar": true,
+    "compression": "maximum",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "package.json",
+      "!src/**/*.map"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "src/main/assets/app-icon-256.png",
+      "artifactName": "gpt-plus-${version}-setup.${ext}",
+      "requestedExecutionLevel": "asInvoker",
+      "signExecutable": true
+    },
+    "nsis": {
+      "include": "build/installer.nsh",
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "gpt++",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}

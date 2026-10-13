@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' file:; style-src 'self' file: 'unsafe-inline'; img-src 'self' data:; font-src 'self' file:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gpt++ · ChatGPT 自定义模型注入</title>
+<script src="startup-theme.js"></script>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="app">
+
+  <!-- 左侧导航 -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">g++</div>
+      <div class="brand-text">
+        <strong>gpt++</strong>
+        <span>自定义模型注入</span>
+      </div>
+    </div>
+
+    <nav class="nav" id="nav" aria-label="主导航">
+      <button type="button" class="nav-item" data-view="providers">
+        <span class="nav-label">提供商</span>
+        <span class="nav-badge" data-badge="providers">0</span>
+      </button>
+      <button type="button" class="nav-item" data-view="models">
+        <span class="nav-label">模型</span>
+        <span class="nav-badge" data-badge="models">0</span>
+      </button>
+      <button type="button" class="nav-item" data-view="usage">
+        <span class="nav-label">使用量</span>
+        <span class="nav-badge" data-badge="usage">0</span>
+      </button>
+      <button type="button" class="nav-item" data-view="settings">
+        <span class="nav-label">设置</span>
+        <span class="nav-badge" data-badge="gateway">停</span>
+      </button>
+    </nav>
+
+    <div class="sidebar-bottom">
+      <div class="sidebar-foot" id="sidebar-foot">
+        <span class="muted">正在读取本地状态…</span>
+      </div>
+
+      <div class="sidebar-actions" id="sidebar-actions"></div>
+    </div>
+  </aside>
+
+  <!-- 主工作区：标题栏 / 内容 / 日志抽屉 / 状态栏 -->
+  <div class="workspace">
+    <header class="topbar">
+      <div class="topbar-text">
+        <h1 id="view-title">提供商</h1>
+        <p id="view-sub">管理你自己的模型接口</p>
+      </div>
+      <div class="topbar-actions" id="view-actions"></div>
+    </header>
+
+    <main class="content" id="view" tabindex="-1">
+      <div class="booting" id="booting">
+        <div class="booting-spinner" aria-hidden="true"></div>
+        <p class="booting-title">正在加载界面…</p>
+        <p class="booting-hint">
+          若这段文字一直停留在这里，说明模块脚本没有执行：请用 <code>Ctrl+Shift+I</code> 打开开发者工具，
+          查看 Console 里的报错（常见原因是 file:// 下的 ES module 加载限制，或 app.js 抛出了异常）。
+        </p>
+      </div>
+    </main>
+
+    <section class="logs" id="log-drawer" aria-label="运行日志">
+      <div class="logs-head">
+        <span class="logs-title">运行日志</span>
+        <span class="logs-count" id="log-count">0 条</span>
+        <div class="logs-filters" id="log-filters" role="group" aria-label="日志级别过滤">
+          <button type="button" class="filter-btn is-active" data-filter="all">全部</button>
+          <button type="button" class="filter-btn" data-filter="info">信息</button>
+          <button type="button" class="filter-btn" data-filter="warn">警告</button>
+          <button type="button" class="filter-btn" data-filter="error">错误</button>
+        </div>
+        <div class="logs-actions">
+          <button type="button" class="btn btn-ghost btn-sm logs-autoscroll muted" id="log-autoscroll" title="点击恢复自动滚动">自动滚动</button>
+          <button type="button" class="btn btn-danger btn-sm" id="log-clear">清空</button>
+          <button type="button" class="btn btn-icon" id="log-close" title="收起日志" aria-label="收起日志"></button>
+        </div>
+      </div>
+      <div class="log-list" id="log-list"></div>
+    </section>
+
+    <footer class="statusbar">
+      <div class="flow" id="flow"></div>
+      <div class="statusbar-right">
+        <div id="theme-control" aria-label="界面主题"></div>
+        <span class="build-tag" id="build-tag"></span>
+        <button type="button" class="btn btn-ghost btn-sm" id="log-toggle" aria-expanded="false">
+          <span id="log-toggle-label">运行日志</span>
+          <span class="badge" id="log-toggle-count">0</span>
+        </button>
+      </div>
+    </footer>
+  </div>
+
+</div>
+
+<!-- 提供商编辑表单 / 确认框挂载点（app.js 构建，全部用 textContent 写入） -->
+<div id="modal-root"></div>
+
+<!-- 轻提示 -->
+<div id="toast-root" class="toast-root" role="status" aria-live="polite"></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

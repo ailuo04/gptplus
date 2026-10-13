@@ -1,0 +1,856 @@
+// 模型页：把「提供商 → 本地网关 → ChatGPT 模型选择器」这条链路摆在一个界面里，
+// 链路末端的开关就是注入总开关；下面的选择器决定客户端默认用哪个模型。
+
+const viewState = {
+  filter: '',
+  onlyEnabled: false,
+  busy: false,
+  warn: null, // { text, action: 'providers' | 'settings' }
+};
+
+const dragState = {
+  row: null,
+  rows: [],
+  startIndex: -1,
+  targetIndex: -1,
+  startY: 0,
+  rowHeight: 0,
+  rowTops: [],
+  moveFrame: 0,
+  lastY: 0,
+  finish: null,
+};
+
+/** 渲染模型页 */
+export function renderModels(root, ctx, actions) {
+  const { el, icon, state } = ctx;
+  const models = state.models || [];
+  const inject = state.inject || (state.status && state.status.inject) || { enabled: false, defaultModel: null };
+  const gateway = state.gateway || (state.status && state.status.gateway) || {};
+  const providerCount = (state.status && state.status.providers) || (state.providers || []).length || 0;
+
+  // ---- 标题栏动作 ----
+  actions.replaceChildren(
+    el('button', {
+      class: 'btn btn-ghost btn-sm',
+      type: 'button',
+      on: { click: () => ctx.reload('models') },
+    }, [icon('refresh', 13), el('span', { text: '刷新' })]),
+    el('button', {
+      class: 'btn btn-ghost btn-sm',
+      type: 'button',
+      title: '在资源管理器中打开 ~/.codex',
+      on: { click: () => openCodexFolder(ctx) },
+    }, [icon('folder', 13), el('span', { text: '打开 Codex 目录' })]),
+  );
+
+  if (!models.length) {
+    root.replaceChildren(emptyState(ctx));
+    return;
+  }
+
+  const enabledModels = models.filter((m) => m.enabled);
+
+  // ---- 接线三节点（本页的记忆点：一眼看清链路断在哪一环） ----
+  const wiring = el('div', { class: 'wiring' }, [
+    wireNode(ctx, {
+      step: '1 · 提供商',
+      value: `${providerCount} 个`,
+      detail: `提供 ${models.length} 个模型`,
+      tone: providerCount ? 'on' : 'off',
+    }),
+    el('div', { class: 'wire-link' + (gateway.running && inject.enabled ? ' is-live' : '') }, [icon('chevronDown', 14)]),
+    wireNode(ctx, {
+      step: '2 · 本地网关',
+      value: gateway.running ? `运行中 :${gateway.port}` : gateway.enabled ? '已启用 · 未运行' : '未启用',
+      detail: gateway.running ? gateway.url || `127.0.0.1:${gateway.port}` : 'ChatGPT 通过它访问你的模型',
+      tone: gateway.running ? 'on' : gateway.enabled ? 'warn' : 'off',
+    }),
+    el('div', { class: 'wire-link' + (inject.enabled ? ' is-live' : '') }, [icon('chevronDown', 14)]),
+    injectNode(ctx, { inject, gateway, enabledModels }),
+  ]);
+
+  // ---- 注入状态说明（具体、有信息量的一句话） ----
+  const summary = inject.enabled
+    ? el('div', { class: 'note note-ok' }, [
+        icon('check', 15),
+        el('div', { class: 'grow' }, [
+          el('div', { text: `已注入 ${enabledModels.length} 个模型 · 重启 ChatGPT 客户端后可在模型选择器中看到` }),
+          el('div', {
+            class: 'faint',
+            text: inject.catalogPath
+              ? `模型目录：${ctx.shortPath(inject.catalogPath)} · 写入 Codex 配置前会自动备份`
+              : '模型目录已写入 Codex 配置',
+          }),
+        ]),
+      ])
+    : el('div', { class: 'note' }, [
+        icon('info', 15),
+        el('div', { class: 'grow' }, [
+          el('div', { text: `未注入 · ChatGPT 仍显示内置的官方模型，这里有 ${models.length} 个自建模型等着接入` }),
+          el('div', { class: 'faint', text: '打开上面第三个节点的开关，gpt++ 会把模型目录写进 Codex 配置并指向本地网关' }),
+        ]),
+      ]);
+
+  const warnBox = viewState.warn ? warningNote(ctx) : null;
+
+  // ---- 默认模型 ----
+  // store 里真正写进 Codex `model` 键的值；没设过就是空。
+  const storedDefault = inject.defaultModel || '';
+  // 下拉框只是「预选」：后端在注入时会自动取第一个启用的模型，这里保持一致，
+  // 不能拿 models[0]（可能是停用模型）当默认值去标「当前默认」。
+  const defaultModel =
+    storedDefault || (models.find((m) => m.enabled !== false) || {}).slug || '';
+  const select = modelPicker(ctx, models, defaultModel, setDefaultModel);
+
+  const defaultCard = el('section', { class: 'card' }, [
+    el('header', { class: 'card-head' }, [
+      icon('zap', 14),
+      el('span', { class: 'card-title', text: '默认模型' }),
+      el('span', { class: 'card-desc', text: 'ChatGPT 新建对话时默认选中它' }),
+    ]),
+    el('div', { class: 'card-body' }, [
+      el('div', { class: 'toolbar' }, [
+        el('span', { class: 'grow', style: { 'max-width': '460px' } }, [select]),
+        el('span', { class: 'chip chip-mono', title: '写入 Codex 配置的 model 键', text: storedDefault || '未设置' }),
+      ]),
+      el('div', {
+        class: 'hint',
+        text: '对应 Codex 配置里的 model = "<slug>"；如果客户端里手动选了别的模型，以你在客户端里的选择为准。',
+      }),
+    ]),
+  ]);
+
+  // replaceChildren 会把 null 当成文本节点插入（渲染出字面量 "null"），这里显式过滤
+  root.replaceChildren(...[wiring, warnBox, summary, defaultCard, modelTable(ctx, models, storedDefault)].filter(Boolean));
+}
+
+/**
+ * 自绘默认模型选择器：保留原生选择器的键盘语义，但让展开面板跟随应用主题。
+ * @param {{el:Function, icon:Function}} ctx 渲染上下文
+ * @param {Array<{slug:string,label:string,providerName:string,enabled?:boolean}>} models 模型列表
+ * @param {string} selectedSlug 当前模型 slug
+ * @param {(ctx:any, slug:string) => Promise<void>} onChange 选中后的保存回调
+ * @returns {HTMLElement}
+ */
+function modelPicker(ctx, models, selectedSlug, onChange) {
+  const { el, icon } = ctx;
+  const pickerId = 'default-model-options';
+  const selectedIndex = Math.max(0, models.findIndex((model) => model.slug === selectedSlug));
+  let activeIndex = selectedIndex;
+  let open = false;
+
+  const button = el('button', {
+    class: 'model-picker-trigger',
+    type: 'button',
+    attrs: {
+      role: 'combobox',
+      'aria-label': '默认模型',
+      'aria-haspopup': 'listbox',
+      'aria-expanded': 'false',
+      'aria-controls': pickerId,
+    },
+  });
+  const value = el('span', { class: 'model-picker-value' });
+  const valueLabel = el('strong', { class: 'model-picker-label' });
+  const valueProvider = el('span', { class: 'model-picker-provider' });
+  const chevron = el('span', { class: 'model-picker-chevron' }, [icon('chevronDown', 15)]);
+  value.append(valueLabel, valueProvider);
+  button.append(value, chevron);
+
+  const menu = el('div', {
+    class: 'model-picker-menu',
+    id: pickerId,
+    attrs: { role: 'listbox', 'aria-label': '可用模型' },
+  });
+  const wrapper = el('div', { class: 'model-picker' }, [button, menu]);
+
+  function updateValue(index) {
+    const model = models[index] || models[0] || {};
+    valueLabel.textContent = model.label || model.slug || '未选择模型';
+    valueProvider.textContent = model.providerName || '';
+    button.setAttribute('aria-activedescendant', `${pickerId}-${index}`);
+  }
+
+  function updateActive(index) {
+    activeIndex = Math.max(0, Math.min(models.length - 1, index));
+    for (const option of menu.children) {
+      const isActive = Number(option.dataset.index) === activeIndex;
+      option.classList.toggle('is-active', isActive);
+      if (isActive) option.scrollIntoView?.({ block: 'nearest' });
+    }
+    button.setAttribute('aria-activedescendant', `${pickerId}-${activeIndex}`);
+  }
+
+  function close() {
+    if (!open) return;
+    open = false;
+    wrapper.classList.remove('is-open');
+    button.setAttribute('aria-expanded', 'false');
+    document.removeEventListener?.('pointerdown', onDocumentPointerDown, true);
+  }
+
+  function choose(index) {
+    const model = models[index];
+    if (!model) return;
+    close();
+    button.focus();
+    void onChange(ctx, model.slug);
+  }
+
+  function openMenu() {
+    if (open || !models.length) return;
+    open = true;
+    wrapper.classList.add('is-open');
+    button.setAttribute('aria-expanded', 'true');
+    updateActive(selectedIndex);
+    document.addEventListener?.('pointerdown', onDocumentPointerDown, true);
+  }
+
+  function onDocumentPointerDown(event) {
+    if (!wrapper.contains?.(event.target)) close();
+  }
+
+  models.forEach((model, index) => {
+    const option = el('button', {
+      class: 'model-picker-option',
+      type: 'button',
+      id: `${pickerId}-${index}`,
+      data: { index },
+      attrs: { role: 'option', 'aria-selected': model.slug === selectedSlug ? 'true' : 'false' },
+      on: {
+        click: () => choose(index),
+        pointerenter: () => updateActive(index),
+      },
+    }, [
+      el('span', { class: 'model-picker-option-main' }, [
+        el('span', { class: 'model-picker-option-label', text: model.label || model.slug }),
+        el('span', { class: 'model-picker-option-provider', text: model.providerName || '未标记提供商' }),
+      ]),
+      model.enabled === false
+        ? el('span', { class: 'model-picker-option-state', text: '已停用' })
+        : el('span', {
+            class: `model-picker-option-check${model.slug === selectedSlug ? ' is-selected' : ''}`,
+          }, [icon('check', 14)]),
+    ]);
+    menu.appendChild(option);
+  });
+
+  button.addEventListener('click', () => (open ? close() : openMenu()));
+  button.addEventListener('keydown', (event) => {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (!open) openMenu();
+      updateActive(activeIndex + (event.key === 'ArrowDown' ? 1 : -1));
+      return;
+    }
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      if (open) choose(activeIndex);
+      else openMenu();
+      return;
+    }
+    if (event.key === 'Escape') close();
+    if (event.key === 'Home' && open) {
+      event.preventDefault();
+      updateActive(0);
+    }
+    if (event.key === 'End' && open) {
+      event.preventDefault();
+      updateActive(models.length - 1);
+    }
+  });
+
+  updateValue(selectedIndex);
+  updateActive(selectedIndex);
+  return wrapper;
+}
+
+function wireNode(ctx, { step, value, detail, tone }) {
+  const { el } = ctx;
+  return el('div', { class: 'wire-node' }, [
+    el('div', { class: 'wire-eyebrow', text: step }),
+    el('div', { class: 'wire-value' }, [
+      el('span', { class: 'dot ' + (tone === 'on' ? 'dot-ok' : tone === 'warn' ? 'dot-warn' : 'dot-off') }),
+      el('span', { class: 'wire-num ellipsis', text: value }),
+    ]),
+    el('div', { class: 'wire-detail ellipsis', title: detail, text: detail }),
+  ]);
+}
+
+/** 第三个节点：ChatGPT 客户端 + 注入总开关 */
+function injectNode(ctx, { inject, gateway, enabledModels }) {
+  const { el } = ctx;
+  const on = !!inject.enabled;
+  const switchBtn = el('button', {
+    class: 'switch',
+    type: 'button',
+    role: 'switch',
+    disabled: viewState.busy ? true : null,
+    attrs: {
+      'aria-checked': on ? 'true' : 'false',
+      'aria-label': '注入到 ChatGPT 模型选择器',
+      'aria-busy': viewState.busy ? 'true' : null,
+    },
+    on: { click: () => void toggleInject(ctx, !on) },
+  });
+  return el('div', { class: 'wire-node is-codex' + (on ? ' is-on' : '') }, [
+    el('div', { class: 'wire-eyebrow', text: '3 · ChatGPT 客户端' }),
+    el('div', { class: 'wire-value' }, [
+      el('span', { class: 'dot ' + (on ? 'dot-warn' : 'dot-off') }),
+      el('span', { class: 'ellipsis', text: on ? `已注入 ${enabledModels.length} 个模型` : '未接入（官方模型）' }),
+      el('span', { class: 'right' }),
+      switchBtn,
+    ]),
+    el('div', {
+      class: 'wire-detail ellipsis',
+      text: on
+        ? '重启客户端后出现在模型选择器里'
+        : gateway.running
+          ? '打开开关即可写入模型清单'
+          : '需要先让本地网关运行起来',
+    }),
+  ]);
+}
+
+function warningNote(ctx) {
+  const { el, icon } = ctx;
+  const warn = viewState.warn;
+  const to = warn.action === 'settings' ? 'settings' : 'providers';
+  return el('div', { class: 'note note-warn' }, [
+    icon('alert', 15),
+    el('div', { class: 'grow' }, [
+      el('div', { text: warn.text }),
+      el('div', { class: 'note-actions' }, [
+        el('button', {
+          class: 'btn btn-sm btn-warning',
+          type: 'button',
+          on: {
+            click: () => {
+              viewState.warn = null;
+              ctx.navigate(to);
+            },
+          },
+        }, [el('span', { text: to === 'settings' ? '去设置' : '去添加提供商' })]),
+        el('button', {
+          class: 'btn btn-sm btn-ghost',
+          type: 'button',
+          on: {
+            click: () => {
+              viewState.warn = null;
+              ctx.renderCurrent(true);
+            },
+          },
+        }, [el('span', { text: '知道了' })]),
+      ]),
+    ]),
+  ]);
+}
+
+function modelTable(ctx, models, defaultModel) {
+  const { el, icon } = ctx;
+  const rowsBox = el('div', { class: 'table' });
+  const countLabel = el('span', { class: 'card-desc' });
+
+  function refresh() {
+    const visible = models.filter((m) => {
+      if (viewState.onlyEnabled && !m.enabled) return false;
+      if (!viewState.filter) return true;
+      return (
+        String(m.label || '').toLowerCase().includes(viewState.filter) ||
+        String(m.slug || '').toLowerCase().includes(viewState.filter) ||
+        String(m.modelId || '').toLowerCase().includes(viewState.filter) ||
+        String(m.providerName || '').toLowerCase().includes(viewState.filter)
+      );
+    });
+    countLabel.textContent = `显示 ${visible.length} / ${models.length} 个`;
+
+    const head = el('div', { class: 'trow thead' }, [
+      el('span', { text: '显示名' }),
+      el('span', { text: 'slug（写进 ChatGPT 的模型 ID）' }),
+      el('span', { text: '来源提供商' }),
+      el('span', { text: '状态' }),
+      el('span', { text: '推理' }),
+      el('span', { text: '默认' }),
+      el('span', { text: '排序' }),
+    ]);
+
+    const rows = visible.map((m, index) => {
+      const isDefault = m.slug === defaultModel;
+      const row = el('div', {
+        class: 'trow tbody-row' + (m.enabled ? '' : ' is-off') + (isDefault ? ' is-default' : ''),
+        data: { orderKey: m.orderKey || `${m.providerId}::${m.modelId}` },
+      }, [
+        el('div', { class: 'cell-label', title: m.label || m.modelId, text: m.label || m.modelId }),
+        el('div', { class: 'cell-slug' }, [
+          el('span', { class: 'slug-text', title: m.slug, text: m.slug }),
+          el('button', {
+            class: 'btn btn-icon',
+            type: 'button',
+            title: '复制 slug',
+            attrs: { 'aria-label': '复制 slug' },
+            on: { click: () => ctx.copyText(m.slug, ' slug') },
+          }, [icon('copy', 12)]),
+        ]),
+        el('div', { class: 'cell-provider', title: m.providerName, text: m.providerName }),
+        el('div', {}, [modelSwitch(ctx, m)]),
+        el('div', {}, [
+          m.reasoning
+            ? el('span', { class: 'chip chip-accent', text: '推理' })
+            : el('span', { class: 'faint', text: '—' }),
+        ]),
+        el('div', {}, [
+          isDefault
+            ? el('span', { class: 'chip chip-accent', text: '当前默认' })
+            : el('button', {
+                class: 'btn btn-sm btn-accent',
+                type: 'button',
+                // 停用模型当默认会被后端静默换成别的 slug，界面提示与实际写入不符；
+                // 这里直接不给按钮。
+                disabled: viewState.busy || !m.enabled ? true : null,
+                title: m.enabled ? '设为默认' : '该模型已停用，不能设为默认',
+                on: { click: () => void setDefaultModel(ctx, m.slug) },
+              }, [el('span', { text: '设为默认' })]),
+        ]),
+        el('div', { class: 'model-order-actions' }),
+      ]);
+      row.lastElementChild.appendChild(dragHandle(ctx, row, visible, index));
+      return row;
+    });
+
+    if (!rows.length) {
+      rowsBox.replaceChildren(
+        el('div', { class: 'log-empty' }, [
+          el('div', { text: '没有匹配的模型' }),
+          el('div', { class: 'faint', text: '清空搜索框，或取消「只看已启用」' }),
+        ]),
+      );
+      return;
+    }
+    rowsBox.replaceChildren(head, ...rows);
+    if (!viewState.filter && !viewState.onlyEnabled) {
+      bindDragRows(ctx, rowsBox, visible, rows);
+    }
+  }
+
+  const searchInput = el('input', {
+    class: 'input',
+    type: 'search',
+    value: viewState.filter,
+    placeholder: '搜索模型显示名、slug 或提供商',
+    attrs: { spellcheck: 'false', 'aria-label': '搜索模型' },
+    on: {
+      input: (e) => {
+        viewState.filter = e.target.value.trim().toLowerCase();
+        refresh();
+      },
+    },
+  });
+
+  const onlyCheck = el('input', {
+    type: 'checkbox',
+    checked: viewState.onlyEnabled ? true : null,
+    on: {
+      change: (e) => {
+        viewState.onlyEnabled = e.target.checked;
+        refresh();
+      },
+    },
+  });
+
+  refresh();
+
+  return el('section', { class: 'card' }, [
+    el('header', { class: 'card-head' }, [
+      icon('box', 14),
+      el('span', { class: 'card-title', text: '全部模型' }),
+      countLabel,
+      el('span', { class: 'right' }),
+      el('label', { class: 'check' }, [onlyCheck, el('span', { text: '只看已启用' })]),
+    ]),
+    el('div', { class: 'card-body' }, [
+      el('div', { class: 'toolbar' }, [searchInput]),
+      rowsBox,
+      el('div', {
+        class: 'hint',
+        text: 'slug 形如 <渠道名>__<modelId>，网关按它反查上游提供商与真实模型名。按住任意模型行右侧把手拖动即可调序；状态开关和排序会立即保存。',
+      }),
+    ]),
+  ]);
+}
+
+function emptyState(ctx) {
+  const { el, icon } = ctx;
+  return el('div', { class: 'empty' }, [
+    el('div', { class: 'empty-glyph' }, [icon('box', 20)]),
+    el('div', { class: 'empty-title', text: '还没有可注入的模型' }),
+    el('div', {
+      class: 'empty-text',
+      text: '先添加一个提供商（Base URL + API Key），填上模型 ID 或点「从 /models 拉取」；保存后模型会出现在这里，再一键注入 ChatGPT 的模型选择器。',
+    }),
+    el('div', { class: 'empty-actions' }, [
+      el('button', {
+        class: 'btn btn-primary',
+        type: 'button',
+        on: { click: () => ctx.openProviderForm(null) },
+      }, [icon('plus', 13), el('span', { text: '添加提供商' })]),
+      el('button', {
+        class: 'btn btn-ghost',
+        type: 'button',
+        on: { click: () => ctx.navigate('providers') },
+      }, [el('span', { text: '返回提供商列表' })]),
+    ]),
+  ]);
+}
+
+function modelSwitch(ctx, model) {
+  const { el } = ctx;
+  const available = model.providerEnabled !== false;
+  const on = model.enabled && available;
+  return el('button', {
+    class: 'model-switch switch-table',
+    type: 'button',
+    role: 'switch',
+    disabled: viewState.busy || !available ? true : null,
+    title: available ? (on ? '停用模型' : '启用模型') : '请先启用提供商',
+    attrs: { 'aria-checked': on ? 'true' : 'false', 'aria-label': (on ? '停用' : '启用') + ' ' + (model.label || model.modelId) },
+    on: { click: () => void toggleModel(ctx, model, !on) },
+  });
+}
+
+function dragHandle(ctx, row, models, index) {
+  const { el } = ctx;
+  return el('button', {
+    class: 'btn btn-icon model-drag-handle',
+    type: 'button',
+    disabled: viewState.busy || models.length < 2 ? true : null,
+    title: '按住拖动调整模型顺序',
+    attrs: { 'aria-label': `拖动第 ${index + 1} 个模型调整顺序`, 'tabindex': '-1' },
+    on: {
+      pointerdown: (event) => beginModelDrag(ctx, event, row),
+    },
+  }, [el('span', { class: 'drag-grip', text: '::' })]);
+}
+
+/** 计算拖动项插入目标位置后的完整顺序。 */
+export function reorderModelKeys(keys, fromIndex, toIndex) {
+  const next = Array.isArray(keys) ? keys.slice() : [];
+  if (fromIndex < 0 || fromIndex >= next.length || toIndex < 0 || toIndex >= next.length) return next;
+  const [item] = next.splice(fromIndex, 1);
+  next.splice(toIndex, 0, item);
+  return next;
+}
+
+function bindDragRows(ctx, rowsBox, models, rows) {
+  rows.forEach((row) => {
+    row.addEventListener('pointerdown', (event) => {
+      if (event.target && event.target.closest && event.target.closest('button')) return;
+      beginModelDrag(ctx, event, row);
+    });
+  });
+  rowsBox.addEventListener('pointerleave', () => {
+    if (dragState.row && dragState.row.parentNode === rowsBox) scheduleDragFrame(ctx);
+  });
+}
+
+function beginModelDrag(ctx, event, row) {
+  if (viewState.busy || dragState.row || event.button !== undefined && event.button !== 0) return;
+  const rowsBox = row.parentNode;
+  const rows = rowsBox ? Array.from(rowsBox.children).filter((child) => child.classList.contains('tbody-row')) : [];
+  const startIndex = rows.indexOf(row);
+  if (!rowsBox || startIndex < 0 || rows.length < 2) return;
+  const rect = row.getBoundingClientRect();
+  dragState.row = row;
+  dragState.rows = rows;
+  dragState.startIndex = startIndex;
+  dragState.targetIndex = startIndex;
+  dragState.startY = event.clientY;
+  dragState.lastY = event.clientY;
+  dragState.rowHeight = rect.height || row.offsetHeight || 1;
+  dragState.rowTops = rows.map((item) => item.getBoundingClientRect().top);
+  dragState.finish = () => finishModelDrag(ctx, rowsBox);
+  row.classList.add('is-dragging');
+  row.setPointerCapture?.(event.pointerId);
+  rowsBox.classList.add('is-dragging-list');
+  rowsBox.addEventListener('pointermove', onModelDragMove);
+  rowsBox.addEventListener('pointerup', dragState.finish, { once: true });
+  rowsBox.addEventListener('pointercancel', dragState.finish, { once: true });
+  event.preventDefault?.();
+}
+
+function onModelDragMove(event) {
+  if (!dragState.row) return;
+  dragState.lastY = event.clientY;
+  scheduleDragFrame();
+  event.preventDefault?.();
+}
+
+function scheduleDragFrame(ctx) {
+  if (!dragState.row || dragState.moveFrame) return;
+  const raf = typeof window !== 'undefined' && window.requestAnimationFrame;
+  if (typeof raf === 'function') {
+    dragState.moveFrame = raf(() => {
+      dragState.moveFrame = 0;
+      updateDragVisual(ctx);
+    });
+  } else {
+    updateDragVisual(ctx);
+  }
+}
+
+function updateDragVisual(ctx) {
+  if (!dragState.row) return;
+  const rows = dragState.rows;
+  const draggedY = dragState.lastY - dragState.startY;
+  let targetIndex = dragState.startIndex;
+  for (let index = 0; index < dragState.rowTops.length; index += 1) {
+    if (index === dragState.startIndex) continue;
+    const midpoint = dragState.rowTops[index] + dragState.rowHeight / 2;
+    if (dragState.lastY < midpoint) {
+      targetIndex = index;
+      break;
+    }
+    targetIndex = index;
+  }
+  dragState.targetIndex = targetIndex;
+  rows.forEach((row, index) => {
+    if (index === dragState.startIndex) {
+      row.style.setProperty('transform', `translateY(${draggedY}px) scale(1.015)`);
+      return;
+    }
+    let offset = 0;
+    if (dragState.targetIndex > dragState.startIndex && index > dragState.startIndex && index <= dragState.targetIndex) {
+      offset = -dragState.rowHeight;
+    } else if (dragState.targetIndex < dragState.startIndex && index >= dragState.targetIndex && index < dragState.startIndex) {
+      offset = dragState.rowHeight;
+    }
+    row.style.setProperty('transform', offset ? `translateY(${offset}px)` : 'none');
+  });
+}
+
+async function finishModelDrag(ctx, rowsBox) {
+  if (!dragState.row) return;
+  const rows = dragState.rows;
+  const fromIndex = dragState.startIndex;
+  const toIndex = dragState.targetIndex;
+  const draggedRow = dragState.row;
+  const orderKeys = rows.map((row) => row.dataset.orderKey).filter(Boolean);
+  const nextKeys = reorderModelKeys(orderKeys, fromIndex, toIndex);
+  const firstRects = new Map(rows.map((row) => [row, row.getBoundingClientRect()]));
+  const movedRows = reorderModelRows(rows, fromIndex, toIndex);
+  rowsBox.removeEventListener('pointermove', onModelDragMove);
+  if (dragState.moveFrame && typeof window !== 'undefined') window.cancelAnimationFrame?.(dragState.moveFrame);
+  dragState.moveFrame = 0;
+  dragState.row = null;
+  dragState.rows = [];
+  dragState.rowTops = [];
+  dragState.finish = null;
+  if (fromIndex === toIndex || !nextKeys.length) {
+    rowsBox.classList.remove('is-dragging-list');
+    rows.forEach((row) => {
+      row.classList.remove('is-dragging');
+      row.style.setProperty('transform', 'none');
+    });
+    return;
+  }
+  animateRowsToFinalPosition(rowsBox, firstRects, movedRows);
+  viewState.busy = true;
+  try {
+    await ctx.api.reorderModels({ orderKeys: nextKeys });
+  } catch (err) {
+    ctx.toastError(err, '调整模型顺序失败');
+  } finally {
+    viewState.busy = false;
+    await ctx.reload('models', { preserveScrollTop: true });
+  }
+  void draggedRow;
+}
+
+function reorderModelRows(rowsBox, fromIndex, toIndex) {
+  const rows = dragState.rows.slice();
+  const [moved] = rows.splice(fromIndex, 1);
+  rows.splice(toIndex, 0, moved);
+  const anchor = rowsBox.querySelector?.('.tbody-row');
+  if (!anchor) return rows;
+  const firstRow = rows[0];
+  rowsBox.insertBefore(firstRow, anchor);
+  for (let index = 1; index < rows.length; index += 1) {
+    rowsBox.insertBefore(rows[index], rows[index - 1].nextSibling);
+  }
+  return rows;
+}
+
+function animateRowsToFinalPosition(rowsBox, firstRects, movedRows) {
+  rowsBox.classList.add('is-dragging-list');
+  movedRows.forEach((row) => {
+    row.classList.remove('is-dragging');
+    row.style.setProperty('transform', 'none');
+  });
+  const lastRects = new Map(movedRows.map((row) => [row, row.getBoundingClientRect()]));
+  movedRows.forEach((row) => {
+    const first = firstRects.get(row);
+    const last = lastRects.get(row);
+    if (!first || !last) return;
+    const dx = first.left - last.left;
+    const dy = first.top - last.top;
+    if (!dx && !dy) return;
+    row.style.setProperty('transition', 'none');
+    row.style.setProperty('transform', `translate(${dx}px, ${dy}px)`);
+  });
+  const raf = typeof window !== 'undefined' && window.requestAnimationFrame;
+  const play = () => {
+    movedRows.forEach((row) => {
+      row.style.removeProperty('transition');
+      row.style.setProperty('transform', 'none');
+    });
+    window.setTimeout(() => {
+      rowsBox.classList.remove('is-dragging-list');
+      movedRows.forEach((row) => row.style.removeProperty('transition'));
+    }, 200);
+  };
+  if (typeof raf === 'function') raf(play);
+  else play();
+}
+
+// ============ 动作 ============
+async function toggleInject(ctx, next) {
+  if (viewState.busy) return;
+  const models = ctx.state.models || [];
+  const gateway = ctx.state.gateway || (ctx.state.status && ctx.state.status.gateway) || {};
+
+  // 先给出清晰指引，而不是让主进程抛错
+  if (next) {
+    if (!models.some((model) => model.enabled !== false)) {
+      viewState.warn = {
+        text: '没有已启用的模型：请在「提供商」页至少启用一个提供商和模型。',
+        action: 'providers',
+      };
+      ctx.renderCurrent(true);
+      ctx.toast('没有已启用的模型', 'warn');
+      return;
+    }
+    if (!gateway.enabled) {
+      viewState.warn = {
+        text: '本地网关没有启用：ChatGPT 需要通过网关访问你的模型，所以注入会被拒绝。请先到设置页打开网关开关。',
+        action: 'settings',
+      };
+      ctx.renderCurrent(true);
+      ctx.toast('请先启用本地网关', 'warn');
+      return;
+    }
+    if (!gateway.running) {
+      viewState.warn = {
+        text: `本地网关已启用但没有在运行（端口 ${gateway.port || '未知'}），注入前需要它先跑起来。到设置页点「启动网关」，或重启 gpt++。`,
+        action: 'settings',
+      };
+      ctx.renderCurrent(true);
+      ctx.toast('本地网关未运行', 'warn');
+      return;
+    }
+  }
+
+  viewState.warn = null;
+  viewState.busy = true;
+  try {
+    const status = await ctx.api.setInject({ enabled: next });
+    ctx.state.status = status;
+    ctx.markRelaunchNeeded?.();
+    const n = models.filter((m) => m.enabled).length;
+    const msg = next
+      ? `已注入 ${n} 个模型，重启 ChatGPT 客户端后可在模型选择器中看到`
+      : '已还原：Codex 配置里的自定义模型清单已移除，ChatGPT 回到官方模型';
+    ctx.toast(msg, next ? 'ok' : 'warn');
+    ctx.logLocal(next ? 'info' : 'warn', msg);
+  } catch (err) {
+    viewState.warn = { text: `注入失败：${ctx.describeError(err)}`, action: 'settings' };
+    ctx.toastError(err, '注入失败');
+  } finally {
+    viewState.busy = false;
+    await ctx.reload('models');
+  }
+}
+
+async function toggleModel(ctx, model, enabled) {
+  if (viewState.busy || !model.orderKey) return;
+  viewState.busy = true;
+  try {
+    const status = await ctx.api.setModelEnabled({ providerId: model.providerId, modelId: model.modelId, enabled });
+    ctx.state.status = status;
+    markRelaunchIfInjected(ctx);
+    ctx.toast((enabled ? '已启用' : '已停用') + '模型「' + (model.label || model.modelId) + '」', 'ok');
+  } catch (err) {
+    ctx.toastError(err, '修改模型状态失败');
+  } finally {
+    viewState.busy = false;
+    await ctx.reload('models');
+  }
+}
+
+async function moveModel(ctx, model, direction) {
+  if (viewState.busy || !model.orderKey) return;
+  viewState.busy = true;
+  try {
+    await ctx.api.moveModel({ providerId: model.providerId, modelId: model.modelId, direction });
+    markRelaunchIfInjected(ctx);
+  } catch (err) {
+    ctx.toastError(err, '调整模型顺序失败');
+  } finally {
+    viewState.busy = false;
+    await ctx.reload('models');
+  }
+}
+
+async function setDefaultModel(ctx, slug) {
+  if (!slug || viewState.busy) return;
+  viewState.busy = true;
+  try {
+    const status = await ctx.api.setInject({ defaultModel: slug });
+    ctx.state.status = status;
+    markRelaunchIfInjected(ctx);
+    const model = (ctx.state.models || []).find((m) => m.slug === slug);
+    // 后端会把「已停用/不存在」的 slug 回退成第一个启用模型；
+    // 提示必须按实际写进去的值说，不能照着用户点的值报平安。
+    const applied = (status && status.inject && status.inject.defaultModel) || null;
+    if (applied !== slug) {
+      ctx.toast(
+        applied
+          ? `该模型当前不可为默认，已改为「${labelOf(ctx, applied)}」`
+          : '默认模型未更改（注入时会自动取第一个启用的模型）',
+        'warn',
+      );
+      ctx.logLocal('warn', `默认模型未落在 ${slug}，实际为 ${applied || '（空）'}`);
+    } else {
+      ctx.toast(`默认模型已设为「${model ? model.label : slug}」`, 'ok');
+      ctx.logLocal('info', `默认模型：${slug}`);
+    }
+  } catch (err) {
+    ctx.toastError(err, '设置默认模型失败');
+  } finally {
+    viewState.busy = false;
+    await ctx.reload('models');
+  }
+}
+
+/** 模型状态、排序或默认值变化会影响已写入的客户端目录。 */
+function markRelaunchIfInjected(ctx) {
+  const inject = ctx.state.inject || (ctx.state.status && ctx.state.status.inject);
+  if (inject && inject.enabled) ctx.markRelaunchNeeded?.();
+}
+
+function labelOf(ctx, slug) {
+  const m = (ctx.state.models || []).find((item) => item.slug === slug);
+  return m ? m.label : slug;
+}
+
+async function openCodexFolder(ctx) {
+  try {
+    const res = await ctx.api.openCodexFolder();
+    if (res && res.ok) {
+      ctx.toast('已在资源管理器中打开 Codex 配置目录', 'ok');
+    } else {
+      ctx.toast(`打开目录失败：${(res && res.error) || '未知错误'}`, 'error');
+    }
+  } catch (err) {
+    ctx.toastError(err, '打开 Codex 目录失败');
+  }
+}

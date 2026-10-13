@@ -1,0 +1,1398 @@
+﻿// gpt++ 渲染层控制器：状态、路由、全局 chrome（状态栏/日志抽屉/弹窗/提示）。
+//
+// 安全约定（全项目遵守）：
+//   1. 任何来自用户或 API 的字符串一律通过 textContent / 属性设置进入 DOM，绝不拼进 innerHTML。
+//   2. 代码中唯一的 innerHTML 用法是 ICONS 表里的静态图标字面量（见 icon()）。
+//   3. 没有远程资源：无 fetch、无外部字体、无 CDN（CSP 也是 default-src 'none'）。
+
+import { renderProviders, openProviderForm, closeProviderForm } from './views/providers.js';
+import { renderModels, reorderModelKeys } from './views/models.js';
+import { renderUsage } from './views/usage.js';
+import { renderSettings } from './views/settings.js';
+
+// ============ 静态图标（纯字面量，不含任何变量） ============
+const SVG_OPEN =
+  '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" ' +
+  'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">';
+const SVG_FILL = '<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" focusable="false">';
+
+const ICONS = Object.freeze({
+  plus: SVG_OPEN + '<path d="M8 3.2v9.6M3.2 8h9.6"/></svg>',
+  pencil: SVG_OPEN + '<path d="M11.2 2.7l2.1 2.1-7.1 7.1-2.9.8.8-2.9z"/><path d="M2.6 14h10.8"/></svg>',
+  trash: SVG_OPEN + '<path d="M2.9 4.6h10.2"/><path d="M6.4 4.6V3.1h3.2v1.5"/><path d="M4.6 4.6l.6 8.4h5.6l.6-8.4"/></svg>',
+  refresh: SVG_OPEN + '<path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.7"/><path d="M13.4 2.9v3.2h-3.2"/></svg>',
+  eye: SVG_OPEN + '<path d="M1.9 8S4.2 4.4 8 4.4 14.1 8 14.1 8 11.8 11.6 8 11.6 1.9 8 1.9 8z"/><circle cx="8" cy="8" r="1.9"/></svg>',
+  eyeOff:
+    SVG_OPEN +
+    '<path d="M6.5 6.5A2 2 0 0 0 8 10a2 2 0 0 0 1.7-.9"/><path d="M4.1 4.5C2.6 5.5 1.9 8 1.9 8s2.3 3.6 6.1 3.6c.9 0 1.7-.2 2.4-.6"/>' +
+    '<path d="M11 9.9c2-.9 3.1-1.9 3.1-1.9S12 4.4 8.2 4.4c-.5 0-1 .1-1.4.2"/><path d="M2.7 2.7l10.6 10.6"/></svg>',
+  copy: SVG_OPEN + '<rect x="5.7" y="5.7" width="7.3" height="7.3" rx="1.6"/><path d="M10.3 5.7V4.3c0-.9-.7-1.6-1.6-1.6H4.3c-.9 0-1.6.7-1.6 1.6v4.4c0 .9.7 1.6 1.6 1.6h1.4"/></svg>',
+  check: SVG_OPEN + '<path d="M3.4 8.4l3 3 6.2-6.9"/></svg>',
+  x: SVG_OPEN + '<path d="M4.3 4.3l7.4 7.4M11.7 4.3l-7.4 7.4"/></svg>',
+  folder: SVG_OPEN + '<path d="M2.4 4.3h4l1.3 1.6h5.9v6.3H2.4z"/></svg>',
+  power: SVG_OPEN + '<path d="M8 2.6v5.1"/><path d="M12.1 4.6a5.4 5.4 0 1 1-8.2 0"/></svg>',
+  alert: SVG_OPEN + '<path d="M8 2.7l5.7 10.6H2.3z"/><path d="M8 6.5v3.1M8 11.6h.01"/></svg>',
+  info: SVG_OPEN + '<circle cx="8" cy="8" r="5.6"/><path d="M8 7.3v3.6M8 5.2h.01"/></svg>',
+  zap: SVG_OPEN + '<path d="M9.1 2.3L4.4 9h3.1l-.6 4.7L11.6 7H8.4z"/></svg>',
+  server: SVG_OPEN + '<rect x="2.4" y="3.1" width="11.2" height="4.1" rx="1.3"/><rect x="2.4" y="8.8" width="11.2" height="4.1" rx="1.3"/><path d="M5 5.15h.01M5 10.85h.01"/></svg>',
+  chevronDown: SVG_OPEN + '<path d="M4.4 6.4L8 10l3.6-3.6"/></svg>',
+  chevronUp: SVG_OPEN + '<path d="M4.4 9.6L8 6l3.6 3.6"/></svg>',
+  activity: SVG_OPEN + '<path d="M1.7 8h2.8l1.9-4.3 3 8.6 1.8-4.3h3.1"/></svg>',
+  box: SVG_OPEN + '<path d="M2.5 5.4L8 2.7l5.5 2.7v5.2L8 13.3l-5.5-2.7z"/><path d="M2.5 5.4L8 8.1l5.5-2.7M8 8.1v5.2"/></svg>',
+  dot: SVG_FILL + '<circle cx="8" cy="8" r="3"/></svg>',
+  plug: SVG_OPEN + '<path d="M6 6.6V3.2M10 6.6V3.2"/><path d="M4.2 6.6h7.6v1.9a3.8 3.8 0 0 1-7.6 0z"/><path d="M8 12.3v1.4"/></svg>',
+  code: SVG_OPEN + '<path d="M6.2 4.6L3 8l3.2 3.4M9.8 4.6L13 8l-3.2 3.4"/></svg>',
+  sun: SVG_OPEN + '<circle cx="8" cy="8" r="2.4"/><path d="M8 1.8v1.5M8 12.7v1.5M1.8 8h1.5M12.7 8h1.5M3.6 3.6l1.1 1.1M11.3 11.3l1.1 1.1M12.4 3.6l-1.1 1.1M4.7 11.3l-1.1 1.1"/></svg>',
+  moon: SVG_OPEN + '<path d="M12.8 10.7A5.5 5.5 0 0 1 5.3 3.2 5.6 5.6 0 1 0 12.8 10.7z"/></svg>',
+  monitor: SVG_OPEN + '<rect x="2.3" y="2.8" width="11.4" height="8" rx="1.2"/><path d="M6 13.2h4M8 10.8v2.4"/></svg>',
+});
+
+// ============ DOM 构造helper ============
+/**
+ * 创建元素。props:
+ *   class / text / html（仅静态字面量）/ on / attrs / data / style，其余作为属性。
+ * children: 字符串（自动 textContent 转义）、节点或数组。
+ */
+function el(tag, props = {}, children = []) {
+  const node = document.createElement(tag);
+  const deferredControlProps = [];
+  for (const [key, value] of Object.entries(props || {})) {
+    if (value === null || value === undefined || value === false) continue;
+    if (key === 'class') node.className = value;
+    else if (key === 'text') node.textContent = String(value);
+    else if (key === 'html') node.innerHTML = value; // 仅静态图标
+    else if (key === 'on') {
+      for (const [evt, fn] of Object.entries(value)) node.addEventListener(evt, fn);
+    } else if (key === 'attrs') {
+      for (const [attr, val] of Object.entries(value)) {
+        if (val === null || val === undefined || val === false) continue;
+        node.setAttribute(attr, val === true ? '' : String(val));
+      }
+    } else if (key === 'data') {
+      for (const [dk, dv] of Object.entries(value)) node.dataset[dk] = String(dv);
+    } else if (key === 'style') {
+      for (const [sk, sv] of Object.entries(value)) node.style.setProperty(sk, String(sv));
+    } else if (key === 'value' || key === 'checked' || key === 'disabled' || key === 'selected') {
+      // 子节点挂载后再设置控件属性，避免 select 在 option 存在前回落到第一项。
+      deferredControlProps.push([key, value]);
+    } else {
+      node.setAttribute(key, value === true ? '' : String(value));
+    }
+  }
+  appendChildren(node, children);
+  // 表单控件走属性赋值；textarea 的 value 必须使用 property。
+  for (const [key, value] of deferredControlProps) {
+    if (key in node) {
+      node[key] = key === 'value' ? String(value) : Boolean(value);
+    } else {
+      node.setAttribute(key, value === true ? '' : String(value));
+    }
+  }
+  return node;
+}
+
+// 判断是不是 DOM 节点：不依赖全局 Node 构造器，避免在非浏览器环境里直接 ReferenceError
+function isDomNode(value) {
+  return !!value && typeof value === 'object' && typeof value.nodeType === 'number';
+}
+
+function appendChildren(node, children) {
+  if (children === null || children === undefined || children === false) return node;
+  const list = Array.isArray(children) ? children : [children];
+  for (const child of list) {
+    if (child === null || child === undefined || child === false) continue;
+    node.appendChild(isDomNode(child) ? child : document.createTextNode(String(child)));
+  }
+  return node;
+}
+
+function icon(name, size = 14) {
+  const wrap = el('span', { class: 'icon', html: ICONS[name] || ICONS.dot });
+  const svg = wrap.firstElementChild;
+  if (svg) {
+    svg.setAttribute('width', String(size));
+    svg.setAttribute('height', String(size));
+  }
+  return wrap;
+}
+
+// ============ 工具 ============
+const fmt = {
+  clock(ts) {
+    if (!ts) return '--:--:--';
+    const d = new Date(ts);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  },
+  dateTime(ts) {
+    if (!ts) return '—';
+    const d = new Date(ts);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${fmt.clock(ts)}`;
+  },
+  rel(ts) {
+    if (!ts) return '从未';
+    const diff = Date.now() - ts;
+    if (diff < 0) return '刚刚';
+    if (diff < 15000) return '刚刚';
+    if (diff < 60000) return `${Math.round(diff / 1000)} 秒前`;
+    if (diff < 3600000) return `${Math.round(diff / 60000)} 分钟前`;
+    if (diff < 86400000) return `${Math.round(diff / 3600000)} 小时前`;
+    return fmt.dateTime(ts);
+  },
+  dur(ms) {
+    const n = Number(ms);
+    if (!Number.isFinite(n) || n < 0) return '—';
+    if (n < 1000) return `${Math.round(n)}ms`;
+    return `${(n / 1000).toFixed(n < 10000 ? 2 : 1)}s`;
+  },
+};
+
+function maskKey(raw) {
+  const s = String(raw || '');
+  if (!s) return '';
+  if (s.length <= 8) return '•'.repeat(Math.max(6, s.length));
+  return `${s.slice(0, 3)}${'•'.repeat(8)}${s.slice(-4)}`;
+}
+
+function shortPath(p) {
+  const s = String(p || '');
+  return s.replace(/^[A-Za-z]:\\Users\\[^\\]+/i, '~');
+}
+
+function describeError(err, fallback = '操作失败') {
+  if (!err) return fallback;
+  const msg = err && err.message ? err.message : String(err);
+  return msg && msg.trim() ? msg : fallback;
+}
+
+// ============ 应用状态 ============
+const state = {
+  view: 'providers',
+  // preload 会在 CSS 首次计算前写入该属性；这里同步沿用，避免首屏先落到深色。
+  theme: typeof document !== 'undefined'
+    ? (document.documentElement.dataset.themeMode || document.documentElement.dataset.theme || 'dark')
+    : 'dark',
+  status: null,
+  providers: [],
+  models: [],
+  modelLimits: null,
+  gateway: null,
+  network: null,
+  inject: null,
+  logs: [],
+  usage: [],
+  logOpen: false,
+  logFilter: 'all',
+  logPaused: false,
+  pendingRelaunch: false,
+  relaunchNeeded: false,
+  loaded: { status: false, providers: false, models: false, modelLimits: false, gateway: false, inject: false, logs: false, usage: false },
+};
+
+const THEME_MODES = new Set(['dark', 'light', 'system']);
+let systemThemeQuery = null;
+
+function normalizeThemeMode(value) {
+  return THEME_MODES.has(value) ? value : 'dark';
+}
+
+function applyTheme(mode) {
+  if (typeof document === 'undefined') return;
+  const selected = normalizeThemeMode(mode);
+  const resolved = selected === 'system'
+    && typeof window !== 'undefined'
+    && typeof window.matchMedia === 'function'
+    && window.matchMedia('(prefers-color-scheme: light)').matches
+    ? 'light'
+    : selected === 'system' ? 'dark' : selected;
+  document.documentElement.dataset.theme = resolved;
+  document.documentElement.dataset.themeMode = selected;
+}
+
+function onSystemThemeChange() {
+  if (state.theme === 'system') applyTheme('system');
+}
+
+function syncSystemThemeListener() {
+  if (systemThemeQuery && typeof systemThemeQuery.removeEventListener === 'function') {
+    systemThemeQuery.removeEventListener('change', onSystemThemeChange);
+  }
+  systemThemeQuery = null;
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function' || state.theme !== 'system') return;
+  systemThemeQuery = window.matchMedia('(prefers-color-scheme: light)');
+  if (typeof systemThemeQuery.addEventListener === 'function') {
+    systemThemeQuery.addEventListener('change', onSystemThemeChange);
+  }
+}
+
+function setThemePreference(value) {
+  state.theme = normalizeThemeMode(value);
+  syncSystemThemeListener();
+  applyTheme(state.theme);
+  return state.theme;
+}
+
+/** 日志抽屉里最多渲染多少行 DOM。只约束界面，不约束统计。 */
+const LOG_DRAW_LIMIT = 300;
+/** 与主进程 log-store 的 LOG_RING_SIZE 对齐：使用量页要看到全部历史 */
+const LOG_STATE_LIMIT = 20000;
+const MAX_TOASTS = 4;
+
+let api = null;
+let subscribed = false;
+let relaunchTimer = 0;
+let themeSaveBusy = false;
+let networkSaveBusy = false;
+let networkFocusMode = null;
+let observedWriteAt = 0;
+
+const dom = {};
+
+// ============ 轻提示 ============
+function toast(message, kind = 'info', ttlOverride) {
+  const root = dom.toastRoot;
+  if (!root) return;
+  const iconName = kind === 'ok' ? 'check' : kind === 'warn' ? 'alert' : kind === 'error' ? 'alert' : 'info';
+  const node = el('div', { class: `toast toast-${kind}`, attrs: { role: 'status' } }, [
+    icon(iconName, 14),
+    el('div', { class: 'toast-msg', text: String(message ?? '') }),
+  ]);
+  root.appendChild(node);
+  while (root.children.length > MAX_TOASTS) root.removeChild(root.firstElementChild);
+  const ttl = ttlOverride ?? (kind === 'error' ? 6500 : kind === 'warn' ? 5000 : 3400);
+  window.setTimeout(() => {
+    node.classList.add('is-closing');
+    window.setTimeout(() => node.remove(), 180);
+  }, ttl);
+}
+
+function toastError(err, fallback) {
+  const msg = describeError(err, fallback);
+  toast(msg, 'error');
+  pushLog({ at: Date.now(), level: 'error', msg });
+  return msg;
+}
+
+function normalizeLogEntry(entry) {
+  const src = entry && typeof entry === 'object' ? entry : {};
+  // 逐字段挑着复制会静默丢掉主进程新增的字段（cacheUsageAvailable 就这么丢过，
+  // 使用量页的缓存统计因此一直判失真）。这里保留全部字段，只补默认值。
+  return {
+    ...src,
+    at: src.at || Date.now(),
+    level: src.level || 'info',
+    msg: String(src.msg || ''),
+  };
+}
+
+function logIdentity(entry) {
+  return [
+    entry?.at,
+    entry?.level,
+    entry?.msg,
+    entry?.providerId,
+    entry?.providerName,
+    entry?.model,
+    entry?.upstreamModel,
+    entry?.status,
+    entry?.ms,
+    entry?.events,
+    entry?.clientGone,
+    entry?.cacheUsageAvailable,
+    entry?.estimatedUsage,
+    JSON.stringify(entry?.tokens || null),
+  ].map((value) => String(value ?? '')).join('\u001f');
+}
+
+// ============ 本地日志（渲染层自身事件，不经过主进程） ============
+function pushLog(entry) {
+  const full = { ...normalizeLogEntry(entry), local: true };
+  state.logs.push(full);
+  while (state.logs.length > LOG_STATE_LIMIT) state.logs.shift();
+  updateLogBadge();
+  if (state.logOpen) {
+    appendLogRow(full);
+    trimLogDom();
+    autoScrollLogs();
+  }
+}
+
+function mergeUsageRecords(records) {
+  if (!Array.isArray(records)) return 0;
+  const known = new Set(state.usage.map((entry) => String(entry?.requestId || logIdentity(entry))));
+  let added = 0;
+  for (const entry of records) {
+    const normalized = normalizeLogEntry(entry);
+    const identity = String(normalized.requestId || logIdentity(normalized));
+    if (known.has(identity)) continue;
+    known.add(identity);
+    state.usage.push(normalized);
+    added += 1;
+  }
+  if (added) state.usage.sort((a, b) => Number(a.at || 0) - Number(b.at || 0));
+  return added;
+}
+
+function handleIncomingLog(entry, rerender = renderCurrent) {
+  if (!entry || typeof entry !== 'object') return;
+  const normalized = normalizeLogEntry(entry);
+  const identity = logIdentity(normalized);
+  if (state.logs.some((current) => logIdentity(current) === identity)) return;
+  pushLog(normalized);
+  if (normalized.final === true || normalized.usageRecord === true) mergeUsageRecords([normalized]);
+  if (state.view === 'usage') rerender(false, { preserveScrollTop: true });
+}
+
+function logLocal(level, msg) {
+  pushLog({ at: Date.now(), level, msg });
+}
+
+// ============ 剪贴板 ============
+async function copyText(text, label = '内容') {
+  const value = String(text ?? '');
+  if (!value) {
+    toast(`${label}为空，没有可复制的内容`, 'warn');
+    return false;
+  }
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(value);
+      toast(`已复制${label}`, 'ok');
+      return true;
+    }
+  } catch {
+    /* 退回到 execCommand */
+  }
+  try {
+    const ta = el('textarea', { class: 'sr-only', attrs: { 'aria-hidden': 'true' } });
+    ta.value = value;
+    ta.style.setProperty('position', 'fixed');
+    ta.style.setProperty('opacity', '0');
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    toast(ok ? `已复制${label}` : '复制失败，请手动选择文本', ok ? 'ok' : 'warn');
+    return ok;
+  } catch {
+    toast('复制失败，请手动选择文本', 'warn');
+    return false;
+  }
+}
+
+// ============ 弹窗宿主 ============
+let currentModal = null;
+
+function openModal(node, options = {}) {
+  closeModal();
+  const backdrop = el(
+    'div',
+    {
+      class: 'modal-backdrop',
+      on: {
+        mousedown: (e) => {
+          if (e.target === backdrop) closeModal();
+        },
+      },
+    },
+    [node],
+  );
+  dom.modalRoot.appendChild(backdrop);
+  currentModal = { backdrop, onClose: options.onClose || null, prevFocus: document.activeElement };
+  const focusTarget = backdrop.querySelector('[data-autofocus]') || backdrop.querySelector('input, textarea, select, button');
+  if (focusTarget) window.setTimeout(() => focusTarget.focus(), 0);
+  return backdrop;
+}
+
+function closeModal() {
+  if (!currentModal) return false;
+  const { backdrop, onClose, prevFocus } = currentModal;
+  currentModal = null;
+  backdrop.classList.add('is-closing');
+  window.setTimeout(() => backdrop.remove(), 180);
+  if (typeof onClose === 'function') {
+    try {
+      onClose();
+    } catch {
+      /* 关闭回调异常不影响界面 */
+    }
+  }
+  if (prevFocus && prevFocus.isConnected && typeof prevFocus.focus === 'function') {
+    try {
+      prevFocus.focus();
+    } catch {
+      /* ignore */
+    }
+  }
+  return true;
+}
+
+function isModalOpen() {
+  return !!currentModal;
+}
+
+// ============ 数据加载 ============
+async function loadStatus() {
+  state.status = await api.getStatus();
+  if (state.status && state.status.network) state.network = { ...state.status.network };
+  setThemePreference(state.status && state.status.theme);
+  state.loaded.status = true;
+}
+
+async function loadProviders() {
+  state.providers = await api.listProviders();
+  state.loaded.providers = true;
+}
+
+async function loadModels() {
+  state.models = await api.listModels();
+  state.loaded.models = true;
+}
+
+async function loadModelLimits() {
+  state.modelLimits = await api.getModelLimits();
+  state.loaded.modelLimits = true;
+}
+
+async function loadGateway() {
+  state.gateway = await api.getGateway();
+  state.loaded.gateway = true;
+}
+
+async function loadInject() {
+  state.inject = await api.getInject();
+  state.loaded.inject = true;
+}
+
+async function loadLogs() {
+  const logs = await api.getLogs();
+  if (Array.isArray(logs)) {
+    // 本地日志（渲染层自己的提示）只存在于内存，整体替换会把它们抹掉
+    const local = state.logs.filter((entry) => entry && entry.local);
+    state.logs = [...local, ...logs.map(normalizeLogEntry)]
+      .sort((a, b) => Number(a.at || 0) - Number(b.at || 0))
+      .slice(-LOG_STATE_LIMIT);
+  }
+  state.loaded.logs = true;
+}
+
+async function loadUsage() {
+  let records = typeof api.getUsage === 'function' ? await api.getUsage() : null;
+  if ((!Array.isArray(records) || records.length === 0) && typeof api.getLogs === 'function') {
+    records = await api.getLogs();
+  }
+  if (Array.isArray(records)) {
+    state.usage = records.map(normalizeLogEntry).sort((a, b) => Number(a.at || 0) - Number(b.at || 0));
+  }
+  state.loaded.usage = true;
+}
+
+/**
+ * 增量合并主进程日志，供使用量页的定时刷新使用。
+ * @param {any[]} logs 主进程返回的持久化日志
+ * @returns {number} 新增日志条数
+ */
+function mergeUsageLogs(logs) {
+  if (!Array.isArray(logs)) return 0;
+  let added = 0;
+  const known = new Set(state.logs.map((entry) => logIdentity(entry)));
+  for (const entry of logs) {
+    const normalized = normalizeLogEntry(entry);
+    const identity = logIdentity(normalized);
+    if (known.has(identity)) continue;
+    known.add(identity);
+    state.logs.push(normalized);
+    added += 1;
+  }
+  if (added) {
+    state.logs = state.logs
+      .sort((a, b) => Number(a.at || 0) - Number(b.at || 0))
+      .slice(-LOG_STATE_LIMIT);
+  }
+  return added;
+}
+
+/** 统一的安全加载：失败时提示但不抛出，避免整页白屏 */
+async function tryLoad(loader, label) {
+  try {
+    await loader();
+    return true;
+  } catch (err) {
+    toastError(err, `${label}读取失败`);
+    return false;
+  }
+}
+
+const RELOAD_PLAN = {
+  providers: [
+    [loadProviders, '提供商列表'],
+    [loadModels, '模型列表'], // 模型由提供商派生，改完提供商要一起刷新
+    [loadStatus, '全局状态'],
+  ],
+  models: [
+    [loadModels, '模型列表'],
+    [loadInject, '注入状态'],
+    [loadGateway, '网关状态'],
+    [loadStatus, '全局状态'],
+  ],
+  settings: [
+    [loadModelLimits, '模型上下文设置'],
+    [loadGateway, '网关状态'],
+    [loadInject, '注入状态'],
+    [loadStatus, '全局状态'],
+  ],
+  usage: [[loadUsage, '使用量统计']],
+};
+
+async function reload(scope = 'providers', options = {}) {
+  const targetView = state.view;
+  const plan = RELOAD_PLAN[scope] || RELOAD_PLAN.providers;
+  for (const [loader, label] of plan) {
+    await tryLoad(loader, label);
+  }
+  if (state.view === targetView) {
+    renderChrome();
+    renderCurrent(true, options);
+  }
+}
+
+const USAGE_REFRESH_INTERVAL_MS = 60_000;
+let usageRefreshTimer = null;
+let usageRefreshInFlight = false;
+
+/** 停止使用量页的自动刷新定时器。 */
+function stopUsageAutoRefresh() {
+  if (usageRefreshTimer === null || typeof window === 'undefined') return;
+  window.clearInterval(usageRefreshTimer);
+  usageRefreshTimer = null;
+}
+
+/**
+ * 拉取并增量更新使用量日志，不触发整页重置。
+ * @returns {Promise<number>} 本次新增日志条数
+ */
+async function refreshUsageIncrementally() {
+  if (!api || (typeof api.getUsage !== 'function' && typeof api.getLogs !== 'function') || usageRefreshInFlight) return 0;
+  usageRefreshInFlight = true;
+  try {
+    let records = typeof api.getUsage === 'function' ? await api.getUsage() : null;
+    if ((!Array.isArray(records) || records.length === 0) && typeof api.getLogs === 'function') {
+      records = await api.getLogs();
+    }
+    const added = mergeUsageRecords(records);
+    state.loaded.usage = true;
+    if (added && state.view === 'usage') {
+      renderChrome();
+      renderCurrent(false, { preserveScrollTop: true });
+    }
+    return added;
+  } catch (err) {
+    toastError(err, '使用量日志读取失败');
+    return 0;
+  } finally {
+    usageRefreshInFlight = false;
+  }
+}
+
+/** 根据当前视图启停使用量页的每分钟增量刷新。 */
+function syncUsageAutoRefresh() {
+  if (state.view !== 'usage' || !api || typeof window === 'undefined') {
+    stopUsageAutoRefresh();
+    return;
+  }
+  if (usageRefreshTimer !== null) return;
+  usageRefreshTimer = window.setInterval(() => {
+    void refreshUsageIncrementally();
+  }, USAGE_REFRESH_INTERVAL_MS);
+}
+
+// ============ 全局 chrome ============
+const VIEW_META = {
+  providers: {
+    title: '提供商',
+    sub: '添加你自己的模型接口；保存后模型会进入 ChatGPT 的模型清单',
+    render: renderProviders,
+    needs: ['providers', 'status'],
+  },
+  models: {
+    title: '模型',
+    sub: '注入后 ChatGPT 客户端的模型选择器里会出现这些模型',
+    render: renderModels,
+    needs: ['models', 'inject', 'gateway'],
+  },
+  usage: {
+    title: '使用量',
+    sub: '查看本地网关请求、Token 与响应耗时统计',
+    render: renderUsage,
+    needs: ['usage'],
+  },
+  settings: {
+    title: '设置',
+    sub: '本地网关、Codex 配置写入与客户端重启',
+    render: renderSettings,
+    needs: ['modelLimits', 'gateway', 'inject', 'status'],
+  },
+};
+
+function renderChrome() {
+  const s = state.status;
+
+  // 导航
+  for (const btn of dom.nav.querySelectorAll('.nav-item')) {
+    btn.classList.toggle('is-active', btn.dataset.view === state.view);
+  }
+  const providerBadge = dom.nav.querySelector('[data-badge="providers"]');
+  const modelBadge = dom.nav.querySelector('[data-badge="models"]');
+  const usageBadge = dom.nav.querySelector('[data-badge="usage"]');
+  const gatewayBadge = dom.nav.querySelector('[data-badge="gateway"]');
+  setAnimatedText(providerBadge, s ? String(s.providers) : '–');
+  setAnimatedText(modelBadge, s ? String(s.models) : '–');
+  const usageRows = Array.isArray(state.usage) && state.usage.length ? state.usage : state.logs;
+  setAnimatedText(usageBadge, String(usageRows.filter((entry) => entry && entry.tokens && (entry.final === true || entry.usageRecord === true || entry.status === 200)).length));
+  if (gatewayBadge) {
+    const running = !!(s && s.gateway && s.gateway.running);
+    setAnimatedText(gatewayBadge, s ? (running ? '运行' : '停') : '–');
+    gatewayBadge.classList.toggle('is-run', running);
+    gatewayBadge.classList.toggle('is-off', !!s && !running);
+  }
+
+  // 标题
+  const meta = VIEW_META[state.view];
+  dom.viewTitle.textContent = meta.title;
+  dom.viewSub.textContent = meta.sub;
+
+  // 侧栏底部
+  renderSidebarAction();
+  renderSidebarFoot(s);
+
+  // 状态栏链路
+  renderFlow(s);
+  renderThemeControl();
+
+  // 版本
+  dom.buildTag.textContent = s && s.appVersion ? `v${s.appVersion}` : '';
+}
+
+/** 底部状态栏里的全局主题快捷切换。图标按钮保留 title，便于鼠标悬停识别。 */
+function renderThemeControl() {
+  if (!dom.themeControl) return;
+  const options = [
+    ['dark', 'moon', '深色'],
+    ['light', 'sun', '浅色'],
+    ['system', 'monitor', '跟随系统'],
+  ];
+  dom.themeControl.replaceChildren(
+    el('div', { class: 'theme-quick', role: 'group', attrs: { 'aria-label': '界面主题' } }, options.map(([value, iconName, label]) => el('button', {
+      class: 'theme-quick-btn' + (state.theme === value ? ' is-active' : ''),
+      type: 'button',
+      disabled: !api || themeSaveBusy ? true : null,
+      title: label,
+      attrs: { 'aria-label': label, 'aria-pressed': state.theme === value ? 'true' : 'false' },
+      on: { click: () => void saveThemePreference(value) },
+    }, [icon(iconName, 13)]))),
+  );
+}
+
+/** 只在状态值真正变化时给侧栏徽标一次短反馈，避免状态广播导致持续闪烁。 */
+function setAnimatedText(node, value) {
+  if (!node) return;
+  const next = String(value);
+  if (node.textContent === next) return;
+  node.textContent = next;
+  node.classList.remove('is-updated');
+  window.setTimeout(() => {
+    if (!node.isConnected) return;
+    node.classList.add('is-updated');
+    window.setTimeout(() => node.classList.remove('is-updated'), 320);
+  }, 0);
+}
+
+async function saveThemePreference(next) {
+  if (themeSaveBusy || !api || !THEME_MODES.has(next)) return;
+  const previous = state.theme;
+  themeSaveBusy = true;
+  document.documentElement.classList.add('is-theme-switching');
+  setThemePreference(next);
+  renderChrome();
+  try {
+    const status = await api.setTheme({ theme: next });
+    state.status = status;
+    if (status && status.theme) setThemePreference(status.theme);
+    toast(`主题已切换为${next === 'dark' ? '深色' : next === 'light' ? '浅色' : '跟随系统'}`, 'ok');
+  } catch (err) {
+    setThemePreference(previous);
+    toastError(err, '保存主题失败');
+  } finally {
+    themeSaveBusy = false;
+    window.setTimeout(() => document.documentElement.classList.remove('is-theme-switching'), 360);
+    renderChrome();
+  }
+}
+
+/** 立即切换上游网络模式，不重启网关，也不迁移正在进行的请求。 */
+async function saveNetworkMode(nextMode) {
+  const currentMode = state.network && state.network.proxyMode === 'direct' ? 'direct' : 'system';
+  if (networkSaveBusy || !api || !['system', 'direct'].includes(nextMode) || currentMode === nextMode) return;
+
+  // 先更新侧栏选中态，让用户感知到切换是即时的；主进程失败时再恢复旧值。
+  networkSaveBusy = true;
+  networkFocusMode = nextMode;
+  state.network = { ...(state.network || {}), proxyMode: nextMode };
+  renderChrome();
+  try {
+    const status = await api.setNetwork({ proxyMode: nextMode });
+    state.status = status;
+    state.network = status && status.network ? status.network : { proxyMode: nextMode };
+    const msg = nextMode === 'system' ? '已切换为系统代理：跟随 Windows 系统代理设置' : '已切换为直连';
+    toast(msg, 'ok');
+    logLocal('info', msg);
+  } catch (err) {
+    networkFocusMode = currentMode;
+    state.network = { ...(state.network || {}), proxyMode: currentMode };
+    toastError(err, '切换网络模式失败');
+  } finally {
+    networkSaveBusy = false;
+    renderChrome();
+  }
+}
+
+/** 侧栏里的全局客户端重启动作：所有页面共用同一份确认状态。 */
+function renderSidebarAction() {
+  if (!dom.sidebarActions) return;
+  const mode = state.network && state.network.proxyMode === 'direct' ? 'direct' : 'system';
+  const pending = state.pendingRelaunch;
+  const needed = state.relaunchNeeded;
+  const networkOption = (value, label, description, glyph) => el('button', {
+    class: `sidebar-network-option${mode === value ? ' is-selected' : ''}`,
+    type: 'button',
+    disabled: !api || networkSaveBusy ? true : null,
+    title: description,
+    data: { networkMode: value },
+    tabindex: mode === value ? '0' : '-1',
+    attrs: {
+      role: 'radio',
+      'aria-checked': mode === value ? 'true' : 'false',
+      'aria-label': `${label}：${description}`,
+    },
+    on: {
+      click: () => void saveNetworkMode(value),
+      keydown: (e) => {
+        if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+        e.preventDefault();
+        const next = e.key === 'ArrowLeft' ? 'system' : 'direct';
+        if (next !== mode) void saveNetworkMode(next);
+      },
+    },
+  }, [icon(glyph, 12), el('span', { text: label })]);
+  const networkControl = el('section', { class: 'sidebar-network', attrs: { 'aria-label': '上游网络连接' } }, [
+    el('div', { class: 'sidebar-network-head' }, [
+      icon('plug', 13),
+      el('span', { class: 'sidebar-network-title', text: '上游网络' }),
+      el('span', {
+        class: 'sidebar-network-state' + (mode === 'direct' ? ' is-direct' : ''),
+        text: mode === 'system' ? '系统代理' : '直连',
+      }),
+    ]),
+    el('div', { class: 'sidebar-network-modes', role: 'radiogroup', attrs: { 'aria-label': '选择上游网络模式' } }, [
+      networkOption('system', '系统代理', '跟随 Windows 系统代理；Clash Verge 开启系统代理时自动使用代理', 'plug'),
+      networkOption('direct', '直连', '不使用系统代理，直接连接模型提供商', 'zap'),
+    ]),
+  ]);
+  const button = el('button', {
+    class: 'btn btn-sm sidebar-relaunch ' + (pending || needed ? 'btn-danger' : 'btn-ghost'),
+    type: 'button',
+    disabled: !api,
+    title: pending
+      ? '再次点击确认，立即结束并重新启动 ChatGPT.exe'
+      : '结束 ChatGPT.exe 再重新启动，让它重新读取模型清单',
+    on: {
+      click: () => {
+        if (!state.pendingRelaunch) {
+          state.pendingRelaunch = true;
+          renderSidebarAction();
+          window.clearTimeout(relaunchTimer);
+          relaunchTimer = window.setTimeout(() => {
+            if (state.pendingRelaunch) {
+              state.pendingRelaunch = false;
+              renderSidebarAction();
+            }
+          }, 6000);
+          return;
+        }
+        void relaunchChatGpt();
+      },
+    },
+  }, [
+    icon('power', 13),
+    el('span', { text: pending ? '确认重启 ChatGPT？' : needed ? '重启 ChatGPT（配置待生效）' : '重启 ChatGPT 客户端' }),
+  ]);
+  const warning = needed
+    ? el('div', { class: 'sidebar-relaunch-alert', attrs: { role: 'alert' } }, [
+        icon('alert', 14),
+        el('span', { text: '配置已修改，需要重启 ChatGPT 客户端生效' }),
+      ])
+    : null;
+  dom.sidebarActions.replaceChildren(
+    networkControl,
+    el('div', { class: 'sidebar-relaunch-wrap' }, [warning, button]),
+  );
+  if (networkFocusMode && !networkSaveBusy) {
+    const target = dom.sidebarActions.querySelector(`[data-network-mode="${networkFocusMode}"]`);
+    networkFocusMode = null;
+    target?.focus();
+  }
+}
+
+/** 标记配置已写入磁盘，提醒用户重启 ChatGPT 客户端读取新配置。 */
+function markRelaunchNeeded() {
+  if (state.relaunchNeeded) return;
+  state.relaunchNeeded = true;
+  renderChrome();
+}
+
+/** 统一接收主进程的 Codex 配置写入结果，避免漏掉其它配置入口。 */
+function observeCodexWrite(s) {
+  const write = s && s.codex && s.codex.lastWrite;
+  const at = Number(write && write.at);
+  if (!write || !Number.isFinite(at) || at <= observedWriteAt) return;
+  observedWriteAt = at;
+  if (write.ok) markRelaunchNeeded();
+}
+
+/** 调用主进程重启 ChatGPT，并把结果反馈到全局提示与运行日志。 */
+async function relaunchChatGpt() {
+  state.pendingRelaunch = false;
+  window.clearTimeout(relaunchTimer);
+  renderSidebarAction();
+  try {
+    const res = await api.relaunchChatGpt();
+    if (res && res.ok) {
+      state.relaunchNeeded = false;
+      renderChrome();
+      toast('正在重启 ChatGPT 客户端：关闭后会自动拉起并重新读取模型清单', 'ok');
+      logLocal('info', '已请求重启 ChatGPT 客户端');
+    } else {
+      toast(`重启失败：${(res && res.error) || '未知错误'}`, 'error');
+    }
+  } catch (err) {
+    toastError(err, '重启 ChatGPT 失败');
+  }
+}
+
+/** 真正会被写进模型清单的模型数：提供商与模型都必须处于启用状态 */
+function enabledModelCount() {
+  const list = state.models || [];
+  if (list.length) return list.filter((m) => m.enabled).length;
+  // 模型列表还没拉到时用主进程报的「启用数」；status.models 是总数（含停用），
+  // 拿它兜底会把「已注入 N 个模型」报大。
+  const s = state.status;
+  return s ? (typeof s.modelsEnabled === 'number' ? s.modelsEnabled : s.models) : 0;
+}
+
+function renderSidebarFoot(s) {
+  const rows = [];
+  if (!s) {
+    rows.push(el('div', { class: 'foot-row' }, [el('span', { class: 'muted', text: '正在读取本地状态…' })]));
+  } else {
+    const gw = s.gateway || {};
+    const addr = `${gw.host || '127.0.0.1'}:${gw.port ?? '—'}`;
+    rows.push(
+      el('div', { class: 'foot-row' }, [
+        el('span', { class: 'foot-key', text: '网关' }),
+        el('span', { class: 'dot ' + (gw.running ? 'dot-ok' : gw.enabled ? 'dot-warn' : 'dot-off') }),
+        el('span', {
+          class: 'foot-val grow ellipsis',
+          title: gw.url || addr,
+          text: gw.running ? addr : gw.enabled ? `未运行 · ${gw.port ?? '—'}` : '未启用',
+        }),
+      ]),
+    );
+    const on = !!(s.inject && s.inject.enabled);
+    rows.push(
+      el('div', { class: 'foot-row' }, [
+        el('span', { class: 'foot-key', text: '注入' }),
+        el('span', { class: 'chip ' + (on ? 'chip-codex' : ''), text: on ? `已注入 ${enabledModelCount()}` : '未注入' }),
+      ]),
+    );
+  }
+  dom.sidebarFoot.replaceChildren(el('div', { class: 'foot-card' }, rows));
+}
+
+/** 状态栏的「提供商 → 网关 → ChatGPT」链路：本界面唯一的记忆点，直接反映系统接线 */
+function renderFlow(s) {
+  const nodes = [];
+  const sep = () => el('span', { class: 'flow-sep', text: '→' });
+
+  const providersNode = el('span', { class: 'flow-node' }, [
+    el('span', { class: 'flow-key', text: '提供商' }),
+    el('span', { class: 'flow-summary', text: s ? `${s.providers} 个 · 模型 ${s.models}` : '正在读取…' }),
+  ]);
+
+  const gw = (s && s.gateway) || null;
+  const gatewayNode = el('span', { class: 'flow-node' }, [
+    el('span', { class: 'dot ' + (gw ? (gw.running ? 'dot-ok' : gw.enabled ? 'dot-warn' : 'dot-off') : 'dot-off') }),
+    el('span', { class: 'flow-key', text: '网关' }),
+    el('span', {
+      class: 'flow-val' + (gw && gw.running ? '' : ' is-dim'),
+      text: gw ? (gw.running ? `127.0.0.1:${gw.port}` : gw.enabled ? `未运行 · 端口 ${gw.port}` : '未启用') : '–',
+    }),
+  ]);
+
+  const inject = (s && s.inject) || null;
+  const codexNode = el('span', { class: 'flow-node is-codex' }, [
+    el('span', { class: 'dot ' + (inject && inject.enabled ? 'dot-warn' : 'dot-off') }),
+    el('span', { class: 'flow-key', text: 'ChatGPT' }),
+    el('span', {
+      class: 'flow-val',
+      text: inject && inject.enabled ? `已注入 ${enabledModelCount()} 个模型` : '未注入（官方模型）',
+    }),
+  ]);
+
+  nodes.push(providersNode, sep(), gatewayNode, sep(), codexNode);
+  dom.flow.replaceChildren(...nodes);
+}
+
+function updateLogBadge() {
+  const n = state.logs.length;
+  setAnimatedText(dom.logToggleCount, String(n));
+  setAnimatedText(dom.logCount, `${n} 条`);
+}
+
+// ============ 日志抽屉 ============
+function logMetaText(entry) {
+  const parts = [];
+  if (entry.providerId) parts.push(entry.providerId);
+  if (entry.model) parts.push(entry.model);
+  if (entry.status !== undefined && entry.status !== null) parts.push(`HTTP ${entry.status}`);
+  if (entry.ms !== undefined && entry.ms !== null) parts.push(fmt.dur(entry.ms));
+  return parts.join(' · ');
+}
+
+function logRowNode(entry, fresh = false) {
+  const meta = logMetaText(entry);
+  return el('div', { class: `log-row lv-${entry.level || 'info'}${fresh ? ' is-new' : ''}` }, [
+    el('span', { class: 'log-time', text: fmt.clock(entry.at) }),
+    el('span', { class: 'log-level', text: entry.level || 'info' }),
+    el('span', { class: 'log-msg', text: entry.msg || '' }),
+    el('span', { class: 'log-meta', text: meta }),
+  ]);
+}
+
+function matchesFilter(entry) {
+  if (state.logFilter === 'all') return true;
+  if (state.logFilter === 'info') return entry.level !== 'warn' && entry.level !== 'error';
+  return entry.level === state.logFilter;
+}
+
+function appendLogRow(entry) {
+  if (!dom.logList || !matchesFilter(entry)) return;
+  const empty = dom.logList.querySelector('.log-empty');
+  if (empty) empty.remove();
+  dom.logList.appendChild(logRowNode(entry, true));
+}
+
+function trimLogDom() {
+  if (!dom.logList) return;
+  const rows = dom.logList.querySelectorAll('.log-row');
+  for (let i = 0; i < rows.length - LOG_DRAW_LIMIT; i += 1) rows[i].remove();
+}
+
+function renderLogs() {
+  if (!dom.logList) return;
+  // 历史持久化后 state.logs 可能有上万条，全量建 DOM 节点会把抽屉卡死
+  const rows = state.logs.filter(matchesFilter).slice(-LOG_DRAW_LIMIT).map(logRowNode);
+  if (!rows.length) {
+    dom.logList.replaceChildren(
+      el('div', { class: 'log-empty' }, [
+        el('div', { text: state.logs.length ? '当前过滤条件下没有日志' : '暂无日志' }),
+        el('div', {
+          class: 'faint',
+          text: state.logs.length ? '切换到「全部」可以看到其它级别的记录' : '网关收到请求、配置写入后，这里会实时显示',
+        }),
+      ]),
+    );
+  } else {
+    dom.logList.replaceChildren(...rows);
+  }
+  updateLogBadge();
+  autoScrollLogs(true);
+}
+
+function autoScrollLogs(force = false) {
+  if (!dom.logList) return;
+  if (state.logPaused && !force) return;
+  dom.logList.scrollTop = dom.logList.scrollHeight;
+  state.logPaused = false;
+  updateAutoscrollLabel();
+}
+
+function updateAutoscrollLabel() {
+  if (!dom.logAutoscroll) return;
+  dom.logAutoscroll.textContent = state.logPaused ? '滚动已暂停' : '自动滚动';
+  dom.logAutoscroll.classList.toggle('muted', !state.logPaused);
+}
+
+function setLogOpen(open) {
+  state.logOpen = !!open;
+  dom.logDrawer.classList.toggle('is-open', state.logOpen);
+  dom.logToggle.setAttribute('aria-expanded', state.logOpen ? 'true' : 'false');
+  dom.logToggleLabel.textContent = state.logOpen ? '收起日志' : '运行日志';
+  if (dom.logClose) {
+    dom.logClose.replaceChildren(icon(state.logOpen ? 'chevronDown' : 'chevronUp', 14));
+  }
+  if (state.logOpen) {
+    renderLogs();
+  }
+}
+
+// ============ 视图渲染 ============
+let renderPending = false;
+
+function viewHasFocusedInput() {
+  const active = document.activeElement;
+  const inView = !!(active && dom.view && dom.view.contains(active));
+  const inModal = !!(active && dom.modalRoot && dom.modalRoot.contains(active));
+  if (!inView && !inModal) return false;
+  const tag = active.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+}
+
+// 视图内容可能被状态同步或操作结果重建，入场动画若挂在视图节点上会没完没了地重放。
+// 所以只在真正切页时给容器挂 .is-enter，动画跑完就摘掉。
+let enterTimer = null;
+function playEnter() {
+  if (!dom.view) return;
+  dom.view.classList.add('is-enter');
+  if (enterTimer) clearTimeout(enterTimer);
+  enterTimer = setTimeout(() => {
+    enterTimer = null;
+    if (dom.view) dom.view.classList.remove('is-enter');
+  }, 620);
+}
+
+function renderCurrent(force = false, options = {}) {
+  const meta = VIEW_META[state.view];
+  if (!meta) return;
+  // 局部状态变化只重建当前视图内容，不应把用户正在浏览的位置跳回顶部；
+  // 只有切页时才由 navigate 显式传 false。
+  const preserveScrollTop = options.preserveScrollTop !== false;
+  const previousScrollTop = preserveScrollTop ? dom.view.scrollTop : 0;
+  if (!force && viewHasFocusedInput()) {
+    // 记下来，等焦点离开输入框后补一次渲染：否则这次跳过的刷新永远不会再来，
+    // 页面会长期停留在旧数据上。
+    renderPending = true;
+    return;
+  }
+  renderPending = false;
+  dom.viewActions.replaceChildren();
+  dom.view.replaceChildren();
+  try {
+    meta.render(dom.view, ctx, dom.viewActions);
+  } catch (err) {
+    dom.view.replaceChildren(
+      el('div', { class: 'note note-err' }, [
+        icon('alert', 15),
+        el('div', {}, [
+          el('div', { text: `渲染「${meta.title}」页面时出错` }),
+          el('div', { class: 'mono', text: describeError(err) }),
+        ]),
+      ]),
+    );
+  }
+  dom.view.scrollTop = preserveScrollTop ? previousScrollTop : 0;
+}
+
+function navigate(view) {
+  if (!VIEW_META[view]) return;
+  state.view = view;
+  const targetView = view;
+  syncUsageAutoRefresh();
+  renderChrome();
+  dom.viewTitle.classList.remove('is-swapping');
+  window.setTimeout(() => dom.viewTitle.classList.add('is-swapping'), 0);
+  window.setTimeout(() => dom.viewTitle.classList.remove('is-swapping'), 340);
+  playEnter();
+  renderCurrent(true, { preserveScrollTop: false });
+  // 只补齐这一页缺的数据；已有数据靠「刷新」按钮或操作后的 reload 更新，避免切页时反复打 IPC
+  ensureLoaded(view).then(() => {
+    if (state.view !== targetView) return;
+    renderChrome();
+    renderCurrent(true, { preserveScrollTop: false });
+  });
+}
+
+const LOADER_BY_KEY = {
+  status: [loadStatus, '全局状态'],
+  providers: [loadProviders, '提供商列表'],
+  models: [loadModels, '模型列表'],
+  modelLimits: [loadModelLimits, '模型上下文设置'],
+  gateway: [loadGateway, '网关状态'],
+  inject: [loadInject, '注入状态'],
+  usage: [loadUsage, '使用量统计'],
+  logs: [loadLogs, '使用量日志'],
+};
+
+const inflight = new Map();
+
+/** 确保某页依赖的数据已加载（同一份数据并发只拉一次） */
+async function ensureLoaded(view) {
+  const needs = (VIEW_META[view] && VIEW_META[view].needs) || [];
+  const jobs = [];
+  for (const key of needs) {
+    if (state.loaded[key]) continue;
+    const entry = LOADER_BY_KEY[key];
+    if (!entry) continue;
+    if (!inflight.has(key)) {
+      const job = tryLoad(entry[0], entry[1]).finally(() => inflight.delete(key));
+      inflight.set(key, job);
+    }
+    jobs.push(inflight.get(key));
+  }
+  await Promise.all(jobs);
+}
+
+// ============ 提供给各视图的上下文 ============
+const ctx = {
+  api: null, // boot() 里填入 window.gptplus
+  state,
+  el,
+  icon,
+  toast,
+  toastError,
+  logLocal,
+  copyText,
+  fmt,
+  maskKey,
+  shortPath,
+  describeError,
+  setThemePreference,
+  navigate,
+  reload,
+  renderChrome,
+  renderCurrent,
+  markRelaunchNeeded,
+  openModal,
+  closeModal,
+  isModalOpen,
+  openProviderForm: (providerId) => openProviderForm(ctx, providerId),
+  closeProviderForm: () => closeProviderForm(),
+  reorderModelKeys,
+};
+
+// ============ 事件订阅 ============
+function subscribe() {
+  if (subscribed) return;
+  subscribed = true;
+  try {
+    api.onStatus((s) => {
+      if (!s || typeof s !== 'object') return;
+      observeCodexWrite(s);
+      state.status = s;
+      if (s.theme) setThemePreference(s.theme);
+      if (s.modelLimits) state.modelLimits = s.modelLimits;
+      // 视图优先读 state.gateway / state.inject 快照；只更新 state.status 的话
+      // 主进程推来的新状态会被旧快照盖住（例如端口、注入开关在别处改了）。
+      // 合并而不是替换：这两个快照还有 getGateway/getInject 独有的字段（token、modelBase）。
+      if (s.gateway) state.gateway = { ...(state.gateway || {}), ...s.gateway };
+      if (s.network) state.network = { ...(state.network || {}), ...s.network };
+      if (s.inject) state.inject = { ...(state.inject || {}), ...s.inject };
+      state.loaded.status = true;
+      renderChrome();
+      // 状态广播只更新顶部状态栏。配置操作自己的成功/失败流程负责更新当前视图，
+      // 避免修改其它配置时把当前页面整棵 DOM 替换掉。
+    });
+  } catch (err) {
+    logLocal('warn', `订阅状态事件失败: ${describeError(err)}`);
+  }
+  try {
+    api.onLog((entry) => {
+      handleIncomingLog(entry);
+    });
+  } catch (err) {
+    logLocal('warn', `订阅日志事件失败: ${describeError(err)}`);
+  }
+}
+
+// ============ 静态 DOM 接线 ============
+function wireStaticDom() {
+  dom.nav.addEventListener('click', (e) => {
+    const btn = e.target.closest('.nav-item');
+    if (btn && btn.dataset.view) navigate(btn.dataset.view);
+  });
+
+  // 焦点离开输入框后再补上被跳过的渲染；弹窗输入也要保护背景页面。
+  const flushPendingRender = () => {
+    window.setTimeout(() => {
+      if (renderPending && !viewHasFocusedInput()) renderCurrent(true, { preserveScrollTop: true });
+    }, 0);
+  };
+  dom.view.addEventListener('focusout', flushPendingRender);
+  dom.modalRoot.addEventListener('focusout', flushPendingRender);
+
+  dom.logToggle.addEventListener('click', () => setLogOpen(!state.logOpen));
+  dom.logClose.addEventListener('click', () => setLogOpen(false));
+
+  dom.logFilters.addEventListener('click', (e) => {
+    const btn = e.target.closest('.filter-btn');
+    if (!btn) return;
+    state.logFilter = btn.dataset.filter || 'all';
+    for (const b of dom.logFilters.querySelectorAll('.filter-btn')) {
+      b.classList.toggle('is-active', b === btn);
+    }
+    renderLogs();
+  });
+
+  dom.logClear.addEventListener('click', () => {
+    const n = state.logs.length;
+    state.logs = [];
+    renderLogs();
+    logLocal('info', `已清空 ${n} 条本地日志（主进程日志缓冲不受影响）`);
+  });
+
+  dom.logAutoscroll.addEventListener('click', () => {
+    state.logPaused = false;
+    autoScrollLogs(true);
+  });
+
+  dom.logList.addEventListener('scroll', () => {
+    const atBottom = dom.logList.scrollHeight - dom.logList.scrollTop - dom.logList.clientHeight < 24;
+    if (state.logPaused === atBottom) {
+      state.logPaused = !atBottom;
+      updateAutoscrollLabel();
+    }
+  });
+
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && isModalOpen()) {
+      e.preventDefault();
+      closeModal();
+    }
+  });
+
+  window.addEventListener('error', (e) => {
+    logLocal('error', `渲染层异常: ${describeError(e.error || e.message)}`);
+  });
+
+  window.addEventListener('unhandledrejection', (e) => {
+    logLocal('error', `未处理的 Promise 拒绝: ${describeError(e.reason)}`);
+  });
+
+  window.addEventListener('beforeunload', stopUsageAutoRefresh);
+}
+
+function cacheDom() {
+  dom.nav = document.getElementById('nav');
+  dom.sidebarActions = document.getElementById('sidebar-actions');
+  dom.sidebarFoot = document.getElementById('sidebar-foot');
+  dom.viewTitle = document.getElementById('view-title');
+  dom.viewSub = document.getElementById('view-sub');
+  dom.viewActions = document.getElementById('view-actions');
+  dom.view = document.getElementById('view');
+  dom.logDrawer = document.getElementById('log-drawer');
+  dom.logList = document.getElementById('log-list');
+  dom.logCount = document.getElementById('log-count');
+  dom.logFilters = document.getElementById('log-filters');
+  dom.logClear = document.getElementById('log-clear');
+  dom.logClose = document.getElementById('log-close');
+  dom.logToggle = document.getElementById('log-toggle');
+  dom.logToggleLabel = document.getElementById('log-toggle-label');
+  dom.logToggleCount = document.getElementById('log-toggle-count');
+  dom.logAutoscroll = document.getElementById('log-autoscroll');
+  dom.flow = document.getElementById('flow');
+  dom.themeControl = document.getElementById('theme-control');
+  dom.buildTag = document.getElementById('build-tag');
+  dom.modalRoot = document.getElementById('modal-root');
+  dom.toastRoot = document.getElementById('toast-root');
+}
+
+function renderPreloadMissing() {
+  const box = el('div', { class: 'note note-err' }, [
+    icon('alert', 16),
+    el('div', {}, [
+      el('div', { text: '没有检测到 window.gptplus，界面无法与主进程通信。' }),
+      el('div', {
+        class: 'muted',
+        text: '常见原因：preload.cjs 未加载（BrowserWindow 的 preload 路径不对），或主进程启动时抛出了异常。请在开发者工具 Console 里查看报错。',
+      }),
+    ]),
+  ]);
+  dom.view.replaceChildren(box);
+  dom.viewActions.replaceChildren();
+  dom.buildTag.textContent = 'preload 未加载';
+  logLocal('error', 'window.gptplus 不存在：preload 未暴露 API');
+}
+
+async function boot() {
+  cacheDom();
+  wireStaticDom();
+  renderChrome();
+  setLogOpen(false);
+
+  if (!window.gptplus) {
+    renderPreloadMissing();
+    return;
+  }
+  api = window.gptplus;
+  ctx.api = api;
+
+  // 先接收状态广播，网关在主进程后台启动时不会错过状态更新。
+  subscribe();
+
+  // 默认页只依赖全局状态和提供商列表，先画出可交互页面。
+  await ensureLoaded('providers');
+  renderChrome();
+  renderCurrent(true, { preserveScrollTop: false });
+  syncUsageAutoRefresh();
+  logLocal('info', '界面已就绪：gpt++ 渲染层 v1');
+  document.documentElement.dataset.ready = '1';
+  api.notifyReady?.(document.documentElement.dataset.theme);
+
+  // 模型、设置和历史日志不再挡住首屏；加载完成后只刷新真正受影响的区域。
+  void Promise.all([
+    ensureLoaded('models'),
+    ensureLoaded('settings'),
+    tryLoad(loadLogs, '历史日志'),
+    tryLoad(loadUsage, '使用量统计'),
+  ]).then(() => {
+    updateLogBadge();
+    renderChrome();
+    if (state.view === 'usage') renderCurrent(true, { preserveScrollTop: true });
+  });
+}
+
+if (typeof document !== 'undefined') {
+  const start = () => {
+    // boot() 里任何一步抛错都会让界面永久停在「正在加载…」，
+    // 之前异常只落到 unhandledrejection 里，用户完全看不出来。
+    Promise.resolve()
+      .then(boot)
+      .catch((err) => {
+        try {
+          logLocal('error', `界面初始化失败: ${describeError(err)}`);
+          if (typeof toast === 'function') toast(`界面初始化失败：${describeError(err)}`, 'error');
+        } catch {
+          /* 报错路径本身再出错就只能留给控制台 */
+        }
+        document.documentElement.dataset.ready = '1';
+        window.gptplus?.notifyReady?.();
+      });
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start);
+  } else {
+    start();
+  }
+}
+
+export {
+  el,
+  icon,
+  fmt,
+  maskKey,
+  state,
+  handleIncomingLog,
+  mergeUsageLogs,
+  refreshUsageIncrementally,
+  USAGE_REFRESH_INTERVAL_MS,
+};

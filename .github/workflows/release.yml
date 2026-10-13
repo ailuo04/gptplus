@@ -1,0 +1,48 @@
+name: Release Windows App
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build unsigned Windows installer
+        run: npm run dist:unsigned
+
+      - name: Check release artifacts
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem dist -Filter '*-setup.exe' -File
+          $latest = Get-ChildItem dist -Filter 'latest.yml' -File
+          if (-not $installer) { throw 'Windows installer was not produced.' }
+          if (-not $latest) { throw 'latest.yml was not produced; auto-update metadata is missing.' }
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = @(
+            (Get-ChildItem dist -Filter '*-setup.exe' -File).FullName
+            (Get-ChildItem dist -Filter '*.blockmap' -File).FullName
+            (Get-ChildItem dist -Filter 'latest.yml' -File).FullName
+          )
+          gh release create $env:GITHUB_REF_NAME @assets --title "gpt++ $env:GITHUB_REF_NAME" --generate-notes

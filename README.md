@@ -1,0 +1,125 @@
+# gpt++
+
+让 **ChatGPT 桌面客户端**（Windows，MSIX `OpenAI.Codex`）的模型选择器里出现你自己添加的模型。
+
+你在 gpt++ 里填写提供商（名称 / Base URL / API Key / 模型列表），点一下「注入」，
+ChatGPT 的模型下拉菜单里就会出现这些模型；选中后对话请求会经本机的 gpt++ 网关
+转发到对应提供商。
+
+```
+ChatGPT 客户端 ──► 本地网关 127.0.0.1:18120 ──► 你的提供商
+   (选择器显示           (识别 slug，          (OpenAI 兼容 / Anthropic)
+    自定义模型)            改写模型名与鉴权)
+```
+
+## 为什么这样做
+
+ChatGPT 桌面端内置 OpenAI 的 Codex 引擎，它的模型清单由配置里的
+`model_catalog_json` 决定。gpt++ 做三件事：
+
+1. 把你在界面上配好的模型写成一份符合引擎 schema 的目录 JSON；
+2. 在 `~/.codex/config.toml` 顶部写入 `model` / `model_provider` / `model_catalog_json`
+   三个顶层键，并追加一个指向本地网关的 `[model_providers.gptplus]` 段；
+3. 起一个本地网关，按模型 slug 把请求路由到真正的提供商。
+
+改完重启 ChatGPT 客户端即可在选择器里看到。
+
+## 快速开始
+
+```powershell
+npm install                 # 安装 Electron
+npm start                   # 启动 gpt++
+```
+
+界面里：
+
+1. **提供商** → 添加提供商：填名称、Base URL（如 `https://api.deepseek.com/v1`）、API Key，
+   点「从 /models 拉取」自动带出模型列表，或手动添加。可先点「测试连接」验证。
+2. **模型** → 打开「注入到 ChatGPT」开关（会先检查网关是否在跑）。
+3. 点「重启 ChatGPT 客户端」，然后在对话框的模型选择器里选择你的模型。
+
+## 打包给别人安装
+
+```powershell
+npm install
+# 正式发布：需要先设置受 Windows 信任的代码签名证书
+$env:WIN_CSC_LINK = "D:\secrets\gptplus-code-signing.pfx"
+$env:WIN_CSC_KEY_PASSWORD = "证书密码"
+npm run dist
+```
+
+安装包会生成在 `dist/gpt-plus-<版本>-setup.exe`。这是按当前用户安装的 Windows NSIS 安装包，
+不要求安装者拥有管理员权限；安装目录可以在安装时修改，桌面和开始菜单会创建快捷方式。
+安装器内部程序名使用兼容 Windows 的 `gpt-plus.exe`，应用显示名称仍是 `gpt++`。
+
+## GitHub 发布与自动更新
+
+仓库地址：<https://github.com/ailuo04/gptplus>
+
+推送版本标签后，GitHub Actions 会在 Windows runner 上构建安装包，并创建 GitHub Release：
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+已安装的 gpt++ 会在启动约 8 秒后检查 GitHub Release。发现新版本时会在后台下载，下载完成后提示重启安装。
+更新使用 NSIS 安装包和 `latest.yml` 元数据；开发模式、冒烟测试和未打包运行不会执行更新检查。
+
+第一版工作流使用未签名安装包。正式分发前应在 GitHub Actions 中配置代码签名证书，否则 Windows 可能显示“未知发布者”。
+
+`npm run dist` 是正式发布命令：没有证书、证书路径不存在、或构建后签名不是 `Valid` 时会直接失败，
+不会误生成可交付的未签名安装包。只做本机功能测试时使用 `npm run dist:unsigned`，该命令生成的包不应发给别人。
+构建后也可以单独执行 `npm run verify:signature` 检查安装器和主程序的 Authenticode 状态。
+
+安装包只包含 gpt++ 程序本身，不包含本机的 `~/.gptplus`、API Key 或 `~/.codex` 配置。
+每台电脑首次运行时都会使用自己的用户目录，并在重启 ChatGPT 时通过 Windows 的
+`Get-AppxPackage` 动态找到当前实际安装版本，不依赖用户名、盘符或固定版本号。
+如果自动发现不到 ChatGPT，点击重启动作时可以选择该电脑上的 `ChatGPT.exe`，选择结果只保存在当前用户配置中。
+
+代码签名证书必须包含 Code Signing 用途和私钥，并由 Windows 默认信任的证书机构签发；自签名证书只能在
+手动安装该证书的电脑上显示为可信，不能解决发送给普通用户时的“未知发布者”。证书文件和密码只通过环境变量
+提供，不能放进仓库或安装包。签名可以消除“未知发布者”，但新下载程序仍可能因为 SmartScreen 尚未建立信誉而显示额外提示。
+
+## 目录与数据
+
+| 路径 | 内容 |
+|---|---|
+| `~/.gptplus/config.json` | 提供商、密钥、网关设置、注入开关（App 的唯一数据源） |
+| `~/.gptplus/model-catalog.json` | 生成给客户端读的模型目录 |
+| `~/.gptplus/backups/` | 每次改动前的 `config.toml` 备份（保留 10 份）与还原状态 |
+| `~/.codex/config.toml` | 只被增量修改，注入关闭时逐字节还原 |
+
+## 必须知道的三件事
+
+1. **注入是整体替换。** 注入生效期间，ChatGPT 自带的 GPT 模型会从选择器里消失，
+   换成你配置的模型。点「还原注入」即可恢复原状。
+2. **改完要重启客户端。** 引擎按文件路径缓存模型清单，重启最省事。
+3. **别把 `model_catalog_json` 写到文件末尾。** 它必须写在第一个 `[table]` 之前，
+   否则会被当成 `[windows]` 段下的键而被静默忽略——gpt++ 已经帮你处理了这点。
+
+## 开发
+
+```powershell
+npm test                    # 三套单测（core / gateway / renderer），用例数以运行结果为准
+npm run test:core           # 逐套跑更稳
+npm run test:gateway
+npm run test:renderer
+
+node tools\verify-e2e.cjs       # 端到端：store → 目录 → codex 配置 → 客户端清单
+node tools\verify-picker.cjs    # 决定性验证：用真实客户端 app-server 的 model/list 核对
+node tools\live-client-test.cjs # 真机：真实客户端经本地网关拿回复
+```
+
+架构、接口契约与实测结论见 [spec.md](spec.md)；
+桌面端机制调研见 [research/desktop-model-picker.md](research/desktop-model-picker.md)
+与 [research/codex-gateway-protocol.md](research/codex-gateway-protocol.md)；
+验证记录见 [docs/verification.md](docs/verification.md)。
+
+## 已知限制
+
+- 目录是整体替换，无法做到"官方模型 + 自定义模型"同时出现在同一个选择器里。
+- 注入状态与客户端共享 `~/.codex/config.toml`：如果你同时用其他工具改这个文件，
+  关闭注入时 gpt++ 会按自己的备份还原自己写过的那几个键（其它内容不动）。
+- 上游若是 Anthropic 协议，走的是最小实现的适配器；OpenAI 兼容路径覆盖最完整。
+- 网关只在 gpt++ 运行时监听；关掉 App 客户端就发不出请求。

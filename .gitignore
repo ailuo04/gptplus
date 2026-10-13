@@ -1,0 +1,26 @@
+# 依赖与构建产物
+node_modules/
+dist/
+out/
+
+# 运行时/探针产物（不进版本库）
+probe/
+tools/asar-out/
+tools/out/
+tools/variants/
+tools/testhome*/
+tools/*.log
+
+# 逆向调研的原始抓包与隔离 CODEX_HOME 副本（体积大，结论已沉淀到 research/*.md 与 docs/）
+research/capture/homes/
+research/capture/codex-home/
+research/capture/logs/
+research/capture/*.log
+
+# 本机敏感数据
+*.local.json
+
+# Codex 本地计划与原始抓包
+.zcode/
+research/capture/*.jsonl
+research/example-request.json

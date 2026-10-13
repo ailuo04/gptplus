@@ -1,0 +1,786 @@
+﻿'use strict';
+/**
+ * 本地网关 HTTP 服务器（spec.md 第 6、8 节）。
+ *
+ * 路由：
+ *   GET  /healthz          -> { ok:true, providers:<n>, models:<n> }
+ *   GET  /v1/models        -> { object:'list', data:[{id:<slug>, object:'model', owned_by:<providerName>}] }
+ *   POST /v1/responses     -> Responses 契约（流式 SSE / 非流式 JSON）
+ *   OPTIONS *              -> 204（方便浏览器里调试）
+ *
+ * 认证：store.gateway.token（或 start() 传入的 token）非空时，要求
+ *       `Authorization: Bearer <token>`，不匹配返回 401。
+ *
+ * 设计：server.js 只做「HTTP + 认证 + 路由 + 日志 + 生命周期」；
+ *       Responses 事件契约在 responses.js，上游协议在 adapters/*。
+ *       三个适配器返回统一的内部事件流，server 是唯一的翻译出口。
+ *
+ * 签名（spec 第 8 节末）：
+ *   createGateway({ store, paths, log }) => { start, stop, stopSync, getState,
+ *                                             autoStart, probe, on }
+ *   额外可选依赖（不进契约，测试/调试用）：deps.fetch —— 替换 globalThis.fetch。
+ *   `paths` 为签名兼容而接收，网关不直接落盘（日志走 log 回调与内存环形缓冲）。
+ */
+const http = require('node:http');
+const crypto = require('node:crypto');
+
+const { createRouter } = require('./router.js');
+const { createSystemProxyFetch } = require('../system-proxy.js');
+const { createOpenAIAdapter } = require('./adapters/openai.js');
+const { createAnthropicAdapter } = require('./adapters/anthropic.js');
+const { createResponsesAdapter } = require('./adapters/responses.js');
+const {
+  ResponsesStream,
+  buildResponseObject,
+  estimateUsage,
+  extractErrorMessage,
+  extractResponseText,
+  hasCacheUsage,
+  normalizeUsage,
+  pipeResponsesSse,
+  readBodyText,
+  readJsonBody,
+  sendError,
+  sendJson,
+  sendResponsesFailure,
+  writeSseHeaders,
+} = require('./responses.js');
+
+const RING_SIZE = 200;
+const DEFAULT_PORT = 18120;
+const DEFAULT_HOST = '127.0.0.1';
+const REQUEST_TIMEOUT_MS = 15 * 60 * 1000; // 长思考模型可能要十几分钟
+const PROBE_TIMEOUT_MS = 5000;
+const UPSTREAM_TRANSIENT_RETRY_DELAY_MS = 250;
+
+/** 上游 400 且报错提到这些参数时，去掉可选参数重试一次（老中转的兼容姿势）。 */
+const COMPAT_TRIGGER = /stream_options|prompt_cache_key|cache_control|reasoning_effort|max_tokens|tool_choice|parallel_tool_calls|temperature|unknown|unsupported|not supported/i;
+
+function isTransientUpstreamStatus(status) {
+  return status === 502 || status === 503 || status === 504;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function safeEqual(a, b) {
+  const left = Buffer.from(String(a ?? ''), 'utf8');
+  const right = Buffer.from(String(b ?? ''), 'utf8');
+  if (left.length !== right.length) return false;
+  return crypto.timingSafeEqual(left, right);
+}
+
+function describeListenError(err, port) {
+  if (err && err.code === 'EADDRINUSE') return new Error(`端口 ${port} 已被占用，请换一个端口`);
+  if (err && err.code === 'EACCES') return new Error(`没有权限监听端口 ${port}`);
+  if (err && err.code === 'EADDRNOTAVAIL') return new Error(`地址不可用：${port}`);
+  return err instanceof Error ? err : new Error(String(err));
+}
+
+/** 创建本地网关，并让默认上游请求自动跟随 Windows 系统代理。 */
+/**
+ * @param {{ store:any, paths?:any, log?:(e:any)=>void, fetch?:typeof fetch }} deps
+ */
+function createGateway(deps = {}) {
+  const { store, log: externalLog } = deps;
+  // deps.fetch 是契约外的测试注入点：null/undefined 表示用全局 fetch，
+  // 显式传了别的类型说明调用方写错了，直接报错而不是静默忽略。
+  const doFetch = deps.fetch == null ? globalThis.fetch : deps.fetch;
+  if (typeof doFetch !== 'function') {
+    throw new Error('当前 Node 运行时没有可用的 fetch，请升级到 Node 18+');
+  }
+
+  const router = createRouter({ store });
+  const adapters = {
+    openai: createOpenAIAdapter(),
+    anthropic: createAnthropicAdapter(),
+    responses: createResponsesAdapter(),
+  };
+
+  /** @type {any[]} 最近 200 条 */
+  const ring = [];
+  const listeners = new Set();
+
+  const state = {
+    server: null,
+    running: false,
+    port: DEFAULT_PORT,
+    host: DEFAULT_HOST,
+    url: '',
+    startedAt: null,
+    token: '',
+    requests: 0,
+  };
+
+  function configSnapshot() {
+    try {
+      const cfg = typeof store?.get === 'function' ? store.get() : null;
+      return cfg && typeof cfg === 'object' ? cfg : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function storeToken() {
+    const cfg = configSnapshot();
+    return cfg.gateway && typeof cfg.gateway.token === 'string' ? cfg.gateway.token : '';
+  }
+
+  /** 生效 token：start() 传入的优先，其次 store.gateway.token。 */
+  function effectiveToken() {
+    return state.token || storeToken() || '';
+  }
+
+  function logEntry(entry) {
+    const full = { at: Date.now(), level: 'info', ...entry };
+    ring.push(full);
+    if (ring.length > RING_SIZE) ring.splice(0, ring.length - RING_SIZE);
+    try {
+      if (typeof externalLog === 'function') externalLog(entry);
+    } catch {
+      /* 回调异常不影响网关 */
+    }
+    for (const cb of listeners) {
+      try {
+        cb(full);
+      } catch {
+        /* ignore */
+      }
+    }
+    return full;
+  }
+
+  function configuredPort() {
+    const cfg = configSnapshot();
+    const port = Number(cfg?.gateway?.port);
+    return Number.isInteger(port) && port > 0 ? port : DEFAULT_PORT;
+  }
+
+  // -------------------------------------------------------------------------
+  // 生命周期
+  // -------------------------------------------------------------------------
+
+  function getState() {
+    return {
+      running: state.running,
+      port: state.running ? state.port : configuredPort(),
+      host: state.host || DEFAULT_HOST,
+      url: state.running ? state.url : '',
+      startedAt: state.startedAt,
+      requests: state.requests,
+    };
+  }
+
+  function authHeaders() {
+    const token = effectiveToken();
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  }
+
+  /**
+   * @param {{port?:number, host?:string, token?:string}} [opts]
+   * @returns {Promise<{port:number, url:string}>}
+   */
+  async function start(opts = {}) {
+    const cfg = configSnapshot();
+    const wantPort = Number.isInteger(Number(opts.port)) ? Number(opts.port) : configuredPort();
+    const wantHost = opts.host || cfg?.gateway?.host || DEFAULT_HOST;
+    const wantToken = opts.token === undefined ? storeToken() : String(opts.token ?? '');
+
+    if (state.running) {
+      if (state.port === wantPort && state.host === wantHost && state.token === wantToken) {
+        return { port: state.port, url: state.url };
+      }
+      await stop();
+    }
+
+    const server = http.createServer((req, res) => {
+      handleRequest(req, res).catch((err) => {
+        logEntry({ level: 'error', msg: `网关内部错误: ${err && err.message ? err.message : err}` });
+        try {
+          sendError(res, 500, (err && err.message) || '网关内部错误', 'server_error');
+        } catch {
+          /* 响应可能已经开始写了 */
+        }
+      });
+    });
+    server.keepAliveTimeout = 65000;
+    server.headersTimeout = 70000;
+
+    await new Promise((resolve, reject) => {
+      const onError = (err) => {
+        server.removeListener('listening', onListening);
+        reject(describeListenError(err, wantPort));
+      };
+      const onListening = () => {
+        server.removeListener('error', onError);
+        resolve();
+      };
+      server.once('error', onError);
+      server.once('listening', onListening);
+      server.listen(wantPort, wantHost);
+    });
+
+    const address = server.address();
+    state.server = server;
+    state.running = true;
+    state.port = address && typeof address === 'object' ? address.port : wantPort;
+    state.host = wantHost;
+    state.token = wantToken;
+    state.startedAt = Date.now();
+    state.url = `http://${wantHost === '0.0.0.0' ? '127.0.0.1' : wantHost}:${state.port}/v1`;
+    server.on('error', (err) => {
+      logEntry({ level: 'error', msg: `网关服务器错误: ${err.message}` });
+    });
+    return { port: state.port, url: state.url };
+  }
+
+  async function stop() {
+    const server = state.server;
+    state.running = false;
+    state.server = null;
+    state.startedAt = null;
+    state.url = '';
+    if (!server) return;
+    await new Promise((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        resolve();
+      };
+      server.close(finish);
+      if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+      const timer = setTimeout(finish, 1500);
+      if (typeof timer.unref === 'function') timer.unref();
+    });
+  }
+
+  /** 进程退出用的同步版本。 */
+  function stopSync() {
+    const server = state.server;
+    state.running = false;
+    state.server = null;
+    state.startedAt = null;
+    state.url = '';
+    if (!server) return;
+    try {
+      if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+      server.close();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** 读 store.gateway：enabled 就尝试启动；端口占用等失败只记日志，不抛。 */
+  async function autoStart() {
+    const cfg = configSnapshot();
+    const gw = cfg.gateway || {};
+    if (!gw.enabled) {
+      if (state.running) await stop();
+      return;
+    }
+    if (state.running) return;
+    try {
+      const started = await start({
+        port: Number.isInteger(Number(gw.port)) ? Number(gw.port) : DEFAULT_PORT,
+        host: gw.host || DEFAULT_HOST,
+        token: gw.token || '',
+      });
+      logEntry({ level: 'info', msg: `网关已启动: ${started.url}` });
+    } catch (err) {
+      logEntry({ level: 'error', msg: `网关自动启动失败: ${err.message}` });
+    }
+  }
+
+  /** 自测：GET /healthz。 */
+  function probe() {
+    const started = Date.now();
+    return new Promise((resolve) => {
+      if (!state.running) {
+        return resolve({ ok: false, latencyMs: 0, error: '网关未启动' });
+      }
+      const req = http.request(
+        {
+          host: state.host === '0.0.0.0' ? '127.0.0.1' : state.host,
+          port: state.port,
+          path: '/healthz',
+          method: 'GET',
+          headers: authHeaders(),
+        },
+        (res) => {
+          let data = '';
+          res.setEncoding('utf8');
+          res.on('data', (chunk) => {
+            data += chunk;
+          });
+          res.on('end', () => {
+            const latencyMs = Date.now() - started;
+            if (res.statusCode !== 200) {
+              return resolve({ ok: false, latencyMs, error: `健康检查失败: HTTP ${res.statusCode}` });
+            }
+            try {
+              const json = JSON.parse(data);
+              if (json && json.ok) {
+                return resolve({
+                  ok: true,
+                  latencyMs,
+                  providers: json.providers,
+                  models: json.models,
+                  status: res.statusCode,
+                });
+              }
+              resolve({ ok: false, latencyMs, error: '健康检查返回内容异常' });
+            } catch {
+              resolve({ ok: false, latencyMs, error: '健康检查返回内容不是 JSON' });
+            }
+          });
+        },
+      );
+      req.setTimeout(PROBE_TIMEOUT_MS, () => req.destroy(new Error('健康检查超时')));
+      req.on('error', (err) => resolve({ ok: false, latencyMs: Date.now() - started, error: err.message }));
+      req.end();
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // 请求处理
+  // -------------------------------------------------------------------------
+
+  function authorized(req) {
+    const token = effectiveToken();
+    if (!token) return true;
+    const header = req.headers.authorization || req.headers.Authorization || '';
+    const match = /^Bearer\s+(.+)$/i.exec(String(header).trim());
+    if (!match) return false;
+    return safeEqual(match[1].trim(), token);
+  }
+
+  async function handleRequest(req, res) {
+    const url = new URL(req.url || '/', 'http://127.0.0.1');
+    const path = url.pathname.replace(/\/+$/, '') || '/';
+    const method = (req.method || 'GET').toUpperCase();
+
+    if (method === 'OPTIONS') {
+      res.writeHead(204, {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      });
+      res.end();
+      return;
+    }
+
+    if (!authorized(req)) {
+      logEntry({ level: 'warn', msg: `未授权访问: ${method} ${path}`, status: 401 });
+      sendError(res, 401, '无效的网关令牌（Authorization: Bearer <token>）', 'authentication_error');
+      return;
+    }
+
+    if (path === '/healthz' && method === 'GET') {
+      const counts = router.counts();
+      sendJson(res, 200, { ok: true, providers: counts.providers, models: counts.models });
+      return;
+    }
+
+    if (path === '/v1/models' && method === 'GET') {
+      const data = router.listModels().map((model) => ({
+        id: model.slug,
+        object: 'model',
+        created: 0,
+        owned_by: model.providerName,
+        // 下面几个是本网关的扩展信息，标准客户端会忽略
+        provider: model.providerId,
+        display_name: model.label,
+        enabled: model.enabled,
+      }));
+      sendJson(res, 200, { object: 'list', data });
+      return;
+    }
+
+    if (path === '/v1/responses' && method === 'POST') {
+      await handleResponses(req, res);
+      return;
+    }
+
+    sendError(res, 404, `not found: ${method} ${path}`, 'invalid_request_error');
+  }
+
+  async function callUpstream(adapter, { provider, modelId, body, stream, compat }, signal) {
+    const built = adapter.buildRequest({ provider, modelId, body, stream, compat });
+    const upstream = await doFetch(built.url, {
+      method: 'POST',
+      headers: built.headers,
+      body: JSON.stringify(built.payload),
+      signal,
+    });
+    return { built, upstream };
+  }
+
+  /** 上游 400/422 且报错指向可选参数时，去掉可选参数重发才有意义；404 是地址错，重发也一样错。 */
+  function isCompatRetryableStatus(status) {
+    return status === 400 || status === 422 || (status >= 500 && status <= 599);
+  }
+
+  async function handleResponses(req, res) {
+    const started = Date.now();
+    state.requests += 1;
+
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      logEntry({ level: 'warn', msg: `请求体解析失败: ${err.message}`, status: err.statusCode || 400 });
+      sendError(res, err.statusCode || 400, err.message);
+      return;
+    }
+
+    const slug = body && body.model != null ? String(body.model) : '';
+    const route = router.resolve(slug);
+    if (!route.ok) {
+      logEntry({ level: 'warn', msg: route.reason, status: 404, model: slug });
+      sendError(res, 404, route.reason, 'invalid_request_error');
+      return;
+    }
+
+    const provider = route.provider;
+    const adapter =
+      provider.api === 'anthropic'
+        ? adapters.anthropic
+        : provider.api === 'responses'
+          ? adapters.responses
+          : adapters.openai;
+    const wantStream = body.stream !== false;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error('上游响应超时')), REQUEST_TIMEOUT_MS);
+    if (typeof timer.unref === 'function') timer.unref();
+    let clientGone = false;
+    const onClose = () => {
+      if (!res.writableEnded) {
+        clientGone = true;
+        controller.abort(new Error('客户端中断'));
+      }
+    };
+    res.on('close', onClose);
+
+    const baseLog = {
+      requestId: `req_${crypto.randomBytes(12).toString('hex')}`,
+      providerId: provider.id,
+      providerName: route.providerName,
+      model: slug,
+      upstreamModel: route.modelId,
+    };
+    logEntry({ level: 'info', msg: `开始请求 ${slug}`, ...baseLog, status: 0 });
+
+    let finalLogged = false;
+    let pipe = null;
+    let stream = null;
+
+    // 所有已进入上游处理的请求都必须有且只有一条终结记录，避免统计漏项或重复计数。
+    const logFinal = (entry = {}) => {
+      if (finalLogged) return null;
+      finalLogged = true;
+      return logEntry({
+        level: 'info',
+        ...baseLog,
+        ...entry,
+        final: true,
+        ms: entry.ms ?? Date.now() - started,
+      });
+    };
+
+    // 客户端提前断开时，尽量保留上游已经返回的 usage 和缓存字段。
+    const partialUsage = () => {
+      if (stream) {
+        const tokens = stream.usage || estimateUsage(body, stream.text);
+        return {
+          tokens,
+          cacheUsageAvailable: stream.cacheUsageAvailable,
+          estimatedUsage: stream.usageEstimated || !stream.usage || undefined,
+          events: stream.emittedTypes.length,
+        };
+      }
+      if (pipe) {
+        return {
+          tokens: normalizeUsage(pipe.usage) || estimateUsage(body, pipe.outputText),
+          cacheUsageAvailable: hasCacheUsage(pipe.usage),
+          estimatedUsage: !pipe.usage || undefined,
+          events: pipe.events,
+        };
+      }
+      return {};
+    };
+
+    try {
+      let { upstream } = await callUpstream(
+        adapter,
+        { provider, modelId: route.modelId, body, stream: wantStream, compat: false },
+        controller.signal,
+      );
+      logEntry({ level: 'info', msg: `上游返回 HTTP ${upstream.status}`, ...baseLog, status: upstream.status });
+
+      if (!upstream.ok) {
+        const firstText = await readBodyText(upstream);
+        // 两条互斥的重试路径：
+        //   参数不兼容 -> 去掉网关注入的可选参数重发（只对非透传有意义）；
+        //   瞬时错误   -> 原样重发一次（502/503/504；上游抖动很常见）。
+        // 判据必须先看报错文本：502 里报 "unsupported reasoning_effort" 属于前者，
+        // 原样重发只会再失败一次。
+        const paramIssue =
+          !adapter.passthrough && isCompatRetryableStatus(upstream.status) && COMPAT_TRIGGER.test(firstText);
+        const transientIssue = !paramIssue && isTransientUpstreamStatus(upstream.status);
+
+        if (paramIssue) {
+          logEntry({
+            level: 'warn',
+            msg: `上游拒绝可选参数，改用兼容请求重试: HTTP ${upstream.status}`,
+            ...baseLog,
+            status: upstream.status,
+          });
+          const compatAttempt = await callUpstream(
+            adapter,
+            { provider, modelId: route.modelId, body, stream: wantStream, compat: true },
+            controller.signal,
+          );
+          upstream = compatAttempt.upstream;
+          if (!upstream.ok) {
+            const text = await readBodyText(upstream);
+            throw Object.assign(
+              new Error(extractErrorMessage(text, `上游返回 HTTP ${upstream.status}`)),
+              { upstreamStatus: upstream.status, upstreamText: text },
+            );
+          }
+        } else if (transientIssue) {
+          logEntry({
+            level: 'warn',
+            msg: `上游临时错误，短暂重试一次: HTTP ${upstream.status} ${extractErrorMessage(firstText, '')}`.trim(),
+            ...baseLog,
+            status: upstream.status,
+          });
+          await sleep(UPSTREAM_TRANSIENT_RETRY_DELAY_MS);
+          const retryAttempt = await callUpstream(
+            adapter,
+            { provider, modelId: route.modelId, body, stream: wantStream, compat: false },
+            controller.signal,
+          );
+          upstream = retryAttempt.upstream;
+          if (!upstream.ok) {
+            const retryText = await readBodyText(upstream);
+            throw Object.assign(
+              new Error(extractErrorMessage(retryText, `上游返回 HTTP ${upstream.status}`)),
+              { upstreamStatus: upstream.status, upstreamText: retryText },
+            );
+          }
+        } else {
+          throw Object.assign(
+            new Error(extractErrorMessage(firstText, `上游返回 HTTP ${upstream.status}`)),
+            { upstreamStatus: upstream.status, upstreamText: firstText },
+          );
+        }
+      }
+
+      if (!wantStream) {
+        const json = await upstream.json().catch(() => null);
+        if (!json) throw new Error('上游返回的不是 JSON');
+        if (json.error) {
+          throw Object.assign(new Error(extractErrorMessage(JSON.stringify(json), '上游返回错误')), {
+            upstreamStatus: 502,
+          });
+        }
+        if (adapter.passthrough) {
+          // 原生 Responses 响应：原样回给客户端，网关只记日志
+          const entry = logFinal({
+            level: 'info',
+            msg: `完成 ${slug} -> ${route.modelId} (${Date.now() - started}ms)`,
+            status: 200,
+            tokens: normalizeUsage(json.usage) || estimateUsage(body, extractResponseText(json.output)),
+            estimatedUsage: !json.usage || undefined,
+            cacheUsageAvailable: hasCacheUsage(json.usage),
+          });
+          sendJson(res, 200, json);
+          return entry;
+        }
+        const parsed = adapter.parseJson(json);
+        const responseObject = buildResponseObject({
+          model: slug,
+          text: parsed.text,
+          reasoning: parsed.reasoning,
+          toolCalls: parsed.toolCalls,
+          usage: parsed.usage,
+          requestBody: body,
+        });
+        const entry = logFinal({
+          level: 'info',
+          msg: `完成 ${slug} -> ${route.modelId} (${Date.now() - started}ms)`,
+          status: 200,
+          tokens: responseObject.usage,
+          estimatedUsage: !parsed.usage || undefined,
+          cacheUsageAvailable: hasCacheUsage(parsed.usage),
+        });
+        sendJson(res, 200, responseObject);
+        return entry;
+      }
+
+      writeSseHeaders(res);
+      // 透传模式：上游报文逐字节转发，不做内部事件重建（见 adapters/responses.js）；
+      // pipe 只收集日志要用的信息（usage / responseId / 失败事件）。
+      pipe = adapter.passthrough
+        ? { usage: null, outputText: '', responseId: null, events: 0, completed: false, failed: null }
+        : null;
+      stream = adapter.passthrough ? null : new ResponsesStream({ res, model: slug });
+      if (stream) stream.start();
+      try {
+        if (adapter.passthrough) {
+          await pipeResponsesSse(upstream, res, pipe);
+        } else {
+          for await (const event of adapter.translate(upstream)) {
+            switch (event.type) {
+              case 'text':
+                stream.textDelta(event.delta);
+                break;
+              case 'reasoning':
+                stream.reasoningDelta(event.delta);
+                break;
+              case 'tool_start':
+                stream.toolStart({ key: event.key ?? 0, id: event.id, name: event.name });
+                break;
+              case 'tool_args':
+                stream.toolArgsDelta({ key: event.key ?? 0, delta: event.delta });
+                break;
+              case 'usage':
+                stream.setUsage(event.usage);
+                break;
+              default:
+                break;
+            }
+          }
+        }
+        if (clientGone) {
+          logFinal({
+            level: 'warn',
+            msg: `客户端中断: ${slug}`,
+            status: 499,
+            ...partialUsage(),
+          });
+          return;
+        }
+        if (adapter.passthrough) {
+          if (pipe.failed) {
+            logFinal({
+              level: 'error',
+              msg: `上游返回失败事件: ${pipe.failed.message}`,
+              status: 502,
+              ...partialUsage(),
+            });
+            // 上游的 response.failed/error 已经逐字节转发，不能再补发第二个失败帧。
+            if (!res.writableEnded) res.end();
+            return;
+          }
+          if (!pipe.completed) {
+            const message = '上游响应在 response.completed 之前结束';
+            logFinal({
+              level: 'error',
+              msg: `流式转发失败: ${message}`,
+              status: 502,
+              ...partialUsage(),
+            });
+            sendResponsesFailure(res, { responseId: pipe.responseId, message });
+            return;
+          }
+          const entry = logFinal({
+            level: 'info',
+            msg: `完成 ${slug} -> ${route.modelId} (${Date.now() - started}ms)`,
+            status: 200,
+            tokens: normalizeUsage(pipe.usage) || estimateUsage(body, pipe.outputText),
+            cacheUsageAvailable: hasCacheUsage(pipe.usage),
+            estimatedUsage: !pipe.usage || undefined,
+            events: pipe.events,
+          });
+          if (!res.writableEnded) res.end();
+          return entry;
+        }
+        stream.complete({ requestBody: body });
+        logFinal({
+          level: 'info',
+          msg: `完成 ${slug} -> ${route.modelId} (${Date.now() - started}ms)`,
+          status: 200,
+          tokens: stream.usage,
+          cacheUsageAvailable: stream.cacheUsageAvailable,
+          estimatedUsage: stream.usageEstimated || undefined,
+          events: stream.emittedTypes.length,
+        });
+      } catch (err) {
+        logEntry({ level: 'error', msg: `请求异常: ${err && err.message ? err.message : err}`, ...baseLog, status: 502, ms: Date.now() - started, clientGone });
+        if (clientGone) {
+          logFinal({
+            level: 'warn',
+            msg: `客户端中断: ${slug}`,
+            status: 499,
+            ...partialUsage(),
+          });
+          return;
+        }
+        logFinal({
+          level: 'error',
+          msg: `流式转发失败: ${err.message}`,
+          status: 502,
+          ...partialUsage(),
+        });
+        if (adapter.passthrough) {
+          sendResponsesFailure(res, { responseId: pipe && pipe.responseId, message: err.message });
+        } else {
+          stream.fail(err.message);
+        }
+      }
+    } catch (err) {
+      if (clientGone) {
+        logFinal({
+          level: 'warn',
+          msg: `客户端中断: ${slug}`,
+          status: 499,
+          ...partialUsage(),
+        });
+        return;
+      }
+      if (res.writableEnded) return;
+      const status = err.upstreamStatus && err.upstreamStatus < 500 ? err.upstreamStatus : 502;
+      logFinal({
+        level: 'error',
+        msg: `上游请求失败: ${err.message}`,
+        status,
+      });
+      if (!res.headersSent) sendError(res, status, err.message, 'upstream_error');
+    } finally {
+      clearTimeout(timer);
+      res.removeListener('close', onClose);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 事件
+  // -------------------------------------------------------------------------
+
+  function on(event, cb) {
+    if (event !== 'log' || typeof cb !== 'function') return () => {};
+    listeners.add(cb);
+    return () => listeners.delete(cb);
+  }
+
+  return {
+    start,
+    stop,
+    stopSync,
+    getState,
+    autoStart,
+    probe,
+    on,
+    // ---- 以下为契约外的便利方法（渲染层/测试/诊断用）----
+    getLogs: () => ring.slice(),
+    resetLogs: () => {
+      ring.length = 0;
+    },
+    router,
+  };
+}
+
+module.exports = { createGateway, RING_SIZE, DEFAULT_PORT };
