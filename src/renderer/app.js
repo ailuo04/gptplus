@@ -968,8 +968,13 @@ async function checkForUpdates() {
 /** 接收主进程更新事件，并在首次发现版本时弹出确认框。 */
 function handleUpdateState(next) {
   if (!next || typeof next !== 'object') return;
+  const changed = Object.keys(next).some((key) => state.update?.[key] !== next[key]);
   state.update = { ...state.update, ...next };
   renderChrome();
+  // 设置页的更新卡片不属于 chrome；更新事件到达时需要同步重绘，避免左侧和卡片显示不同状态。
+  if (changed && state.view === 'settings') {
+    renderCurrent(false, { preserveScrollTop: true });
+  }
   updateModalSync?.();
   if (state.update.status === 'available' && state.update.version
     && updatePromptedVersion !== state.update.version && !isModalOpen()) {

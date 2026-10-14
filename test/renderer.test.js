@@ -581,6 +581,17 @@ test('状态广播不重建当前页面，避免修改配置时整页闪烁', ()
   assert.doesNotMatch(cssSrc, /\.note\s*\{[^}]*animation:\s*fade/, '持久状态提示不能每次重绘都重新播放淡入动画');
 });
 
+test('更新状态变化时同步刷新设置页更新卡片', () => {
+  const appSrc = read(APP);
+  const start = appSrc.indexOf('function handleUpdateState(next)');
+  const end = appSrc.indexOf('\n}\n\n/** 更新确认弹窗', start);
+  assert.ok(start >= 0 && end > start, '应能定位更新状态处理函数');
+  const handler = appSrc.slice(start, end);
+  assert.match(handler, /const changed = Object\.keys\(next\)/, '更新处理应先判断状态是否真的变化');
+  assert.match(handler, /state\.view === 'settings'/, '设置页需要响应更新状态变化');
+  assert.match(handler, /renderCurrent\(false, \{ preserveScrollTop: true \}\)/, '设置页刷新必须保留滚动位置');
+});
+
 test('提供商表单支持多模型行与从 /models 拉取', () => {
   const src = read(path.join(VIEWS, 'providers.js'));
   assert.match(src, /fetchRemoteModels/, '表单必须调用 fetchRemoteModels');
