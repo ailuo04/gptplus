@@ -427,6 +427,21 @@ test('页面切换恢复 0.1.4 的分层入场动画，并在完成后移除触�
   assert.match(css, /--stagger/);
 });
 
+test('已预渲染页面不会在路由过渡结束后重复重建 DOM', () => {
+  const appSrc = read(APP);
+  assert.match(appSrc, /const readyState = \{ ready: false, rendered: false \}/);
+  assert.match(
+    appSrc,
+    /if \(readyState\.rendered\) return;\s*renderCurrent\(true, \{ preserveScrollTop: false, allowDuringTransition: true \}\);\s*readyState\.rendered = true;\s*playEnter\(activeViewStage\);/s,
+    '路由就绪阶段只应渲染尚未预渲染的页面',
+  );
+  assert.match(
+    appSrc,
+    /renderCurrent\(true, \{ preserveScrollTop: false, allowDuringTransition: true \}\);\s*readyState\.rendered = true;\s*\/\/ stage 仍不可见时挂入场动画[\s\S]*?playEnter\(activeViewStage\);/s,
+    '切页前预渲染后应在 stage 隐藏时开始入场动画，避免二次闪回首帧',
+  );
+});
+
 test('危险按钮默认保持中性，只在悬停时显示红色警示', () => {
   const css = read(CSS);
   assert.match(

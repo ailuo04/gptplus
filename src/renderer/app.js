@@ -1297,7 +1297,9 @@ function renderWhenRouteIsReady(token, targetView, readyState) {
   if (!readyState.ready || routeTransitionActive) return;
   const render = () => {
     if (token !== viewTransitionToken || state.view !== targetView || !activeViewStage) return;
+    if (readyState.rendered) return;
     renderCurrent(true, { preserveScrollTop: false, allowDuringTransition: true });
+    readyState.rendered = true;
     playEnter(activeViewStage);
   };
   // requestIdleCallback 在后台窗口可能被节流，导致用户点击后长时间停留在骨架。
@@ -1382,12 +1384,16 @@ function navigate(view) {
   window.setTimeout(() => dom.viewTitle.classList.remove('is-swapping'), 340);
   activeViewStage = createViewStage(view);
   renderRoutePlaceholder(activeViewStage, view);
+  const readyState = { ready: false, rendered: false };
   const needs = VIEW_META[view].needs || [];
   const canRenderBeforeTransition = view !== 'usage' && needs.every((key) => state.loaded[key]);
   if (canRenderBeforeTransition) {
     // 轻量页先在不可见 stage 内完成一次渲染，点击后马上进入真实内容过渡；
     // 使用量页保留骨架，避免把热力图和长表格塞进切页关键帧。
     renderCurrent(true, { preserveScrollTop: false, allowDuringTransition: true });
+    readyState.rendered = true;
+    // stage 仍不可见时挂入场动画，让它和首次显现同步，避免内容先出现后又闪回首帧。
+    playEnter(activeViewStage);
   }
   if (exitingViewStage) removeViewStage(exitingViewStage);
   if (previous && previous.stage.parentNode) {
@@ -1398,7 +1404,6 @@ function navigate(view) {
   }
   activeViewStage.stage.classList.add('is-transitioning');
   routeTransitionActive = true;
-  const readyState = { ready: false };
   const nextFrame = typeof window.requestAnimationFrame === 'function'
     && document.visibilityState !== 'hidden'
     ? window.requestAnimationFrame.bind(window)
