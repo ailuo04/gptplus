@@ -50,7 +50,7 @@ if (process.platform === 'win32') app.setAppUserModelId('com.ailuo.gptplus');
 
 const { createWindowLifecycle } = require('./window-lifecycle.js');
 const { TRAY_ICON_DATA_URL } = require('./tray-icon.js');
-const { setupAutoUpdater } = require('./updater.js');
+const { setupAutoUpdater, cleanupInstalledUpdateCache } = require('./updater.js');
 const { autoUpdater } = require('electron-updater');
 
 const isDev = process.argv.includes('--dev');
@@ -324,6 +324,10 @@ async function boot() {
       ctx.log?.(entry);
       broadcast('gptplus:log', entry);
     },
+  });
+
+  void cleanupInstalledUpdateCache({ app }).then((cleaned) => {
+    if (cleaned) ctx.log?.({ at: Date.now(), level: 'info', msg: '已清理已安装版本的更新缓存' });
   });
 
   const { registerIpc } = require('../core/ipc.js');

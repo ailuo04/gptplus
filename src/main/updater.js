@@ -1,5 +1,79 @@
 'use strict';
 
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+const UPDATER_CACHE_DIR = 'gptplus-updater';
+
+/**
+ * 新版本启动后整理更新缓存，保留差分更新所需的当前版本基准。
+ * 已安装版本的安装器和 blockmap 会提升到缓存根目录，pending 副本随后删除。
+ */
+async function cleanupInstalledUpdateCache(options = {}) {
+  const {
+    app,
+    platform = process.platform,
+    env = process.env,
+    fileSystem = fs.promises,
+    homeDir = os.homedir(),
+  } = options;
+  if (platform !== 'win32' || !app?.isPackaged || typeof app.getVersion !== 'function') return false;
+
+  const currentVersion = String(app.getVersion() || '');
+  const currentParts = currentVersion.match(/^(\d+)\.(\d+)\.(\d+)$/);
+  if (!currentParts) return false;
+
+  const localAppData = env.LOCALAPPDATA || path.join(homeDir, 'AppData', 'Local');
+  const cacheRoot = path.resolve(localAppData);
+  const cacheDir = path.resolve(cacheRoot, UPDATER_CACHE_DIR);
+  if (path.dirname(cacheDir) !== cacheRoot || path.basename(cacheDir) !== UPDATER_CACHE_DIR) return false;
+
+  const pendingDir = path.join(cacheDir, 'pending');
+  let updateInfo;
+  try {
+    updateInfo = JSON.parse(await fileSystem.readFile(path.join(pendingDir, 'update-info.json'), 'utf8'));
+  } catch {
+    return false;
+  }
+
+  const cachedVersion = String(updateInfo?.fileName || '').match(/^gpt-plus-(\d+)\.(\d+)\.(\d+)-setup\.exe$/);
+  if (!cachedVersion) return false;
+  const installed = currentParts.slice(1).map(Number);
+  const cached = cachedVersion.slice(1).map(Number);
+  let comparison = 0;
+  for (let index = 0; index < installed.length; index += 1) {
+    if (cached[index] !== installed[index]) {
+      comparison = cached[index] > installed[index] ? 1 : -1;
+      break;
+    }
+  }
+  if (comparison > 0) return false;
+
+  try {
+    if (comparison < 0) {
+      await fileSystem.rm(pendingDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 });
+      return true;
+    }
+
+    const pendingInstaller = path.join(pendingDir, updateInfo.fileName);
+    const currentInstaller = path.join(cacheDir, 'installer.exe');
+    const pendingBlockMap = path.join(pendingDir, 'current.blockmap');
+    const currentBlockMap = path.join(cacheDir, 'current.blockmap');
+    await fileSystem.copyFile(pendingInstaller, currentInstaller);
+    try {
+      await fileSystem.copyFile(pendingBlockMap, currentBlockMap);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      await fileSystem.rm(currentBlockMap, { force: true });
+    }
+    await fileSystem.rm(pendingDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * 配置 GitHub Release 自动更新。
  * 开发模式、冒烟测试和未打包运行时不执行网络更新检查。
@@ -53,6 +127,8 @@ function setupAutoUpdater(options = {}) {
 
   autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = false;
+  // 保留 electron-updater 的 blockmap 差分下载，减少更新时的网络流量。
+  autoUpdater.disableDifferentialDownload = false;
 
   autoUpdater.on('checking-for-update', () => {
     checking = true;
@@ -147,4 +223,4 @@ function setupAutoUpdater(options = {}) {
   };
 }
 
-module.exports = { setupAutoUpdater };
+module.exports = { setupAutoUpdater, cleanupInstalledUpdateCache };

@@ -18,6 +18,8 @@ test('Windows 打包配置使用稳定 appId、安全的内部文件名，并且
   assert.equal(pkg.build.publish.owner, 'ailuo04');
   assert.equal(pkg.build.publish.repo, 'gptplus');
   assert.equal(pkg.build.asar, true);
+  assert.deepEqual(pkg.build.electronLanguages, ['zh-CN', 'en-US']);
+  assert.equal(pkg.build.publish.updaterCacheDirName, 'gptplus-updater');
   assert.equal(pkg.build.win.requestedExecutionLevel, 'asInvoker');
   assert.equal(pkg.build.win.signExecutable, true);
   assert.equal(pkg.build.nsis.perMachine, false);
