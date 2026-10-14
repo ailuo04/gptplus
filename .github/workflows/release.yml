@@ -45,4 +45,9 @@ jobs:
             (Get-ChildItem dist -Filter '*.blockmap' -File).FullName
             (Get-ChildItem dist -Filter 'latest.yml' -File).FullName
           )
-          gh release create $env:GITHUB_REF_NAME @assets --title "gpt++ $env:GITHUB_REF_NAME" --generate-notes
+          $notes = Join-Path $env:GITHUB_WORKSPACE "docs/releases/$($env:GITHUB_REF_NAME).md"
+          if (Test-Path $notes) {
+            gh release create $env:GITHUB_REF_NAME @assets --title "gpt++ $env:GITHUB_REF_NAME" --notes-file $notes
+          } else {
+            gh release create $env:GITHUB_REF_NAME @assets --title "gpt++ $env:GITHUB_REF_NAME" --generate-notes
+          }
