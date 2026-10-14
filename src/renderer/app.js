@@ -692,6 +692,7 @@ function renderChrome() {
   dom.viewSub.textContent = meta.sub;
 
   // 侧栏底部
+  renderSidebarUpdateQuick();
   renderSidebarAction();
   renderSidebarFoot(s);
 
@@ -701,6 +702,52 @@ function renderChrome() {
 
   // 版本
   dom.buildTag.textContent = s && s.appVersion ? `v${s.appVersion}` : '';
+}
+
+/** 左侧常驻更新入口：检查、最新版提示和用户确认后的安装都从这里进入。 */
+function renderSidebarUpdateQuick() {
+  const root = dom.sidebarUpdateQuick;
+  if (!root) return;
+  const update = state.update || {};
+  const status = update.status || 'idle';
+  const checking = status === 'checking';
+  const downloading = status === 'downloading';
+  const pending = status === 'available' || status === 'downloaded';
+  const disabled = !api || checking || downloading || update.enabled === false;
+  const label = status === 'checking'
+    ? '检查中…'
+    : status === 'available'
+      ? `更新到 v${update.version || ''}`
+      : status === 'downloading'
+        ? `下载中 ${Math.round(update.percent || 0)}%`
+        : status === 'downloaded'
+          ? '继续安装更新'
+          : status === 'latest'
+            ? '已是最新版本'
+            : status === 'error'
+              ? '重试检查更新'
+              : update.enabled === false ? '更新不可用' : '检查更新';
+  const title = status === 'available'
+    ? '下载并安装新版本'
+    : status === 'downloaded'
+      ? '重启并安装已下载的更新'
+      : status === 'latest'
+        ? '再次检查 GitHub Release'
+        : '检查 GitHub Release 更新';
+  const iconName = pending || downloading ? 'download' : status === 'latest' ? 'check' : status === 'error' ? 'alert' : 'refresh';
+  root.replaceChildren(el('button', {
+    class: `sidebar-update-quick-button${status === 'latest' ? ' is-latest' : ''}${pending ? ' is-pending' : ''}`,
+    type: 'button',
+    disabled: disabled ? true : null,
+    title,
+    attrs: { 'aria-label': title },
+    on: {
+      click: () => {
+        if (status === 'available' || status === 'downloaded') void startUpdateDownload();
+        else void checkForUpdates();
+      },
+    },
+  }, [icon(iconName, 13), el('span', { text: label })]));
 }
 
 /** 底部状态栏里的全局主题快捷切换。图标按钮保留 title，便于鼠标悬停识别。 */
@@ -1419,6 +1466,7 @@ function wireStaticDom() {
 
 function cacheDom() {
   dom.nav = document.getElementById('nav');
+  dom.sidebarUpdateQuick = document.getElementById('sidebar-update-quick');
   dom.sidebarActions = document.getElementById('sidebar-actions');
   dom.sidebarFoot = document.getElementById('sidebar-foot');
   dom.viewTitle = document.getElementById('view-title');

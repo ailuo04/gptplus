@@ -150,6 +150,10 @@ test('重启 ChatGPT 是侧栏全局动作，而不是某个页面的局部动�
   assert.match(html, /id="sidebar-actions"/, '侧栏必须提供全局动作挂载点');
   assert.match(appSrc, /renderSidebarAction\(\)/, 'app.js 必须渲染侧栏重启动作');
   assert.match(appSrc, /api\.relaunchChatGpt\(\)/, '侧栏动作必须调用重启 API');
+  assert.match(html, /id="sidebar-update-quick"/, '左侧必须提供常驻更新快捷入口');
+  assert.match(appSrc, /function renderSidebarUpdateQuick\(\)/, 'app.js 必须渲染常驻更新快捷入口');
+  assert.match(appSrc, /startUpdateDownload\(\)/, '快捷更新入口必须支持用户确认后安装');
+  assert.match(cssSrc, /\.sidebar-update-quick-button\s*\{/, '常驻更新快捷入口必须有独立样式');
   assert.match(appSrc, /relaunchNeeded: false/, '必须有独立的待重启状态');
   assert.match(appSrc, /配置已修改，需要重启 ChatGPT 客户端生效/, '待重启状态必须给出明确警示');
   assert.match(appSrc, /observeCodexWrite\(s\)/, '状态广播应统一检测 Codex 配置写入');
