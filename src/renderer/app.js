@@ -259,6 +259,10 @@ let networkFocusMode = null;
 let observedWriteAt = 0;
 let updatePromptedVersion = null;
 let updateModalSync = null;
+let viewTransitionToken = 0;
+let activeViewStage = null;
+let exitingViewStage = null;
+const ROUTE_TRANSITION_MS = 240;
 
 const dom = {};
 
@@ -267,16 +271,20 @@ function toast(message, kind = 'info', ttlOverride) {
   const root = dom.toastRoot;
   if (!root) return;
   const iconName = kind === 'ok' ? 'check' : kind === 'warn' ? 'alert' : kind === 'error' ? 'alert' : 'info';
-  const node = el('div', { class: `toast toast-${kind}`, attrs: { role: 'status' } }, [
+  const ttl = ttlOverride ?? (kind === 'error' ? 6500 : kind === 'warn' ? 5000 : 3400);
+  const node = el('div', {
+    class: `toast toast-${kind}`,
+    attrs: { role: 'status' },
+    style: { '--toast-duration': `${ttl}ms` },
+  }, [
     icon(iconName, 14),
     el('div', { class: 'toast-msg', text: String(message ?? '') }),
   ]);
   root.appendChild(node);
   while (root.children.length > MAX_TOASTS) root.removeChild(root.firstElementChild);
-  const ttl = ttlOverride ?? (kind === 'error' ? 6500 : kind === 'warn' ? 5000 : 3400);
   window.setTimeout(() => {
     node.classList.add('is-closing');
-    window.setTimeout(() => node.remove(), 180);
+    window.setTimeout(() => node.remove(), 390);
   }, ttl);
 }
 
@@ -663,6 +671,11 @@ function renderChrome() {
   // 导航
   for (const btn of dom.nav.querySelectorAll('.nav-item')) {
     btn.classList.toggle('is-active', btn.dataset.view === state.view);
+  }
+  const activeNav = dom.nav.querySelector('.nav-item.is-active');
+  if (activeNav) {
+    dom.nav.style.setProperty('--nav-indicator-y', `${activeNav.offsetTop}px`);
+    dom.nav.style.setProperty('--nav-indicator-h', `${activeNav.offsetHeight}px`);
   }
   const providerBadge = dom.nav.querySelector('[data-badge="providers"]');
   const modelBadge = dom.nav.querySelector('[data-badge="models"]');
@@ -1239,17 +1252,31 @@ function viewHasFocusedInput() {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
 }
 
-// 视图内容可能被状态同步或操作结果重建，入场动画若挂在视图节点上会没完没了地重放。
-// 所以只在真正切页时给容器挂 .is-enter，动画跑完就摘掉。
-let enterTimer = null;
-function playEnter() {
-  if (!dom.view) return;
-  dom.view.classList.add('is-enter');
-  if (enterTimer) clearTimeout(enterTimer);
-  enterTimer = setTimeout(() => {
-    enterTimer = null;
-    if (dom.view) dom.view.classList.remove('is-enter');
-  }, 620);
+function createViewStage(view, initial = false) {
+  const stage = el('section', {
+    class: `page-stage ${initial ? 'is-active' : 'is-idle'}`,
+    data: { view },
+    attrs: { 'aria-hidden': initial ? 'false' : 'true' },
+  });
+  const content = el('div', {
+    class: `page-stage-content ${initial ? 'is-active' : 'is-idle'}`,
+  });
+  stage.append(content);
+  dom.view.append(stage);
+  return { view, stage, content };
+}
+
+function removeViewStage(ref) {
+  if (!ref) return;
+  ref.stage.remove();
+  if (exitingViewStage === ref) exitingViewStage = null;
+}
+
+function ensureActiveViewStage() {
+  if (activeViewStage && activeViewStage.stage.parentNode) return activeViewStage;
+  dom.view.replaceChildren();
+  activeViewStage = createViewStage(state.view, true);
+  return activeViewStage;
 }
 
 function renderCurrent(force = false, options = {}) {
@@ -1257,8 +1284,9 @@ function renderCurrent(force = false, options = {}) {
   if (!meta) return;
   // 局部状态变化只重建当前视图内容，不应把用户正在浏览的位置跳回顶部；
   // 只有切页时才由 navigate 显式传 false。
+  const stageRef = ensureActiveViewStage();
   const preserveScrollTop = options.preserveScrollTop !== false;
-  const previousScrollTop = preserveScrollTop ? dom.view.scrollTop : 0;
+  const previousScrollTop = preserveScrollTop ? stageRef.stage.scrollTop : 0;
   if (!force && viewHasFocusedInput()) {
     // 记下来，等焦点离开输入框后补一次渲染：否则这次跳过的刷新永远不会再来，
     // 页面会长期停留在旧数据上。
@@ -1267,11 +1295,11 @@ function renderCurrent(force = false, options = {}) {
   }
   renderPending = false;
   dom.viewActions.replaceChildren();
-  dom.view.replaceChildren();
+  stageRef.content.replaceChildren();
   try {
-    meta.render(dom.view, ctx, dom.viewActions);
+    meta.render(stageRef.content, ctx, dom.viewActions);
   } catch (err) {
-    dom.view.replaceChildren(
+    stageRef.content.replaceChildren(
       el('div', { class: 'note note-err' }, [
         icon('alert', 15),
         el('div', {}, [
@@ -1281,11 +1309,14 @@ function renderCurrent(force = false, options = {}) {
       ]),
     );
   }
-  dom.view.scrollTop = preserveScrollTop ? previousScrollTop : 0;
+  stageRef.stage.scrollTop = preserveScrollTop ? previousScrollTop : 0;
 }
 
 function navigate(view) {
   if (!VIEW_META[view]) return;
+  if (view === state.view) return;
+  const token = ++viewTransitionToken;
+  const previous = activeViewStage;
   state.view = view;
   const targetView = view;
   syncUsageAutoRefresh();
@@ -1293,13 +1324,38 @@ function navigate(view) {
   dom.viewTitle.classList.remove('is-swapping');
   window.setTimeout(() => dom.viewTitle.classList.add('is-swapping'), 0);
   window.setTimeout(() => dom.viewTitle.classList.remove('is-swapping'), 340);
-  playEnter();
+  if (exitingViewStage) removeViewStage(exitingViewStage);
+  if (previous) {
+    previous.stage.classList.remove('is-active', 'is-idle');
+    previous.stage.classList.add('is-exiting');
+    previous.stage.setAttribute('aria-hidden', 'true');
+    previous.content.classList.remove('is-active', 'is-idle');
+    previous.content.classList.add('is-exiting');
+    exitingViewStage = previous;
+  }
+  activeViewStage = createViewStage(view);
   renderCurrent(true, { preserveScrollTop: false });
+  const nextFrame = typeof window.requestAnimationFrame === 'function'
+    ? window.requestAnimationFrame.bind(window)
+    : (callback) => window.setTimeout(callback, 0);
+  nextFrame(() => {
+    if (token !== viewTransitionToken || !activeViewStage) return;
+    activeViewStage.stage.classList.remove('is-idle');
+    activeViewStage.stage.classList.add('is-active');
+    activeViewStage.stage.setAttribute('aria-hidden', 'false');
+    activeViewStage.content.classList.remove('is-idle');
+    activeViewStage.content.classList.add('is-active');
+  });
+  window.setTimeout(() => {
+    if (token !== viewTransitionToken) return;
+    removeViewStage(exitingViewStage);
+  }, ROUTE_TRANSITION_MS);
   // 只补齐这一页缺的数据；已有数据靠「刷新」按钮或操作后的 reload 更新，避免切页时反复打 IPC
   ensureLoaded(view).then(() => {
     if (state.view !== targetView) return;
+    if (token !== viewTransitionToken) return;
     renderChrome();
-    renderCurrent(true, { preserveScrollTop: false });
+    renderCurrent(true, { preserveScrollTop: true });
   });
 }
 

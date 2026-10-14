@@ -335,7 +335,9 @@ export function openProviderForm(ctx, providerId = null) {
     name: existing ? existing.name : '',
     baseUrl: existing ? existing.baseUrl : '',
     apiKey: existing ? existing.apiKey || '' : '',
-    api: existing && (existing.api === 'anthropic' || existing.api === 'responses') ? existing.api : 'openai',
+    api: existing && (existing.api === 'openai' || existing.api === 'anthropic' || existing.api === 'responses')
+      ? existing.api
+      : 'responses',
     enabled: existing ? existing.enabled !== false : true,
     headers: Object.entries((existing && existing.headers) || {}).map(([key, value]) => ({ key, value })),
     models: ((existing && existing.models) || []).map((m) => ({
@@ -356,7 +358,7 @@ export function openProviderForm(ctx, providerId = null) {
     class: 'input',
     type: 'text',
     value: draft.name,
-    placeholder: '例如：梦幻API',
+    placeholder: 'XXX',
     attrs: { 'data-autofocus': 'true', autocomplete: 'off' },
     on: { input: (e) => { draft.name = e.target.value; clearError(refs.nameErr); } },
   });
@@ -408,7 +410,7 @@ export function openProviderForm(ctx, providerId = null) {
   });
 
   // API 协议分段控件
-  const apiSeg = el('div', { class: 'seg', attrs: { role: 'group', 'aria-label': '接口协议' } });
+  const apiSeg = el('div', { class: 'seg seg-api', attrs: { role: 'group', 'aria-label': '接口协议' } });
   for (const value of ['openai', 'responses', 'anthropic']) {
     apiSeg.append(
       el('button', {
@@ -645,7 +647,7 @@ export function openProviderForm(ctx, providerId = null) {
                 id: '',
                 label: '',
                 enabled: true,
-                reasoning: false,
+                reasoning: true,
               });
               filterInput.value = '';
               draft.filter = '';
@@ -770,7 +772,7 @@ async function saveDraft(ctx, draft, refs, saveBtn, opts = {}) {
   // 校验
   let bad = false;
   if (!String(draft.name || '').trim()) {
-    if (refs.nameErr) refs.nameErr.textContent = '请填写提供商名称，例如「梦幻API」';
+    if (refs.nameErr) refs.nameErr.textContent = '请填写提供商名称，例如「XXX」';
     if (refs.nameInput) refs.nameInput.classList.add('is-invalid');
     bad = true;
   } else if (refs.nameInput) {
@@ -925,7 +927,7 @@ async function doPull(ctx, draft, afterRowsChange) {
           id,
           label: String((item && item.label) || id).trim() || id,
           enabled: true,
-          reasoning: false,
+          reasoning: true,
         });
         added += 1;
       }
