@@ -262,7 +262,9 @@ let updateModalSync = null;
 let viewTransitionToken = 0;
 let activeViewStage = null;
 let exitingViewStage = null;
-const ROUTE_TRANSITION_MS = 240;
+const ROUTE_TRANSITION_MS = 180;
+let routeTransitionActive = false;
+let enterTimer = null;
 
 const dom = {};
 
@@ -1266,6 +1268,56 @@ function createViewStage(view, initial = false) {
   return { view, stage, content };
 }
 
+function renderRoutePlaceholder(stageRef, view) {
+  if (!stageRef?.content) return;
+  stageRef.content.replaceChildren(
+    el('div', {
+      class: 'route-placeholder',
+      attrs: { 'aria-label': `${VIEW_META[view]?.title || '页面'}正在加载` },
+    }, [
+      el('div', { class: 'route-placeholder-toolbar' }, [
+        el('span', { class: 'route-placeholder-line is-title' }),
+        el('span', { class: 'route-placeholder-line is-control' }),
+      ]),
+      el('div', { class: 'route-placeholder-stats' }, [
+        el('span', { class: 'route-placeholder-card' }),
+        el('span', { class: 'route-placeholder-card' }),
+        el('span', { class: 'route-placeholder-card' }),
+      ]),
+      el('div', { class: 'route-placeholder-panel' }, [
+        el('span', { class: 'route-placeholder-line is-wide' }),
+        el('span', { class: 'route-placeholder-line is-medium' }),
+        el('span', { class: 'route-placeholder-line is-short' }),
+      ]),
+    ]),
+  );
+}
+
+function renderWhenRouteIsReady(token, targetView, readyState) {
+  if (!readyState.ready || routeTransitionActive) return;
+  const render = () => {
+    if (token !== viewTransitionToken || state.view !== targetView || !activeViewStage) return;
+    renderCurrent(true, { preserveScrollTop: false, allowDuringTransition: true });
+    playEnter(activeViewStage);
+  };
+  // requestIdleCallback 在后台窗口可能被节流，导致用户点击后长时间停留在骨架。
+  // 过渡已结束，此处直接排到下一轮任务，让真实内容尽快出现。
+  window.setTimeout(render, 0);
+}
+
+// 页面切换时只给当前内容层挂入场动画；局部重绘不会重复播放动画。
+function playEnter(stageRef) {
+  const content = stageRef?.content;
+  if (!content) return;
+  content.classList.remove('is-enter');
+  content.classList.add('is-enter');
+  if (enterTimer) window.clearTimeout(enterTimer);
+  enterTimer = window.setTimeout(() => {
+    enterTimer = null;
+    content.classList.remove('is-enter');
+  }, 620);
+}
+
 function removeViewStage(ref) {
   if (!ref) return;
   ref.stage.remove();
@@ -1282,6 +1334,10 @@ function ensureActiveViewStage() {
 function renderCurrent(force = false, options = {}) {
   const meta = VIEW_META[state.view];
   if (!meta) return;
+  if (routeTransitionActive && !options.allowDuringTransition) {
+    renderPending = true;
+    return;
+  }
   // 局部状态变化只重建当前视图内容，不应把用户正在浏览的位置跳回顶部；
   // 只有切页时才由 navigate 显式传 false。
   const stageRef = ensureActiveViewStage();
@@ -1324,18 +1380,27 @@ function navigate(view) {
   dom.viewTitle.classList.remove('is-swapping');
   window.setTimeout(() => dom.viewTitle.classList.add('is-swapping'), 0);
   window.setTimeout(() => dom.viewTitle.classList.remove('is-swapping'), 340);
+  activeViewStage = createViewStage(view);
+  renderRoutePlaceholder(activeViewStage, view);
+  const needs = VIEW_META[view].needs || [];
+  const canRenderBeforeTransition = view !== 'usage' && needs.every((key) => state.loaded[key]);
+  if (canRenderBeforeTransition) {
+    // 轻量页先在不可见 stage 内完成一次渲染，点击后马上进入真实内容过渡；
+    // 使用量页保留骨架，避免把热力图和长表格塞进切页关键帧。
+    renderCurrent(true, { preserveScrollTop: false, allowDuringTransition: true });
+  }
   if (exitingViewStage) removeViewStage(exitingViewStage);
-  if (previous) {
+  if (previous && previous.stage.parentNode) {
     previous.stage.classList.remove('is-active', 'is-idle');
-    previous.stage.classList.add('is-exiting');
+    previous.stage.classList.add('is-exiting', 'is-transitioning');
     previous.stage.setAttribute('aria-hidden', 'true');
-    previous.content.classList.remove('is-active', 'is-idle');
-    previous.content.classList.add('is-exiting');
     exitingViewStage = previous;
   }
-  activeViewStage = createViewStage(view);
-  renderCurrent(true, { preserveScrollTop: false });
+  activeViewStage.stage.classList.add('is-transitioning');
+  routeTransitionActive = true;
+  const readyState = { ready: false };
   const nextFrame = typeof window.requestAnimationFrame === 'function'
+    && document.visibilityState !== 'hidden'
     ? window.requestAnimationFrame.bind(window)
     : (callback) => window.setTimeout(callback, 0);
   nextFrame(() => {
@@ -1343,19 +1408,19 @@ function navigate(view) {
     activeViewStage.stage.classList.remove('is-idle');
     activeViewStage.stage.classList.add('is-active');
     activeViewStage.stage.setAttribute('aria-hidden', 'false');
-    activeViewStage.content.classList.remove('is-idle');
-    activeViewStage.content.classList.add('is-active');
   });
   window.setTimeout(() => {
     if (token !== viewTransitionToken) return;
+    routeTransitionActive = false;
     removeViewStage(exitingViewStage);
+    activeViewStage?.stage.classList.remove('is-transitioning');
+    renderWhenRouteIsReady(token, targetView, readyState);
   }, ROUTE_TRANSITION_MS);
-  // 只补齐这一页缺的数据；已有数据靠「刷新」按钮或操作后的 reload 更新，避免切页时反复打 IPC
+  // Load data alongside the visual transition; heavy DOM work waits until it has completed.
   ensureLoaded(view).then(() => {
-    if (state.view !== targetView) return;
-    if (token !== viewTransitionToken) return;
-    renderChrome();
-    renderCurrent(true, { preserveScrollTop: true });
+    if (state.view !== targetView || token !== viewTransitionToken) return;
+    readyState.ready = true;
+    renderWhenRouteIsReady(token, targetView, readyState);
   });
 }
 

@@ -401,6 +401,32 @@ test('styles.css 里用到的 CSS 变量都有定义', () => {
   assert.deepEqual(missing, [], `styles.css 引用了未定义的变量：${missing.join(', ')}`);
 });
 
+test('路由过渡只临时提升整页图层，不让长内容和表格行常驻 GPU 图层', () => {
+  const css = read(CSS);
+  assert.match(css, /\.page-stage\.is-transitioning\s*\{[^}]*will-change:\s*opacity\s*,\s*transform/s);
+  const stageRule = css.match(/\.page-stage\s*\{([^}]*)\}/s)?.[1] || '';
+  const contentRule = css.match(/\.page-stage-content\s*\{([^}]*)\}/s)?.[1] || '';
+  const rowRule = css.match(/\.tbody-row\s*\{([^}]*)\}/s)?.[1] || '';
+  assert.doesNotMatch(stageRule, /will-change/);
+  assert.doesNotMatch(contentRule, /will-change/);
+  assert.doesNotMatch(contentRule, /transition(?:-property)?:[^;]*(?:transform|opacity)/);
+  assert.doesNotMatch(rowRule, /will-change/);
+  assert.match(css, /\.route-placeholder\s*\{/);
+  assert.match(css, /\.route-placeholder-card/);
+});
+
+test('页面切换恢复 0.1.4 的分层入场动画，并在完成后移除触发类', () => {
+  const appSrc = read(APP);
+  const css = read(CSS);
+  assert.match(appSrc, /function playEnter\(stageRef\)/);
+  assert.match(appSrc, /content\.classList\.add\('is-enter'\)/);
+  assert.match(appSrc, /content\.classList\.remove\('is-enter'\)/);
+  assert.match(css, /\.page-stage-content\.is-enter > \*\s*\{[^}]*animation:\s*rise/s);
+  assert.match(css, /\.page-stage-content\.is-enter \.usage-heatmap-grid/);
+  assert.match(css, /\.page-stage-content\.is-enter \.empty-glyph/);
+  assert.match(css, /--stagger/);
+});
+
 test('危险按钮默认保持中性，只在悬停时显示红色警示', () => {
   const css = read(CSS);
   assert.match(
@@ -575,7 +601,7 @@ test('状态广播不重建当前页面，避免修改配置时整页闪烁', ()
   assert.doesNotMatch(statusHandler, /renderCurrent\(/, '状态广播不能重建当前页面');
   assert.doesNotMatch(appSrc, /scheduleStatusRender|statusRenderTimer/, '不应存在状态广播整页重绘定时器');
   assert.match(appSrc, /renderChrome\(\);[\s\S]*状态广播只更新顶部状态栏/, '状态广播应只更新顶部状态栏');
-  assert.match(appSrc, /if \(state\.view !== targetView\) return/, '旧页面异步加载完成后不能覆盖新页面');
+  assert.match(appSrc, /if \(state\.view !== targetView \|\| token !== viewTransitionToken\) return/, '旧页面异步加载完成后不能覆盖新页面');
   assert.match(appSrc, /if \(state\.view === targetView\) \{/, '刷新完成后只能重绘发起刷新时的页面');
   assert.match(appSrc, /dom\.modalRoot\.addEventListener\('focusout'/, '弹窗输入也应纳入重绘焦点保护');
   assert.doesNotMatch(cssSrc, /\.note\s*\{[^}]*animation:\s*fade/, '持久状态提示不能每次重绘都重新播放淡入动画');

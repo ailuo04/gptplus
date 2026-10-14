@@ -350,6 +350,46 @@ a:hover { text-decoration: underline; }
   to { transform: translateX(46px); }
 }
 
+/* 只在真正切页时由 app.js 挂上 .is-enter，恢复 0.1.4 的内容分层入场节奏。 */
+.page-stage-content.is-enter > * {
+  animation: rise var(--dur-4) var(--ease-out) backwards;
+}
+.page-stage-content.is-enter > :nth-child(1) { animation-delay: 0ms; }
+.page-stage-content.is-enter > :nth-child(2) { animation-delay: calc(var(--stagger) * 1); }
+.page-stage-content.is-enter > :nth-child(3) { animation-delay: calc(var(--stagger) * 2); }
+.page-stage-content.is-enter > :nth-child(4) { animation-delay: calc(var(--stagger) * 3); }
+.page-stage-content.is-enter > :nth-child(5) { animation-delay: calc(var(--stagger) * 4); }
+.page-stage-content.is-enter > :nth-child(n + 6) { animation-delay: calc(var(--stagger) * 5); }
+
+.page-stage-content.is-enter .grid > *,
+.page-stage-content.is-enter .stack > *,
+.page-stage-content.is-enter .usage-stats > *,
+.page-stage-content.is-enter .usage-breakdown-grid > * {
+  animation: rise var(--dur-4) var(--ease-out) backwards;
+  animation-delay: calc(var(--stagger) * 2);
+}
+.page-stage-content.is-enter .grid > :nth-child(2),
+.page-stage-content.is-enter .usage-stats > :nth-child(2) { animation-delay: calc(var(--stagger) * 3); }
+.page-stage-content.is-enter .grid > :nth-child(3),
+.page-stage-content.is-enter .usage-stats > :nth-child(3) { animation-delay: calc(var(--stagger) * 4); }
+.page-stage-content.is-enter .grid > :nth-child(4),
+.page-stage-content.is-enter .usage-stats > :nth-child(4) { animation-delay: calc(var(--stagger) * 5); }
+.page-stage-content.is-enter .grid > :nth-child(n + 5),
+.page-stage-content.is-enter .usage-stats > :nth-child(n + 5) { animation-delay: calc(var(--stagger) * 6); }
+
+.page-stage-content.is-enter .usage-heatmap-grid {
+  animation: fade var(--dur-4) var(--ease-out) backwards;
+  animation-delay: calc(var(--stagger) * 4);
+}
+.page-stage-content.is-enter .empty-glyph {
+  animation: icon-pop var(--dur-4) var(--ease-spring) backwards;
+  animation-delay: calc(var(--stagger) * 2);
+}
+.page-stage-content.is-enter .empty-actions {
+  animation: rise var(--dur-4) var(--ease-out) backwards;
+  animation-delay: calc(var(--stagger) * 4);
+}
+
 /* ============ 4. 布局骨架 ============ */
 .app {
   display: grid;
@@ -753,50 +793,64 @@ html.is-theme-switching .logs {
   overflow: auto;
   min-height: 0;
   opacity: 0;
+  transform: translate3d(0, 7px, 0);
   pointer-events: none;
-  will-change: opacity;
-  transition-property: opacity;
+  transition-property: opacity, transform;
 }
+.page-stage.is-transitioning { will-change: opacity, transform; }
 .page-stage.is-active {
   z-index: 20;
   opacity: 1;
+  transform: translate3d(0, 0, 0);
   pointer-events: auto;
-  transition-duration: 140ms;
+  transition-duration: 120ms;
   transition-timing-function: cubic-bezier(0.2, 0.82, 0.3, 1);
 }
 .page-stage.is-exiting {
   z-index: 10;
   opacity: 0;
+  transform: translate3d(0, -3px, 0);
   pointer-events: none;
-  transition-duration: 170ms;
+  transition-duration: 140ms;
   transition-timing-function: cubic-bezier(0.2, 0.82, 0.3, 1);
 }
 .page-stage-content {
   min-height: 100%;
   padding: var(--sp-4) var(--sp-5) var(--sp-6);
-  will-change: transform, opacity;
-  transition-property: opacity, transform;
-}
-.page-stage-content.is-active {
-  opacity: 1;
-  transform: translateY(0);
-  transition-duration: 240ms;
-  transition-delay: 16ms;
-  transition-timing-function: cubic-bezier(0.22, 0.84, 0.32, 1);
-}
-.page-stage-content.is-exiting {
-  opacity: 0;
-  transform: translateY(-1px);
-  transition-duration: 180ms;
-  transition-delay: 0ms;
-  transition-timing-function: cubic-bezier(0.22, 0.84, 0.32, 1);
-}
-.page-stage-content.is-idle {
-  opacity: 0;
-  transform: translateY(0.5px);
-  pointer-events: none;
 }
 .page-stage-content > * + * { margin-top: var(--sp-3); }
+.route-placeholder {
+  display: grid;
+  gap: var(--sp-3);
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: var(--sp-4) 0;
+}
+.route-placeholder-toolbar { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); min-height: 34px; }
+.route-placeholder-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--sp-3); }
+.route-placeholder-card, .route-placeholder-panel {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--bg-panel);
+}
+.route-placeholder-card { height: 86px; }
+.route-placeholder-panel { display: grid; align-content: start; gap: 18px; min-height: 210px; padding: 22px; }
+.route-placeholder-line {
+  display: block;
+  height: 9px;
+  border-radius: 5px;
+  background: var(--bg-panel-2);
+}
+.route-placeholder-line.is-title { width: min(230px, 42%); }
+.route-placeholder-line.is-control { width: 112px; }
+.route-placeholder-line.is-wide { width: 72%; }
+.route-placeholder-line.is-medium { width: 54%; }
+.route-placeholder-line.is-short { width: 36%; }
+@media (max-width: 700px) {
+  .route-placeholder-stats { grid-template-columns: 1fr; }
+  .route-placeholder-card { height: 54px; }
+  .route-placeholder-card:nth-child(n + 2) { display: none; }
+}
 
 .stack { display: flex; flex-direction: column; gap: var(--sp-3); }
 
@@ -1426,7 +1480,6 @@ html.is-theme-switching .logs {
 .tbody-row {
   position: relative;
   transition: background var(--dur-2) var(--ease-out);
-  will-change: transform;
 }
 .tbody-row:not(.is-dragging) { transition: transform var(--dur-2) var(--ease-out), background var(--dur-2) var(--ease-out); }
 .table.is-dragging-list { user-select: none; }
