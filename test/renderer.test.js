@@ -401,44 +401,29 @@ test('styles.css 里用到的 CSS 变量都有定义', () => {
   assert.deepEqual(missing, [], `styles.css 引用了未定义的变量：${missing.join(', ')}`);
 });
 
-test('路由过渡只临时提升整页图层，不让长内容和表格行常驻 GPU 图层', () => {
+test('页面切换只使用单一内容区的短淡入，不创建占位层或双层路由图层', () => {
   const css = read(CSS);
-  assert.match(css, /\.page-stage\.is-transitioning\s*\{[^}]*will-change:\s*opacity\s*,\s*transform/s);
   const stageRule = css.match(/\.page-stage\s*\{([^}]*)\}/s)?.[1] || '';
-  const contentRule = css.match(/\.page-stage-content\s*\{([^}]*)\}/s)?.[1] || '';
-  const rowRule = css.match(/\.tbody-row\s*\{([^}]*)\}/s)?.[1] || '';
-  assert.doesNotMatch(stageRule, /will-change/);
-  assert.doesNotMatch(contentRule, /will-change/);
-  assert.doesNotMatch(contentRule, /transition(?:-property)?:[^;]*(?:transform|opacity)/);
-  assert.doesNotMatch(rowRule, /will-change/);
-  assert.match(css, /\.route-placeholder\s*\{/);
-  assert.match(css, /\.route-placeholder-card/);
+  assert.equal(stageRule, '', '不应再保留 page-stage 双层路由样式');
+  assert.match(css, /\.content\.is-view-switching\s*\{[^}]*animation:\s*view-switch 120ms ease-out both/s);
+  assert.match(read(APP), /function playViewSwitch\(\)/);
+  assert.doesNotMatch(read(APP), /routeTransitionActive|ROUTE_TRANSITION_MS|renderRoutePlaceholder|playEnter/);
+  assert.doesNotMatch(css, /\.page-stage|\.route-placeholder/);
 });
 
-test('页面切换恢复 0.1.4 的分层入场动画，并在完成后移除触发类', () => {
+test('切页先立即渲染当前状态，数据加载完成后只刷新仍在当前页', () => {
   const appSrc = read(APP);
-  const css = read(CSS);
-  assert.match(appSrc, /function playEnter\(stageRef\)/);
-  assert.match(appSrc, /content\.classList\.add\('is-enter'\)/);
-  assert.match(appSrc, /content\.classList\.remove\('is-enter'\)/);
-  assert.match(css, /\.page-stage-content\.is-enter > \*\s*\{[^}]*animation:\s*rise/s);
-  assert.match(css, /\.page-stage-content\.is-enter \.usage-heatmap-grid/);
-  assert.match(css, /\.page-stage-content\.is-enter \.empty-glyph/);
-  assert.match(css, /--stagger/);
-});
-
-test('已预渲染页面不会在路由过渡结束后重复重建 DOM', () => {
-  const appSrc = read(APP);
-  assert.match(appSrc, /const readyState = \{ ready: false, rendered: false \}/);
   assert.match(
     appSrc,
-    /if \(readyState\.rendered\) return;\s*renderCurrent\(true, \{ preserveScrollTop: false, allowDuringTransition: true \}\);\s*readyState\.rendered = true;\s*playEnter\(activeViewStage\);/s,
-    '路由就绪阶段只应渲染尚未预渲染的页面',
+    /renderCurrent\(true, \{ preserveScrollTop: false \}\);\s*playViewSwitch\(\);/s,
+    '点击切页后必须先用当前状态渲染页面再播放动画',
   );
+  assert.match(appSrc, /const needsData = \(VIEW_META\[view\]\.needs \|\| \[\]\)\.some\(\(key\) => !state\.loaded\[key\]\);/);
+  assert.match(appSrc, /if \(!needsData\) return;\s*ensureLoaded\(view\)\.then/s, '缓存页不能在切页后再次无条件重绘');
   assert.match(
     appSrc,
-    /renderCurrent\(true, \{ preserveScrollTop: false, allowDuringTransition: true \}\);\s*readyState\.rendered = true;\s*\/\/ stage 仍不可见时挂入场动画[\s\S]*?playEnter\(activeViewStage\);/s,
-    '切页前预渲染后应在 stage 隐藏时开始入场动画，避免二次闪回首帧',
+    /ensureLoaded\(view\)\.then\(\(\) => \{[\s\S]*?if \(state\.view !== view \|\| token !== viewTransitionToken\) return;[\s\S]*?renderCurrent\(true, \{ preserveScrollTop: true \}\);/s,
+    '异步数据完成后只能刷新仍处于当前页的内容',
   );
 });
 
@@ -616,7 +601,7 @@ test('状态广播不重建当前页面，避免修改配置时整页闪烁', ()
   assert.doesNotMatch(statusHandler, /renderCurrent\(/, '状态广播不能重建当前页面');
   assert.doesNotMatch(appSrc, /scheduleStatusRender|statusRenderTimer/, '不应存在状态广播整页重绘定时器');
   assert.match(appSrc, /renderChrome\(\);[\s\S]*状态广播只更新顶部状态栏/, '状态广播应只更新顶部状态栏');
-  assert.match(appSrc, /if \(state\.view !== targetView \|\| token !== viewTransitionToken\) return/, '旧页面异步加载完成后不能覆盖新页面');
+  assert.match(appSrc, /if \(state\.view !== view \|\| token !== viewTransitionToken\) return/, '旧页面异步加载完成后不能覆盖新页面');
   assert.match(appSrc, /if \(state\.view === targetView\) \{/, '刷新完成后只能重绘发起刷新时的页面');
   assert.match(appSrc, /dom\.modalRoot\.addEventListener\('focusout'/, '弹窗输入也应纳入重绘焦点保护');
   assert.doesNotMatch(cssSrc, /\.note\s*\{[^}]*animation:\s*fade/, '持久状态提示不能每次重绘都重新播放淡入动画');

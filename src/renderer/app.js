@@ -260,11 +260,9 @@ let observedWriteAt = 0;
 let updatePromptedVersion = null;
 let updateModalSync = null;
 let viewTransitionToken = 0;
-let activeViewStage = null;
-let exitingViewStage = null;
-const ROUTE_TRANSITION_MS = 180;
-let routeTransitionActive = false;
-let enterTimer = null;
+let viewSwitchFrame = 0;
+let viewSwitchTimer = 0;
+const VIEW_SWITCH_MS = 120;
 
 const dom = {};
 
@@ -1254,97 +1252,39 @@ function viewHasFocusedInput() {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
 }
 
-function createViewStage(view, initial = false) {
-  const stage = el('section', {
-    class: `page-stage ${initial ? 'is-active' : 'is-idle'}`,
-    data: { view },
-    attrs: { 'aria-hidden': initial ? 'false' : 'true' },
-  });
-  const content = el('div', {
-    class: `page-stage-content ${initial ? 'is-active' : 'is-idle'}`,
-  });
-  stage.append(content);
-  dom.view.append(stage);
-  return { view, stage, content };
-}
-
-function renderRoutePlaceholder(stageRef, view) {
-  if (!stageRef?.content) return;
-  stageRef.content.replaceChildren(
-    el('div', {
-      class: 'route-placeholder',
-      attrs: { 'aria-label': `${VIEW_META[view]?.title || '页面'}正在加载` },
-    }, [
-      el('div', { class: 'route-placeholder-toolbar' }, [
-        el('span', { class: 'route-placeholder-line is-title' }),
-        el('span', { class: 'route-placeholder-line is-control' }),
-      ]),
-      el('div', { class: 'route-placeholder-stats' }, [
-        el('span', { class: 'route-placeholder-card' }),
-        el('span', { class: 'route-placeholder-card' }),
-        el('span', { class: 'route-placeholder-card' }),
-      ]),
-      el('div', { class: 'route-placeholder-panel' }, [
-        el('span', { class: 'route-placeholder-line is-wide' }),
-        el('span', { class: 'route-placeholder-line is-medium' }),
-        el('span', { class: 'route-placeholder-line is-short' }),
-      ]),
-    ]),
-  );
-}
-
-function renderWhenRouteIsReady(token, targetView, readyState) {
-  if (!readyState.ready || routeTransitionActive) return;
-  const render = () => {
-    if (token !== viewTransitionToken || state.view !== targetView || !activeViewStage) return;
-    if (readyState.rendered) return;
-    renderCurrent(true, { preserveScrollTop: false, allowDuringTransition: true });
-    readyState.rendered = true;
-    playEnter(activeViewStage);
+/** 给已渲染的内容区播放一次短淡入，不等待数据，也不制造空白过渡层。 */
+function playViewSwitch() {
+  if (!dom.view) return;
+  dom.view.classList.remove('is-view-switching');
+  if (viewSwitchFrame) {
+    if (typeof window.cancelAnimationFrame === 'function') window.cancelAnimationFrame(viewSwitchFrame);
+    else window.clearTimeout(viewSwitchFrame);
+    viewSwitchFrame = 0;
+  }
+  if (viewSwitchTimer) {
+    window.clearTimeout(viewSwitchTimer);
+    viewSwitchTimer = 0;
+  }
+  const start = () => {
+    viewSwitchFrame = 0;
+    dom.view.classList.add('is-view-switching');
+    viewSwitchTimer = window.setTimeout(() => {
+      viewSwitchTimer = 0;
+      dom.view.classList.remove('is-view-switching');
+    }, VIEW_SWITCH_MS);
   };
-  // requestIdleCallback 在后台窗口可能被节流，导致用户点击后长时间停留在骨架。
-  // 过渡已结束，此处直接排到下一轮任务，让真实内容尽快出现。
-  window.setTimeout(render, 0);
-}
-
-// 页面切换时只给当前内容层挂入场动画；局部重绘不会重复播放动画。
-function playEnter(stageRef) {
-  const content = stageRef?.content;
-  if (!content) return;
-  content.classList.remove('is-enter');
-  content.classList.add('is-enter');
-  if (enterTimer) window.clearTimeout(enterTimer);
-  enterTimer = window.setTimeout(() => {
-    enterTimer = null;
-    content.classList.remove('is-enter');
-  }, 620);
-}
-
-function removeViewStage(ref) {
-  if (!ref) return;
-  ref.stage.remove();
-  if (exitingViewStage === ref) exitingViewStage = null;
-}
-
-function ensureActiveViewStage() {
-  if (activeViewStage && activeViewStage.stage.parentNode) return activeViewStage;
-  dom.view.replaceChildren();
-  activeViewStage = createViewStage(state.view, true);
-  return activeViewStage;
+  viewSwitchFrame = typeof window.requestAnimationFrame === 'function'
+    ? window.requestAnimationFrame(start)
+    : window.setTimeout(start, 0);
 }
 
 function renderCurrent(force = false, options = {}) {
   const meta = VIEW_META[state.view];
   if (!meta) return;
-  if (routeTransitionActive && !options.allowDuringTransition) {
-    renderPending = true;
-    return;
-  }
   // 局部状态变化只重建当前视图内容，不应把用户正在浏览的位置跳回顶部；
   // 只有切页时才由 navigate 显式传 false。
-  const stageRef = ensureActiveViewStage();
   const preserveScrollTop = options.preserveScrollTop !== false;
-  const previousScrollTop = preserveScrollTop ? stageRef.stage.scrollTop : 0;
+  const previousScrollTop = preserveScrollTop ? dom.view.scrollTop : 0;
   if (!force && viewHasFocusedInput()) {
     // 记下来，等焦点离开输入框后补一次渲染：否则这次跳过的刷新永远不会再来，
     // 页面会长期停留在旧数据上。
@@ -1353,11 +1293,11 @@ function renderCurrent(force = false, options = {}) {
   }
   renderPending = false;
   dom.viewActions.replaceChildren();
-  stageRef.content.replaceChildren();
+  dom.view.replaceChildren();
   try {
-    meta.render(stageRef.content, ctx, dom.viewActions);
+    meta.render(dom.view, ctx, dom.viewActions);
   } catch (err) {
-    stageRef.content.replaceChildren(
+    dom.view.replaceChildren(
       el('div', { class: 'note note-err' }, [
         icon('alert', 15),
         el('div', {}, [
@@ -1367,65 +1307,25 @@ function renderCurrent(force = false, options = {}) {
       ]),
     );
   }
-  stageRef.stage.scrollTop = preserveScrollTop ? previousScrollTop : 0;
+  dom.view.scrollTop = preserveScrollTop ? previousScrollTop : 0;
 }
 
 function navigate(view) {
   if (!VIEW_META[view]) return;
   if (view === state.view) return;
   const token = ++viewTransitionToken;
-  const previous = activeViewStage;
   state.view = view;
-  const targetView = view;
   syncUsageAutoRefresh();
   renderChrome();
-  dom.viewTitle.classList.remove('is-swapping');
-  window.setTimeout(() => dom.viewTitle.classList.add('is-swapping'), 0);
-  window.setTimeout(() => dom.viewTitle.classList.remove('is-swapping'), 340);
-  activeViewStage = createViewStage(view);
-  renderRoutePlaceholder(activeViewStage, view);
-  const readyState = { ready: false, rendered: false };
-  const needs = VIEW_META[view].needs || [];
-  const canRenderBeforeTransition = view !== 'usage' && needs.every((key) => state.loaded[key]);
-  if (canRenderBeforeTransition) {
-    // 轻量页先在不可见 stage 内完成一次渲染，点击后马上进入真实内容过渡；
-    // 使用量页保留骨架，避免把热力图和长表格塞进切页关键帧。
-    renderCurrent(true, { preserveScrollTop: false, allowDuringTransition: true });
-    readyState.rendered = true;
-    // stage 仍不可见时挂入场动画，让它和首次显现同步，避免内容先出现后又闪回首帧。
-    playEnter(activeViewStage);
-  }
-  if (exitingViewStage) removeViewStage(exitingViewStage);
-  if (previous && previous.stage.parentNode) {
-    previous.stage.classList.remove('is-active', 'is-idle');
-    previous.stage.classList.add('is-exiting', 'is-transitioning');
-    previous.stage.setAttribute('aria-hidden', 'true');
-    exitingViewStage = previous;
-  }
-  activeViewStage.stage.classList.add('is-transitioning');
-  routeTransitionActive = true;
-  const nextFrame = typeof window.requestAnimationFrame === 'function'
-    && document.visibilityState !== 'hidden'
-    ? window.requestAnimationFrame.bind(window)
-    : (callback) => window.setTimeout(callback, 0);
-  nextFrame(() => {
-    if (token !== viewTransitionToken || !activeViewStage) return;
-    activeViewStage.stage.classList.remove('is-idle');
-    activeViewStage.stage.classList.add('is-active');
-    activeViewStage.stage.setAttribute('aria-hidden', 'false');
-  });
-  window.setTimeout(() => {
-    if (token !== viewTransitionToken) return;
-    routeTransitionActive = false;
-    removeViewStage(exitingViewStage);
-    activeViewStage?.stage.classList.remove('is-transitioning');
-    renderWhenRouteIsReady(token, targetView, readyState);
-  }, ROUTE_TRANSITION_MS);
-  // Load data alongside the visual transition; heavy DOM work waits until it has completed.
+  // 先用当前缓存状态画出页面，数据加载放到后台，避免点击后进入空白或骨架等待。
+  renderCurrent(true, { preserveScrollTop: false });
+  playViewSwitch();
+  const needsData = (VIEW_META[view].needs || []).some((key) => !state.loaded[key]);
+  if (!needsData) return;
   ensureLoaded(view).then(() => {
-    if (state.view !== targetView || token !== viewTransitionToken) return;
-    readyState.ready = true;
-    renderWhenRouteIsReady(token, targetView, readyState);
+    if (state.view !== view || token !== viewTransitionToken) return;
+    renderChrome();
+    renderCurrent(true, { preserveScrollTop: true });
   });
 }
 

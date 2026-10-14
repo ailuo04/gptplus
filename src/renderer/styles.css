@@ -9,8 +9,7 @@
      2. 禁止动画 width / height / padding / box-shadow / background-position。
      3. 入场动画用 animation-fill-mode: backwards（延迟期间保持首帧，结束后不留 transform，
         否则会把子树里的 position: sticky 永久困在有 transform 的包含块中）。
-   4. 路由切换使用 .page-stage / .page-stage-content 两层状态；持久状态提示不能自带入场动画，
-      否则每次局部重绘都会反复闪烁。
+   4. 路由切换只使用内容区的一次短淡入；局部重绘不重新播放动画。
      5. prefers-reduced-motion 下全局关闭（见第 16 节）。 */
 
 /* ============ 1. 设计令牌 ============ */
@@ -338,7 +337,6 @@ a:hover { text-decoration: underline; }
 @keyframes icon-pop { 0% { transform: scale(0.82) rotate(-8deg); } 60% { transform: scale(1.12) rotate(2deg); } 100% { transform: scale(1) rotate(0); } }
 @keyframes check-draw { from { stroke-dashoffset: 14; } to { stroke-dashoffset: 0; } }
 @keyframes focus-settle { from { transform: translateY(1px); } to { transform: translateY(0); } }
-@keyframes title-swap { from { opacity: 0.35; transform: translateY(3px); } to { opacity: 1; transform: none; } }
 @keyframes toast-out { from { opacity: 1; transform: translateX(0) scale(1); } to { opacity: 0; transform: translateX(18px) scale(0.96); } }
 @keyframes badge-update { 0% { transform: scale(1); } 45% { transform: scale(1.14); } 100% { transform: scale(1); } }
 @keyframes row-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
@@ -348,46 +346,6 @@ a:hover { text-decoration: underline; }
 @keyframes current {
   from { transform: translateX(-100%); }
   to { transform: translateX(46px); }
-}
-
-/* 只在真正切页时由 app.js 挂上 .is-enter，恢复 0.1.4 的内容分层入场节奏。 */
-.page-stage-content.is-enter > * {
-  animation: rise var(--dur-4) var(--ease-out) backwards;
-}
-.page-stage-content.is-enter > :nth-child(1) { animation-delay: 0ms; }
-.page-stage-content.is-enter > :nth-child(2) { animation-delay: calc(var(--stagger) * 1); }
-.page-stage-content.is-enter > :nth-child(3) { animation-delay: calc(var(--stagger) * 2); }
-.page-stage-content.is-enter > :nth-child(4) { animation-delay: calc(var(--stagger) * 3); }
-.page-stage-content.is-enter > :nth-child(5) { animation-delay: calc(var(--stagger) * 4); }
-.page-stage-content.is-enter > :nth-child(n + 6) { animation-delay: calc(var(--stagger) * 5); }
-
-.page-stage-content.is-enter .grid > *,
-.page-stage-content.is-enter .stack > *,
-.page-stage-content.is-enter .usage-stats > *,
-.page-stage-content.is-enter .usage-breakdown-grid > * {
-  animation: rise var(--dur-4) var(--ease-out) backwards;
-  animation-delay: calc(var(--stagger) * 2);
-}
-.page-stage-content.is-enter .grid > :nth-child(2),
-.page-stage-content.is-enter .usage-stats > :nth-child(2) { animation-delay: calc(var(--stagger) * 3); }
-.page-stage-content.is-enter .grid > :nth-child(3),
-.page-stage-content.is-enter .usage-stats > :nth-child(3) { animation-delay: calc(var(--stagger) * 4); }
-.page-stage-content.is-enter .grid > :nth-child(4),
-.page-stage-content.is-enter .usage-stats > :nth-child(4) { animation-delay: calc(var(--stagger) * 5); }
-.page-stage-content.is-enter .grid > :nth-child(n + 5),
-.page-stage-content.is-enter .usage-stats > :nth-child(n + 5) { animation-delay: calc(var(--stagger) * 6); }
-
-.page-stage-content.is-enter .usage-heatmap-grid {
-  animation: fade var(--dur-4) var(--ease-out) backwards;
-  animation-delay: calc(var(--stagger) * 4);
-}
-.page-stage-content.is-enter .empty-glyph {
-  animation: icon-pop var(--dur-4) var(--ease-spring) backwards;
-  animation-delay: calc(var(--stagger) * 2);
-}
-.page-stage-content.is-enter .empty-actions {
-  animation: rise var(--dur-4) var(--ease-out) backwards;
-  animation-delay: calc(var(--stagger) * 4);
 }
 
 /* ============ 4. 布局骨架 ============ */
@@ -766,7 +724,6 @@ html.is-theme-switching .logs {
   flex: 0 0 auto;
 }
 .topbar h1, .topbar-text p { transition: color var(--dur-3) var(--ease-out), opacity var(--dur-3) var(--ease-out); }
-.topbar h1.is-swapping { animation: title-swap var(--dur-3) var(--ease-out); }
 
 /* --- 内容区 --- */
 .content {
@@ -780,76 +737,12 @@ html.is-theme-switching .logs {
 }
 .content > * + * { margin-top: var(--sp-3); }
 
-/* AiMaMi 同款双层路由容器：旧页面和新页面在同一视口内短暂叠放。 */
-.content.page-stage-host {
-  position: relative;
-  overflow: hidden;
-  padding: 0;
-}
-.page-stage {
-  position: absolute;
-  inset: 0;
-  z-index: 0;
-  overflow: auto;
-  min-height: 0;
-  opacity: 0;
-  transform: translate3d(0, 7px, 0);
-  pointer-events: none;
-  transition-property: opacity, transform;
-}
-.page-stage.is-transitioning { will-change: opacity, transform; }
-.page-stage.is-active {
-  z-index: 20;
-  opacity: 1;
-  transform: translate3d(0, 0, 0);
-  pointer-events: auto;
-  transition-duration: 120ms;
-  transition-timing-function: cubic-bezier(0.2, 0.82, 0.3, 1);
-}
-.page-stage.is-exiting {
-  z-index: 10;
-  opacity: 0;
-  transform: translate3d(0, -3px, 0);
-  pointer-events: none;
-  transition-duration: 140ms;
-  transition-timing-function: cubic-bezier(0.2, 0.82, 0.3, 1);
-}
-.page-stage-content {
-  min-height: 100%;
-  padding: var(--sp-4) var(--sp-5) var(--sp-6);
-}
-.page-stage-content > * + * { margin-top: var(--sp-3); }
-.route-placeholder {
-  display: grid;
-  gap: var(--sp-3);
-  max-width: 1120px;
-  margin: 0 auto;
-  padding: var(--sp-4) 0;
-}
-.route-placeholder-toolbar { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); min-height: 34px; }
-.route-placeholder-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--sp-3); }
-.route-placeholder-card, .route-placeholder-panel {
-  border: 1px solid var(--line);
-  border-radius: 7px;
-  background: var(--bg-panel);
-}
-.route-placeholder-card { height: 86px; }
-.route-placeholder-panel { display: grid; align-content: start; gap: 18px; min-height: 210px; padding: 22px; }
-.route-placeholder-line {
-  display: block;
-  height: 9px;
-  border-radius: 5px;
-  background: var(--bg-panel-2);
-}
-.route-placeholder-line.is-title { width: min(230px, 42%); }
-.route-placeholder-line.is-control { width: 112px; }
-.route-placeholder-line.is-wide { width: 72%; }
-.route-placeholder-line.is-medium { width: 54%; }
-.route-placeholder-line.is-short { width: 36%; }
-@media (max-width: 700px) {
-  .route-placeholder-stats { grid-template-columns: 1fr; }
-  .route-placeholder-card { height: 54px; }
-  .route-placeholder-card:nth-child(n + 2) { display: none; }
+
+/* 切页只做一次轻量淡入，内容已经先渲染完成，不经过空白或骨架层。 */
+.content.is-view-switching { animation: view-switch 120ms ease-out both; }
+@keyframes view-switch {
+  from { opacity: 0.78; }
+  to { opacity: 1; }
 }
 
 .stack { display: flex; flex-direction: column; gap: var(--sp-3); }
@@ -2096,8 +1989,6 @@ html.is-theme-switching .logs {
 @media (max-width: 1040px) {
   :root { --sidebar-w: 188px; --drawer-h: min(32vh, 210px); --fs-display: 19px; --fs-num: 22px; }
   .content { padding: 14px var(--sp-4) var(--sp-5); }
-  .content.page-stage-host { padding: 0; }
-  .page-stage-content { padding: 14px var(--sp-4) var(--sp-5); }
   .topbar { padding: 13px var(--sp-4) 10px; }
   .grid { grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
   .wiring { grid-template-columns: minmax(0, 1fr) 28px minmax(0, 1fr) 28px minmax(0, 1fr); }
@@ -2113,7 +2004,6 @@ html.is-theme-switching .logs {
 @media (max-height: 700px) {
   :root { --statusbar-h: 40px; --drawer-h: min(30vh, 190px); }
   .content { padding-top: 12px; }
-  .page-stage-content { padding-top: 12px; }
   .topbar { padding-top: 10px; padding-bottom: 9px; }
   .pcard { padding: 12px; gap: var(--sp-2); }
   .setting { padding: 10px var(--sp-4); }
