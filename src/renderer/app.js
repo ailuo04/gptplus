@@ -6,7 +6,7 @@
 //   3. 没有远程资源：无 fetch、无外部字体、无 CDN（CSP 也是 default-src 'none'）。
 
 import { renderProviders, openProviderForm, closeProviderForm } from './views/providers.js';
-import { renderModels, reorderModelKeys } from './views/models.js';
+import { dragRowOffsets, dragTargetIndex, renderModels, reorderModelKeys } from './views/models.js';
 import { renderUsage } from './views/usage.js';
 import { renderSettings } from './views/settings.js';
 
@@ -1386,6 +1386,8 @@ const ctx = {
   isModalOpen,
   openProviderForm: (providerId) => openProviderForm(ctx, providerId),
   closeProviderForm: () => closeProviderForm(),
+  dragRowOffsets,
+  dragTargetIndex,
   reorderModelKeys,
 };
 

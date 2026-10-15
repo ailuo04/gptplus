@@ -555,6 +555,150 @@ test('模型排序辅助函数支持把任意拖动项插入目标位置', async
   }
 });
 
+test('模型拖动按被拖行中心点越过相邻行中线判断目标', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const modelsMod = await import(pathToFileURL(path.join(tmp, 'views', 'models.js')).href);
+    const rowTops = [100, 150, 200];
+    assert.equal(
+      modelsMod.dragTargetIndex(rowTops, 1, 50, 226, 25),
+      2,
+      '被拖行中心点越过下一行中线后换到下一行',
+    );
+    assert.equal(
+      modelsMod.dragTargetIndex(rowTops, 1, 50, 224, 25),
+      1,
+      '被拖行中心点反向越过中线后应立即回到上一位置',
+    );
+    assert.equal(
+      modelsMod.dragTargetIndex(rowTops, 1, 50, 201, 0),
+      2,
+      '抓取位置变化不应改变被拖行中心点对应的目标判断',
+    );
+    assert.equal(
+      modelsMod.dragTargetIndex(rowTops, 1, 50, 126, 25),
+      1,
+      '向上拖动未越过上一行中线时保持原位',
+    );
+    assert.equal(
+      modelsMod.dragTargetIndex(rowTops, 1, 50, 124, 25),
+      0,
+      '向上拖动越过上一行中线后换到上一行',
+    );
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('模型拖动让相邻行按连续位置进度让位，避免整行吸附跳动', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const modelsMod = await import(pathToFileURL(path.join(tmp, 'views', 'models.js')).href);
+    const rowTops = [100, 150, 200, 250];
+    assert.deepEqual(
+      modelsMod.dragRowOffsets(rowTops, 1, 50, 150, 200),
+      [0, 0, 0, 0],
+      '拖动行尚未接触下一行时不应推动其它行',
+    );
+    assert.deepEqual(
+      modelsMod.dragRowOffsets(rowTops, 1, 50, 160, 210),
+      [0, 0, -10, 0],
+      '拖动行只重叠 10px 时，下一行应只让位 10px',
+    );
+    assert.deepEqual(
+      modelsMod.dragRowOffsets(rowTops, 1, 50, 170, 220),
+      [0, 0, -20, 0],
+      '拖动行继续向下时，让位位移应连续增加',
+    );
+    assert.deepEqual(
+      modelsMod.dragRowOffsets(rowTops, 1, 50, 210, 260),
+      [0, 0, -50, -10],
+      '向下越过一行后应保持完整让位，并开始推动下一行',
+    );
+    assert.deepEqual(
+      modelsMod.dragRowOffsets(rowTops, 2, 50, 190, 240),
+      [0, 10, 0, 0],
+      '向上拖动只重叠 10px 时，上一行应只让位 10px',
+    );
+    assert.deepEqual(
+      modelsMod.dragRowOffsets(rowTops, 2, 50, 140, 190),
+      [10, 50, 0, 0],
+      '向上越过上一行后应保持完整让位，并开始推动再上一行',
+    );
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('模型拖动松手时同步最终指针位置并立即更新 DOM 顺序', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const modelsMod = await import(pathToFileURL(path.join(tmp, 'views', 'models.js')).href);
+    installFakeDom();
+
+    const state = fixtureState();
+    const ctx = makeCtx(appMod, state);
+    const savedOrders = [];
+    ctx.api.reorderModels = async ({ orderKeys }) => {
+      savedOrders.push(orderKeys);
+      return state.status;
+    };
+    const root = new FakeNode('main');
+    modelsMod.renderModels(root, ctx, new FakeNode('div'));
+    const rowsBox = root.find('table')[0];
+    const rows = root.find('tbody-row');
+    assert.equal(rows.length, 3, '测试需要至少三行模型才能验证越过相邻行');
+    rows.forEach((row, index) => {
+      row.classList.add('tbody-row');
+      row.getBoundingClientRect = () => ({ top: 100 + index * 50, left: 0, width: 600, height: 50 });
+    });
+    const before = rows.map((row) => row.dataset.orderKey);
+    const handle = rows[0].find('model-drag-handle')[0];
+    const startY = 125;
+    const finalY = 245;
+    const queuedFrames = [];
+    window.requestAnimationFrame = (callback) => {
+      queuedFrames.push(callback);
+      return queuedFrames.length;
+    };
+    window.cancelAnimationFrame = () => {};
+
+    handle.listeners.pointerdown[0]({
+      button: 0,
+      pointerId: 7,
+      clientY: startY,
+      preventDefault() {},
+    });
+    rowsBox.listeners.pointermove[0]({
+      pointerId: 7,
+      clientY: finalY,
+      preventDefault() {},
+    });
+    assert.equal(queuedFrames.length, 1, '移动事件应等待下一动画帧处理');
+
+    await rowsBox.listeners.pointerup[0]({ pointerId: 7, clientY: finalY });
+
+    const expected = [before[1], before[2], before[0]];
+    assert.deepEqual(savedOrders, [expected], '松手应使用最终坐标提交完整顺序');
+    assert.deepEqual(
+      rowsBox.children.filter((row) => row.classList.contains('tbody-row')).map((row) => row.dataset.orderKey),
+      expected,
+      '列表 DOM 应在保存成功后立即与新顺序一致',
+    );
+    assert.deepEqual(
+      state.models.map((model) => model.orderKey || `${model.providerId}::${model.modelId}`),
+      expected,
+      '内存状态也应同步为新顺序',
+    );
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test('模型页使用自由拖动排序并通过批量 API 保存', () => {
   const src = read(path.join(VIEWS, 'models.js'));
   assert.match(src, /model-drag-handle/, '模型行需要有明确的拖动把手');
@@ -572,9 +716,15 @@ test('模型拖动结束动画只清理当前传入的行集合', () => {
   const fn = src.slice(start, end);
   assert.match(fn, /movedRows\.forEach/, '动画应遍历传入的 movedRows');
   assert.doesNotMatch(fn, /\brows\.forEach/, '动画函数不能引用已移除的 rows 变量');
+  assert.match(
+    fn,
+    /row\.style\.setProperty\('transition', 'transform var\(--dur-2\) var\(--ease-out\)'\)[\s\S]*?row\.style\.setProperty\('transform', 'none'\)/,
+    '松手归位时应临时启用 transform 过渡，避免清除反向位移时闪跳',
+  );
+  assert.match(fn, /row\.style\.removeProperty\('transition'\)/, '归位动画结束后应清理临时过渡');
 });
 
-test('模型换序刷新保留当前页面滚动位置', () => {
+test('模型换序成功不重建页面，失败时保留滚动位置恢复', () => {
   const appSrc = read(APP);
   const modelsSrc = read(path.join(VIEWS, 'models.js'));
   assert.match(appSrc, /async function reload\(scope = 'providers', options = \{\}\)/, 'reload 应支持传入刷新选项');
@@ -586,9 +736,16 @@ test('模型换序刷新保留当前页面滚动位置', () => {
   );
   assert.match(
     modelsSrc,
-    /await ctx\.reload\('models', \{\s*preserveScrollTop: true\s*\}\)/,
-    '拖动保存后应使用保留滚动位置的刷新',
+    /if \(!saved\) await ctx\.reload\('models', \{\s*preserveScrollTop: true\s*\}\)/,
+    '拖动保存失败时才应使用保留滚动位置的刷新来恢复界面',
   );
+  const finishStart = modelsSrc.indexOf('async function finishModelDrag');
+  const finishEnd = modelsSrc.indexOf('\n}\n\n/** 保存成功后只同步内存顺序', finishStart);
+  assert.ok(finishStart >= 0 && finishEnd > finishStart, '应能定位模型拖动结束流程');
+  const finishFn = modelsSrc.slice(finishStart, finishEnd);
+  assert.match(finishFn, /applyModelOrderToState\(ctx, nextKeys\)/, '保存成功后应直接同步当前内存顺序');
+  assert.match(finishFn, /let saved = false/, '拖动保存流程需要区分保存成功与失败');
+  assert.match(finishFn, /saved = true/, '保存成功后应标记为已保存');
 });
 
 test('状态广播不重建当前页面，避免修改配置时整页闪烁', () => {
@@ -667,6 +824,7 @@ class FakeNode {
     this.attributes = {};
     this.dataset = {};
     this.listeners = {};
+    this.parentNode = null;
     this.className = '';
     this._value = '';
     Object.defineProperty(this, 'value', {
@@ -709,6 +867,9 @@ class FakeNode {
       setProperty(k, v) {
         this._props[k] = v;
       },
+      removeProperty(k) {
+        delete this._props[k];
+      },
       getPropertyValue(k) {
         return this._props[k] || '';
       },
@@ -750,7 +911,9 @@ class FakeNode {
   }
 
   appendChild(node) {
+    if (node instanceof FakeNode && node.parentNode) node.parentNode.removeChild(node);
     this.childNodes.push(node);
+    if (node instanceof FakeNode) node.parentNode = this;
     if (this.tagName === 'SELECT' && this._value === '' && node instanceof FakeNode && node.tagName === 'OPTION') {
       this._value = node.value;
     }
@@ -763,13 +926,16 @@ class FakeNode {
   }
 
   replaceChildren(...nodes) {
+    for (const child of this.children) child.parentNode = null;
     this.childNodes = [];
     for (const n of nodes) if (n !== null && n !== undefined) this.appendChild(n);
     return this;
   }
 
   removeChild(node) {
-    this.childNodes = this.childNodes.filter((c) => c !== node);
+    const index = this.childNodes.indexOf(node);
+    if (index >= 0) this.childNodes.splice(index, 1);
+    if (node instanceof FakeNode) node.parentNode = null;
     return node;
   }
 
@@ -789,6 +955,10 @@ class FakeNode {
 
   addEventListener(type, fn) {
     (this.listeners[type] = this.listeners[type] || []).push(fn);
+  }
+
+  removeEventListener(type, fn) {
+    this.listeners[type] = (this.listeners[type] || []).filter((listener) => listener !== fn);
   }
 
   querySelector() {

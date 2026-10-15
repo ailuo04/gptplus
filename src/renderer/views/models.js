@@ -16,8 +16,10 @@ const dragState = {
   startY: 0,
   rowHeight: 0,
   rowTops: [],
+  grabOffsetY: 0,
   moveFrame: 0,
   lastY: 0,
+  pointerId: null,
   finish: null,
 };
 
@@ -568,18 +570,20 @@ function beginModelDrag(ctx, event, row) {
   dragState.lastY = event.clientY;
   dragState.rowHeight = rect.height || row.offsetHeight || 1;
   dragState.rowTops = rows.map((item) => item.getBoundingClientRect().top);
-  dragState.finish = () => finishModelDrag(ctx, rowsBox);
+  dragState.grabOffsetY = event.clientY - rect.top;
+  dragState.pointerId = event.pointerId ?? null;
+  dragState.finish = (finishEvent) => finishModelDrag(ctx, rowsBox, finishEvent);
   row.classList.add('is-dragging');
   row.setPointerCapture?.(event.pointerId);
   rowsBox.classList.add('is-dragging-list');
   rowsBox.addEventListener('pointermove', onModelDragMove);
-  rowsBox.addEventListener('pointerup', dragState.finish, { once: true });
-  rowsBox.addEventListener('pointercancel', dragState.finish, { once: true });
+  rowsBox.addEventListener('pointerup', dragState.finish);
+  rowsBox.addEventListener('pointercancel', dragState.finish);
   event.preventDefault?.();
 }
 
 function onModelDragMove(event) {
-  if (!dragState.row) return;
+  if (!dragState.row || dragState.pointerId !== null && event.pointerId !== dragState.pointerId) return;
   dragState.lastY = event.clientY;
   scheduleDragFrame();
   event.preventDefault?.();
@@ -602,34 +606,85 @@ function updateDragVisual(ctx) {
   if (!dragState.row) return;
   const rows = dragState.rows;
   const draggedY = dragState.lastY - dragState.startY;
-  let targetIndex = dragState.startIndex;
-  for (let index = 0; index < dragState.rowTops.length; index += 1) {
-    if (index === dragState.startIndex) continue;
-    const midpoint = dragState.rowTops[index] + dragState.rowHeight / 2;
-    if (dragState.lastY < midpoint) {
-      targetIndex = index;
-      break;
-    }
-    targetIndex = index;
-  }
+  const draggedTop = dragState.lastY - dragState.grabOffsetY;
+  const draggedBottom = draggedTop + dragState.rowHeight;
+  const targetIndex = dragTargetIndex(
+    dragState.rowTops,
+    dragState.startIndex,
+    dragState.rowHeight,
+    dragState.lastY,
+    dragState.grabOffsetY,
+  );
+  const rowOffsets = dragRowOffsets(
+    dragState.rowTops,
+    dragState.startIndex,
+    dragState.rowHeight,
+    draggedTop,
+    draggedBottom,
+  );
   dragState.targetIndex = targetIndex;
   rows.forEach((row, index) => {
     if (index === dragState.startIndex) {
-      row.style.setProperty('transform', `translateY(${draggedY}px) scale(1.015)`);
+      row.style.setProperty('transform', `translateY(${draggedY}px)`);
       return;
     }
-    let offset = 0;
-    if (dragState.targetIndex > dragState.startIndex && index > dragState.startIndex && index <= dragState.targetIndex) {
-      offset = -dragState.rowHeight;
-    } else if (dragState.targetIndex < dragState.startIndex && index >= dragState.targetIndex && index < dragState.startIndex) {
-      offset = dragState.rowHeight;
-    }
+    const offset = rowOffsets[index] || 0;
     row.style.setProperty('transform', offset ? `translateY(${offset}px)` : 'none');
   });
 }
 
-async function finishModelDrag(ctx, rowsBox) {
-  if (!dragState.row) return;
+/** 根据拖动行经过相邻行位置的进度，连续计算让位位移，避免整行突然吸附。 */
+export function dragRowOffsets(rowTops, startIndex, rowHeight, draggedTop, draggedBottom) {
+  if (!Array.isArray(rowTops) || !rowTops.length || rowHeight <= 0) return [];
+  if (startIndex < 0 || startIndex >= rowTops.length) return rowTops.map(() => 0);
+
+  const offsets = rowTops.map(() => 0);
+  const clamp = (value) => Math.max(0, Math.min(1, value));
+  if (draggedTop >= rowTops[startIndex]) {
+    for (let index = startIndex + 1; index < rowTops.length; index += 1) {
+      const progress = clamp((draggedBottom - rowTops[index]) / rowHeight);
+      if (progress > 0) offsets[index] = -rowHeight * progress;
+    }
+  } else {
+    for (let index = startIndex - 1; index >= 0; index -= 1) {
+      const rowBottom = rowTops[index] + rowHeight;
+      const progress = clamp((rowBottom - draggedTop) / rowHeight);
+      if (progress > 0) offsets[index] = rowHeight * progress;
+    }
+  }
+  return offsets;
+}
+
+/** 被拖行中心越过相邻行中线时切换目标，正反方向使用同一条边界。 */
+export function dragTargetIndex(rowTops, startIndex, rowHeight, pointerY, grabOffsetY) {
+  if (!Array.isArray(rowTops) || !rowTops.length || rowHeight <= 0) return startIndex;
+  if (startIndex < 0 || startIndex >= rowTops.length) return startIndex;
+
+  const draggedCenter = pointerY - grabOffsetY + rowHeight / 2;
+  let naturalIndex = startIndex;
+  const startMidpoint = rowTops[startIndex] + rowHeight / 2;
+  if (draggedCenter > startMidpoint) {
+    for (let index = startIndex + 1; index < rowTops.length; index += 1) {
+      if (draggedCenter <= rowTops[index] + rowHeight / 2) break;
+      naturalIndex = index;
+    }
+  } else if (draggedCenter < startMidpoint) {
+    for (let index = startIndex - 1; index >= 0; index -= 1) {
+      if (draggedCenter >= rowTops[index] + rowHeight / 2) break;
+      naturalIndex = index;
+    }
+  }
+
+  return naturalIndex;
+}
+
+async function finishModelDrag(ctx, rowsBox, event) {
+  if (!dragState.row || dragState.pointerId !== null && event?.pointerId !== dragState.pointerId) return;
+  if (Number.isFinite(event?.clientY)) {
+    // 松手可能发生在最后一个 requestAnimationFrame 之前，先同步目标位置再提交。
+    dragState.lastY = event.clientY;
+    updateDragVisual(ctx);
+  }
   const rows = dragState.rows;
   const fromIndex = dragState.startIndex;
   const toIndex = dragState.targetIndex;
@@ -637,13 +692,16 @@ async function finishModelDrag(ctx, rowsBox) {
   const orderKeys = rows.map((row) => row.dataset.orderKey).filter(Boolean);
   const nextKeys = reorderModelKeys(orderKeys, fromIndex, toIndex);
   const firstRects = new Map(rows.map((row) => [row, row.getBoundingClientRect()]));
-  const movedRows = reorderModelRows(rows, fromIndex, toIndex);
+  const movedRows = reorderModelRows(rowsBox, rows, fromIndex, toIndex);
   rowsBox.removeEventListener('pointermove', onModelDragMove);
+  rowsBox.removeEventListener('pointerup', dragState.finish);
+  rowsBox.removeEventListener('pointercancel', dragState.finish);
   if (dragState.moveFrame && typeof window !== 'undefined') window.cancelAnimationFrame?.(dragState.moveFrame);
   dragState.moveFrame = 0;
   dragState.row = null;
   dragState.rows = [];
   dragState.rowTops = [];
+  dragState.pointerId = null;
   dragState.finish = null;
   if (fromIndex === toIndex || !nextKeys.length) {
     rowsBox.classList.remove('is-dragging-list');
@@ -655,28 +713,45 @@ async function finishModelDrag(ctx, rowsBox) {
   }
   animateRowsToFinalPosition(rowsBox, firstRects, movedRows);
   viewState.busy = true;
+  let saved = false;
   try {
-    await ctx.api.reorderModels({ orderKeys: nextKeys });
+    const status = await ctx.api.reorderModels({ orderKeys: nextKeys });
+    applyModelOrderToState(ctx, nextKeys);
+    if (status && typeof status === 'object') ctx.state.status = status;
+    markRelaunchIfInjected(ctx);
+    saved = true;
   } catch (err) {
     ctx.toastError(err, '调整模型顺序失败');
   } finally {
     viewState.busy = false;
-    await ctx.reload('models', { preserveScrollTop: true });
+    if (!saved) await ctx.reload('models', { preserveScrollTop: true });
   }
   void draggedRow;
 }
 
-function reorderModelRows(rowsBox, fromIndex, toIndex) {
-  const rows = dragState.rows.slice();
+/** 保存成功后只同步内存顺序，避免重建整页导致松手瞬间闪烁。 */
+function applyModelOrderToState(ctx, orderKeys) {
+  const models = Array.isArray(ctx.state.models) ? ctx.state.models : [];
+  const byKey = new Map(models.map((model) => [
+    model.orderKey || `${model.providerId}::${model.modelId}`,
+    model,
+  ]));
+  const ordered = [];
+  for (const key of orderKeys) {
+    const model = byKey.get(key);
+    if (!model) continue;
+    ordered.push(model);
+    byKey.delete(key);
+  }
+  ctx.state.models = [...ordered, ...byKey.values()];
+}
+
+function reorderModelRows(rowsBox, currentRows, fromIndex, toIndex) {
+  const rows = currentRows.slice();
   const [moved] = rows.splice(fromIndex, 1);
   rows.splice(toIndex, 0, moved);
-  const anchor = rowsBox.querySelector?.('.tbody-row');
-  if (!anchor) return rows;
-  const firstRow = rows[0];
-  rowsBox.insertBefore(firstRow, anchor);
-  for (let index = 1; index < rows.length; index += 1) {
-    rowsBox.insertBefore(rows[index], rows[index - 1].nextSibling);
-  }
+  // 直接按最终顺序追加已有节点，保留表头，同时避免 insertBefore 链在不同 DOM 实现中失去顺序。
+  rowsBox.append(...rows);
   return rows;
 }
 
@@ -700,7 +775,7 @@ function animateRowsToFinalPosition(rowsBox, firstRects, movedRows) {
   const raf = typeof window !== 'undefined' && window.requestAnimationFrame;
   const play = () => {
     movedRows.forEach((row) => {
-      row.style.removeProperty('transition');
+      row.style.setProperty('transition', 'transform var(--dur-2) var(--ease-out)');
       row.style.setProperty('transform', 'none');
     });
     window.setTimeout(() => {

@@ -1376,11 +1376,11 @@ html.is-theme-switching .logs {
 }
 .tbody-row:not(.is-dragging) { transition: transform var(--dur-2) var(--ease-out), background var(--dur-2) var(--ease-out); }
 .table.is-dragging-list { user-select: none; }
-.table.is-dragging-list .tbody-row { transition: transform 180ms var(--ease-out), background var(--dur-2) var(--ease-out); }
+.table.is-dragging-list .tbody-row { transition: background var(--dur-2) var(--ease-out); }
 .table.is-dragging-list .tbody-row.is-dragging {
   z-index: 2;
   background: var(--bg-hover);
-  box-shadow: 0 12px 24px rgba(0, 0, 0, 0.28);
+  box-shadow: 0 8px 16px rgba(0, 0, 0, 0.2);
   transition: none;
   cursor: grabbing;
 }
