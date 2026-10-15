@@ -105,6 +105,8 @@ function registerIpc(deps) {
   handle('gptplus:update:state', () => updater?.getState?.() || { enabled: false, status: 'disabled' });
   handle('gptplus:update:check', () => updater?.checkForUpdates?.() || { enabled: false, status: 'disabled' });
   handle('gptplus:update:download', () => updater?.downloadUpdate?.() || { enabled: false, status: 'disabled' });
+  handle('gptplus:update:rollbacks', () => updater?.listRollbackReleases?.() || []);
+  handle('gptplus:update:rollback', (version) => updater?.rollbackToVersion?.(version) || { enabled: false, status: 'disabled' });
   handle('gptplus:theme:get', () => store.get().theme);
   handle('gptplus:theme:set', (patch = {}) => {
     const raw = typeof patch === 'string' ? patch : patch && patch.theme;

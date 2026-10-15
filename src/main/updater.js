@@ -5,6 +5,44 @@ const os = require('node:os');
 const path = require('node:path');
 
 const UPDATER_CACHE_DIR = 'gptplus-updater';
+const RELEASES_API = 'https://api.github.com/repos/ailuo04/gptplus/releases?per_page=100';
+const RELEASE_DOWNLOAD_BASE = 'https://github.com/ailuo04/gptplus/releases/download';
+
+function stableVersion(value) {
+  const match = String(value || '').replace(/^v/i, '').match(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
+  return match ? { value: match[0], parts: match.slice(1).map(Number) } : null;
+}
+
+function compareVersions(left, right) {
+  for (let index = 0; index < 3; index += 1) {
+    if (left.parts[index] !== right.parts[index]) return left.parts[index] < right.parts[index] ? -1 : 1;
+  }
+  return 0;
+}
+
+async function listRollbackReleases({ currentVersion, fetchImpl = globalThis.fetch }) {
+  if (typeof fetchImpl !== 'function') throw new Error('当前环境无法连接 GitHub');
+  const current = stableVersion(currentVersion);
+  if (!current) throw new Error('当前应用版本格式无效');
+  const url = new URL(RELEASES_API);
+  const releases = [];
+  for (let page = 1; page <= 3; page += 1) {
+    url.searchParams.set('page', String(page));
+    const response = await fetchImpl(url, { headers: { Accept: 'application/vnd.github+json' } });
+    if (!response.ok) throw new Error(`读取 GitHub 历史版本失败（HTTP ${response.status}）`);
+    const batch = await response.json();
+    if (!Array.isArray(batch)) throw new Error('GitHub 返回的版本列表格式无效');
+    for (const release of batch) {
+      const parsedVersion = stableVersion(release.tag_name);
+      if (!parsedVersion || release.draft || release.prerelease || compareVersions(parsedVersion, current) >= 0) continue;
+      const assets = new Set((release.assets || []).map((asset) => asset.name));
+      if (!assets.has(`gpt-plus-${parsedVersion.value}-setup.exe`) || !assets.has('latest.yml')) continue;
+      releases.push({ version: parsedVersion.value, name: String(release.name || `v${parsedVersion.value}`), publishedAt: release.published_at || null });
+    }
+    if (batch.length < 100) break;
+  }
+  return releases.sort((a, b) => compareVersions(stableVersion(b.version), stableVersion(a.version)));
+}
 
 /**
  * 新版本启动后整理更新缓存，保留差分更新所需的当前版本基准。
@@ -88,6 +126,7 @@ function setupAutoUpdater(options = {}) {
     autoUpdater,
     isDev = false,
     isSmoke = false,
+    fetchImpl = globalThis.fetch,
     onLog = () => {},
     onState = () => {},
   } = options;
@@ -98,6 +137,7 @@ function setupAutoUpdater(options = {}) {
     status: disabled ? 'disabled' : 'idle',
     currentVersion: String(app?.getVersion?.() || ''),
     version: null,
+    rollbackTarget: null,
     releaseDate: null,
     percent: 0,
     error: null,
@@ -114,12 +154,15 @@ function setupAutoUpdater(options = {}) {
       getState: () => ({ ...state }),
       checkForUpdates: async () => ({ ...state }),
       downloadUpdate: async () => ({ ...state }),
+      listRollbackReleases: async () => [],
+      rollbackToVersion: async () => ({ ...state }),
     };
   }
 
   let checking = false;
   let downloading = false;
   let installAfterDownload = false;
+  let rollbackTarget = null;
 
   const log = (level, msg) => {
     onLog({ at: Date.now(), level, msg });
@@ -130,6 +173,30 @@ function setupAutoUpdater(options = {}) {
   // 保留 electron-updater 的 blockmap 差分下载，减少更新时的网络流量。
   autoUpdater.disableDifferentialDownload = false;
 
+  const resetRollbackFeed = () => {
+    rollbackTarget = null;
+    autoUpdater.allowDowngrade = false;
+    autoUpdater.disableDifferentialDownload = false;
+    autoUpdater.setFeedURL({ provider: 'github', owner: 'ailuo04', repo: 'gptplus' });
+  };
+
+  const beginDownload = async () => {
+    if (downloading || state.status !== 'available') return { ...state };
+    downloading = true;
+    installAfterDownload = true;
+    publish({ status: 'downloading', percent: 0, error: null });
+    try {
+      await autoUpdater.downloadUpdate();
+    } catch (err) {
+      downloading = false;
+      installAfterDownload = false;
+      if (rollbackTarget) resetRollbackFeed();
+      publish({ status: 'error', rollbackTarget: null, error: err.message });
+      log('error', `更新下载失败: ${err.message}`);
+    }
+    return { ...state };
+  };
+
   autoUpdater.on('checking-for-update', () => {
     checking = true;
     publish({ status: 'checking', error: null });
@@ -138,16 +205,29 @@ function setupAutoUpdater(options = {}) {
 
   autoUpdater.on('update-not-available', () => {
     checking = false;
-    publish({ status: 'latest', version: null, releaseDate: null, percent: 0, error: null, lastCheckedAt: Date.now() });
+    if (rollbackTarget) {
+      const version = rollbackTarget;
+      resetRollbackFeed();
+      publish({ status: 'error', version: null, rollbackTarget: null, error: `无法回退到 v${version}，请确认该版本仍可用` });
+      return;
+    }
+    publish({ status: 'latest', version: null, rollbackTarget: null, releaseDate: null, percent: 0, error: null, lastCheckedAt: Date.now() });
     log('info', '当前已是最新版本');
   });
 
   autoUpdater.on('update-available', (info = {}) => {
     checking = false;
+    if (rollbackTarget && String(info.version) !== rollbackTarget) {
+      const requested = rollbackTarget;
+      resetRollbackFeed();
+      publish({ status: 'error', version: null, rollbackTarget: null, error: `版本校验不匹配：请求 v${requested}，服务器返回 v${info.version}` });
+      return;
+    }
     publish({
       status: 'available',
       version: String(info.version || ''),
       releaseDate: info.releaseDate || null,
+      rollbackTarget,
       percent: 0,
       error: null,
       lastCheckedAt: Date.now(),
@@ -178,7 +258,8 @@ function setupAutoUpdater(options = {}) {
     checking = false;
     downloading = false;
     installAfterDownload = false;
-    publish({ status: 'error', error: err.message, lastCheckedAt: Date.now() });
+    if (rollbackTarget) resetRollbackFeed();
+    publish({ status: 'error', rollbackTarget: null, error: err.message, lastCheckedAt: Date.now() });
     log('error', `自动更新失败: ${err.message}`);
   });
 
@@ -198,6 +279,50 @@ function setupAutoUpdater(options = {}) {
         return { ...state };
       }
     },
+    async listRollbackReleases() {
+      if (checking || downloading) return [];
+      return listRollbackReleases({ currentVersion: state.currentVersion, fetchImpl });
+    },
+    async rollbackToVersion(requestedVersion) {
+      if (checking || downloading) return { ...state };
+      const parsedVersion = stableVersion(requestedVersion);
+      const currentVersion = stableVersion(state.currentVersion);
+      if (!parsedVersion || !currentVersion || compareVersions(parsedVersion, currentVersion) >= 0) throw new Error('只能回退到有效的较早版本');
+      const version = parsedVersion.value;
+      const releases = await listRollbackReleases({ currentVersion: state.currentVersion, fetchImpl });
+      if (!releases.some((release) => release.version === version)) throw new Error('所选版本不存在、已撤回，或缺少有效安装文件');
+      rollbackTarget = version;
+      checking = true;
+      autoUpdater.allowDowngrade = true;
+      autoUpdater.disableDifferentialDownload = true;
+      autoUpdater.setFeedURL({ provider: 'generic', url: `${RELEASE_DOWNLOAD_BASE}/v${version}/` });
+      publish({ status: 'checking', version, rollbackTarget: version, error: null, percent: 0 });
+      log('warn', `用户请求回退到 v${version}`);
+      try {
+        const result = await autoUpdater.checkForUpdates();
+        const resultVersion = String(result?.updateInfo?.version || result?.versionInfo?.version || '');
+        if (result?.isUpdateAvailable === false || (resultVersion && resultVersion !== version)) {
+          checking = false;
+          resetRollbackFeed();
+          publish({ status: 'error', version: null, rollbackTarget: null, error: `版本 v${version} 当前不可安装` });
+          return { ...state };
+        }
+        if (state.status !== 'available' || state.version !== version) {
+          checking = false;
+          resetRollbackFeed();
+          publish({ status: 'error', version: null, rollbackTarget: null, error: `版本 v${version} 当前不可安装` });
+          return { ...state };
+        }
+        checking = false;
+        return beginDownload();
+      } catch (err) {
+        checking = false;
+        resetRollbackFeed();
+        publish({ status: 'error', version: null, rollbackTarget: null, error: err.message });
+        log('error', `回退到 v${version} 失败: ${err.message}`);
+        return { ...state };
+      }
+    },
     /** 用户明确点击更新后才下载，并在下载完成后重启安装。 */
     async downloadUpdate() {
       if (downloading) return { ...state };
@@ -207,20 +332,9 @@ function setupAutoUpdater(options = {}) {
         return { ...state };
       }
       if (state.status !== 'available') return { ...state };
-      downloading = true;
-      installAfterDownload = true;
-      publish({ status: 'downloading', percent: 0, error: null });
-      try {
-        await autoUpdater.downloadUpdate();
-      } catch (err) {
-        downloading = false;
-        installAfterDownload = false;
-        publish({ status: 'error', error: err.message });
-        log('error', `更新下载失败: ${err.message}`);
-      }
-      return { ...state };
+      return beginDownload();
     },
   };
 }
 
-module.exports = { setupAutoUpdater, cleanupInstalledUpdateCache };
+module.exports = { setupAutoUpdater, cleanupInstalledUpdateCache, listRollbackReleases };

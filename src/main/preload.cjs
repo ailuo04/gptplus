@@ -82,6 +82,8 @@ contextBridge.exposeInMainWorld('gptplus', {
   getUpdateState: () => invoke('gptplus:update:state'),
   checkForUpdates: () => invoke('gptplus:update:check'),
   downloadUpdate: () => invoke('gptplus:update:download'),
+  listRollbackReleases: () => invoke('gptplus:update:rollbacks'),
+  rollbackToVersion: (version) => invoke('gptplus:update:rollback', version),
 
   // 事件
   onStatus: (cb) => subscribe('gptplus:status', cb),

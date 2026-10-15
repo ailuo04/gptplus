@@ -196,6 +196,8 @@ const state = {
     releaseDate: null,
     percent: 0,
     error: null,
+    rollbackTarget: null,
+    rollbackReleases: null,
     lastCheckedAt: null,
   },
   loaded: { status: false, providers: false, models: false, modelLimits: false, gateway: false, inject: false, update: false, logs: false, usage: false },

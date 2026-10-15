@@ -1448,6 +1448,11 @@ html.is-theme-switching .logs {
 .setting-title { font-size: var(--fs-body); font-weight: 650; display: flex; align-items: center; gap: var(--sp-2); letter-spacing: 0; }
 .setting-desc { font-size: var(--fs-meta); color: var(--fg-dim); margin-top: 2px; }
 .setting-ctl { display: flex; align-items: center; gap: var(--sp-2); flex-shrink: 0; }
+.rollback-panel { margin-top: var(--sp-3); padding-top: var(--sp-3); border-top: 1px solid var(--line-soft); }
+.rollback-controls { display: flex; align-items: center; gap: var(--sp-2); padding: 0 var(--sp-4); }
+.rollback-select { flex: 1 1 220px; min-width: 0; }
+.rollback-empty, .rollback-warning { margin: 0 var(--sp-4); }
+.rollback-warning { margin-top: var(--sp-2); }
 
 .path-list { display: flex; flex-direction: column; gap: 7px; }
 .path-row { display: grid; grid-template-columns: 92px minmax(0, 1fr) auto; gap: 10px; align-items: center; }

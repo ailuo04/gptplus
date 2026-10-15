@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { setupAutoUpdater, cleanupInstalledUpdateCache } = require('../src/main/updater.js');
+const { setupAutoUpdater, cleanupInstalledUpdateCache, listRollbackReleases } = require('../src/main/updater.js');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
@@ -14,8 +14,26 @@ function createUpdater() {
   updater.checkForUpdates = async () => ({ updateInfo: { version: '0.1.1' } });
   updater.downloadUpdate = async () => {};
   updater.quitAndInstall = () => {};
+  updater.setFeedURL = () => {};
   return updater;
 }
+
+test('历史版本只返回较早稳定版且必须包含安装器和更新元数据', async () => {
+  const fetchImpl = async () => ({
+    ok: true,
+    json: async () => [
+      { tag_name: 'v0.2.0', draft: false, prerelease: false, assets: [{ name: 'gpt-plus-0.2.0-setup.exe' }, { name: 'latest.yml' }] },
+      { tag_name: 'v0.1.9', draft: false, prerelease: true, assets: [{ name: 'gpt-plus-0.1.9-setup.exe' }, { name: 'latest.yml' }] },
+      { tag_name: 'v0.1.8', draft: false, prerelease: false, assets: [{ name: 'latest.yml' }] },
+      { tag_name: 'v0.1.7', draft: false, prerelease: false, assets: [{ name: 'gpt-plus-0.1.7-setup.exe' }, { name: 'latest.yml' }] },
+      { tag_name: 'v0.3.0', draft: false, prerelease: false, assets: [{ name: 'gpt-plus-0.3.0-setup.exe' }, { name: 'latest.yml' }] },
+    ],
+  });
+  assert.deepEqual(await listRollbackReleases({ currentVersion: '0.2.1', fetchImpl }), [
+    { version: '0.2.0', name: 'v0.2.0', publishedAt: null },
+    { version: '0.1.7', name: 'v0.1.7', publishedAt: null },
+  ]);
+});
 
 test('开发模式跳过自动更新', async () => {
   const controller = setupAutoUpdater({
@@ -59,6 +77,42 @@ test('NSIS 更新保留差分下载能力，并关闭自动安装', () => {
   const updater = createUpdater();
   setupAutoUpdater({ app: { isPackaged: true, getVersion: () => '0.1.3' }, autoUpdater: updater });
   assert.equal(updater.disableDifferentialDownload, false);
+});
+
+test('回退到指定历史版本会切换 Release、允许降级并自动安装', async () => {
+  const updater = createUpdater();
+  const feeds = [];
+  let downloadCalls = 0;
+  let installed = false;
+  updater.setFeedURL = (feed) => feeds.push(feed);
+  updater.checkForUpdates = async () => {
+    updater.emit('update-available', { version: '0.1.2' });
+    return { isUpdateAvailable: true, updateInfo: { version: '0.1.2' } };
+  };
+  updater.downloadUpdate = async () => {
+    downloadCalls += 1;
+    updater.emit('update-downloaded');
+  };
+  updater.quitAndInstall = () => { installed = true; };
+  const controller = setupAutoUpdater({
+    app: { isPackaged: true, getVersion: () => '0.2.1' },
+    autoUpdater: updater,
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => [{ tag_name: 'v0.1.2', draft: false, prerelease: false, assets: [
+        { name: 'gpt-plus-0.1.2-setup.exe' }, { name: 'latest.yml' },
+      ] }],
+    }),
+  });
+
+  const state = await controller.rollbackToVersion('0.1.2');
+  assert.equal(state.status, 'downloaded');
+  assert.equal(state.rollbackTarget, '0.1.2');
+  assert.equal(downloadCalls, 1);
+  assert.deepEqual(feeds[0], { provider: 'generic', url: 'https://github.com/ailuo04/gptplus/releases/download/v0.1.2/' });
+  assert.equal(updater.allowDowngrade, true);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(installed, true);
 });
 
 test('新版本首次启动后清理已安装版本对应的更新缓存', async (t) => {

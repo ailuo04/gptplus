@@ -319,6 +319,7 @@ async function boot() {
     autoUpdater,
     isDev,
     isSmoke,
+    fetchImpl: ctx.network,
     onState: (state) => broadcast('gptplus:update', state),
     onLog: (entry) => {
       ctx.log?.(entry);

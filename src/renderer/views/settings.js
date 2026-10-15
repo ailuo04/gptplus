@@ -12,6 +12,8 @@ const viewState = {
   revealedToken: false,
   pendingRestore: false,
   restoreBusy: false,
+  rollbackBusy: false,
+  pendingRollback: '',
 };
 
 /** 渲染设置页 */
@@ -96,8 +98,90 @@ function updateCard(ctx) {
       update.status === 'error'
         ? el('div', { class: 'hint-error', text: '请检查网络连接后再次点击“检查更新”。' })
         : null,
+      rollbackCard(ctx),
     ]),
   ]);
+}
+
+function rollbackCard(ctx) {
+  const { el, icon, state } = ctx;
+  const update = state.update || {};
+  const releases = Array.isArray(update.rollbackReleases) ? update.rollbackReleases : null;
+  const busy = viewState.rollbackBusy || update.status === 'checking' || update.status === 'downloading';
+  const load = async () => {
+    if (!ctx.api || busy) return;
+    viewState.rollbackBusy = true;
+    try {
+      const list = await ctx.api.listRollbackReleases();
+      state.update = { ...state.update, rollbackReleases: Array.isArray(list) ? list : [] };
+    } catch (err) {
+      ctx.toastError(err, '\u8BFB\u53D6\u5386\u53F2\u7248\u672C\u5931\u8D25');
+    } finally {
+      viewState.rollbackBusy = false;
+      ctx.renderCurrent(false, { preserveScrollTop: true });
+    }
+  };
+  const confirm = async () => {
+    const version = viewState.pendingRollback;
+    if (!version || !ctx.api || busy) return;
+    viewState.rollbackBusy = true;
+    try {
+      const next = await ctx.api.rollbackToVersion(version);
+      if (next && typeof next === 'object') state.update = { ...state.update, ...next };
+      viewState.pendingRollback = '';
+      ctx.toast(`\u5DF2\u5F00\u59CB\u56DE\u9000\u5230 v${version}\uFF0C\u4E0B\u8F7D\u5B8C\u6210\u540E\u4F1A\u81EA\u52A8\u91CD\u542F\u5B89\u88C5`, 'info');
+    } catch (err) {
+      ctx.toastError(err, '\u5F00\u59CB\u56DE\u9000\u5931\u8D25');
+    } finally {
+      viewState.rollbackBusy = false;
+      ctx.renderCurrent(false, { preserveScrollTop: true });
+    }
+  };
+  const selected = viewState.pendingRollback;
+  const children = [
+    el('div', { class: 'setting' }, [
+      el('div', { class: 'setting-main' }, [
+        el('div', { class: 'setting-title', text: '\u56DE\u9000\u5230\u4E4B\u524D\u7684\u7248\u672C' }),
+        el('div', { class: 'setting-desc', text: '\u4ECE GitHub Release \u9009\u62E9\u8F83\u65E9\u7684\u7A33\u5B9A\u7248\u672C\uFF1B\u56DE\u9000\u53EA\u66FF\u6362\u7A0B\u5E8F\uFF0C\u4E0D\u4F1A\u5220\u9664\u672C\u5730\u914D\u7F6E\u3002' }),
+      ]),
+      el('div', { class: 'setting-ctl' }, [
+        el('button', {
+          class: 'btn btn-sm btn-ghost',
+          type: 'button',
+          disabled: !ctx.api || busy ? true : null,
+          on: { click: () => void load() },
+        }, [icon('refresh', 13), el('span', { text: viewState.rollbackBusy ? '\u8BFB\u53D6\u4E2D\u2026' : releases ? '\u5237\u65B0\u5386\u53F2\u7248\u672C' : '\u67E5\u770B\u5386\u53F2\u7248\u672C' })]),
+      ]),
+    ]),
+  ];
+  if (releases && !releases.length) {
+    children.push(el('div', { class: 'rollback-empty', text: '\u6CA1\u6709\u53EF\u7528\u7684\u66F4\u65E9\u7A33\u5B9A\u7248\u672C\u3002' }));
+  } else if (releases) {
+    children.push(el('div', { class: 'rollback-controls' }, [
+      el('select', {
+        class: 'select rollback-select',
+        value: selected,
+        disabled: busy ? true : null,
+        attrs: { 'aria-label': '\u9009\u62E9\u56DE\u9000\u7248\u672C' },
+        on: { change: (event) => { viewState.pendingRollback = event.target.value; ctx.renderCurrent(false, { preserveScrollTop: true }); } },
+      }, [
+        el('option', { value: '', text: '\u9009\u62E9\u4E00\u4E2A\u5386\u53F2\u7248\u672C' }),
+        ...releases.map((release) => el('option', { value: release.version, text: 'v' + release.version })),
+      ]),
+      selected
+        ? el('button', {
+            class: 'btn btn-sm btn-warning',
+            type: 'button',
+            disabled: busy ? true : null,
+            on: { click: () => void confirm() },
+          }, [icon('download', 13), el('span', { text: '\u786E\u8BA4\u56DE\u9000\u5230 v' + selected })])
+        : null,
+    ]));
+    if (selected) {
+      children.push(el('div', { class: 'hint-warn rollback-warning', text: '\u56DE\u9000\u4F1A\u9000\u51FA gpt++ \u5E76\u8986\u76D6\u5F53\u524D\u7A0B\u5E8F\u7248\u672C\uFF1B\u672C\u5730\u63D0\u4F9B\u5546\u3001API Key \u548C\u7F51\u5173\u914D\u7F6E\u4F1A\u4FDD\u7559\u3002' }));
+    }
+  }
+  return el('div', { class: 'rollback-panel' }, children);
 }
 
 // ============ 模型上下文 ============

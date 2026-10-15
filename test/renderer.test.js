@@ -795,6 +795,9 @@ test('设置页覆盖网关、探活、目录与还原注入', () => {
   assert.match(src, /setModelLimits/, '设置页必须调用 setModelLimits');
   assert.match(src, /checkForUpdates/, '设置页必须提供手动检查更新入口');
   assert.match(src, /startUpdateDownload/, '设置页必须提供手动安装更新入口');
+  assert.match(src, /listRollbackReleases/, '设置页必须提供历史版本列表入口');
+  assert.match(src, /rollbackToVersion/, '设置页必须提供指定版本回退入口');
+  assert.match(src, /pendingRollback/, '回退必须先选择版本再确认');
   assert.match(src, /上下文窗口 Token/, '设置页必须提供上下文窗口设置');
   assert.match(src, /自动压缩阈值 Token/, '设置页必须提供自动压缩设置');
   assert.match(src, /codex\.configPath/, '需要展示 codex.configPath');
@@ -1131,6 +1134,14 @@ function makeApi(state, calls) {
     },
     downloadUpdate: async () => {
       calls.push(['downloadUpdate']);
+      return state.update || { enabled: false, status: 'idle' };
+    },
+    listRollbackReleases: async () => {
+      calls.push(['listRollbackReleases']);
+      return state.update?.rollbackReleases || [];
+    },
+    rollbackToVersion: async (version) => {
+      calls.push(['rollbackToVersion', version]);
       return state.update || { enabled: false, status: 'idle' };
     },
     onStatus: () => () => {},
