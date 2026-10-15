@@ -29,6 +29,16 @@ Var pid
   ${endIf}
 !macroend
 
+; NSIS upgrades keep an existing shortcut when its target still exists. Rewrite
+; both shortcuts so an older external .ico path cannot survive an upgrade.
+!macro customInstall
+  ${if} ${FileExists} "$INSTDIR\${APP_EXECUTABLE_FILENAME}"
+    CreateShortCut "$DESKTOP\${PRODUCT_NAME}.lnk" "$INSTDIR\${APP_EXECUTABLE_FILENAME}" "" "$INSTDIR\${APP_EXECUTABLE_FILENAME}" 0 SW_SHOWNORMAL "" "${PRODUCT_NAME}"
+    CreateDirectory "$SMPROGRAMS\${PRODUCT_NAME}"
+    CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "$INSTDIR\${APP_EXECUTABLE_FILENAME}" "" "$INSTDIR\${APP_EXECUTABLE_FILENAME}" 0 SW_SHOWNORMAL "" "${PRODUCT_NAME}"
+  ${endIf}
+!macroend
+
 !macro customCheckAppRunning
   !insertmacro IS_POWERSHELL_AVAILABLE
   ${GetProcessInfo} 0 $pid $1 $2 $3 $4

@@ -55,6 +55,13 @@ test('NSIS 覆盖安装会递归结束 gpt++ 的 Electron 进程树', () => {
   assert.match(script, /customCheckAppRunning/);
 });
 
+test('NSIS 安装会用程序本体图标重写桌面和开始菜单快捷方式', () => {
+  const script = fs.readFileSync(path.join(ROOT, 'build', 'installer.nsh'), 'utf8');
+  assert.match(script, /!macro customInstall/);
+  assert.match(script, /\$DESKTOP\\\$\{PRODUCT_NAME\}\.lnk.*\$INSTDIR\\\$\{APP_EXECUTABLE_FILENAME\}.*\$INSTDIR\\\$\{APP_EXECUTABLE_FILENAME\}/);
+  assert.match(script, /\$SMPROGRAMS\\\$\{PRODUCT_NAME\}\\\$\{PRODUCT_NAME\}\.lnk.*\$INSTDIR\\\$\{APP_EXECUTABLE_FILENAME\}.*\$INSTDIR\\\$\{APP_EXECUTABLE_FILENAME\}/);
+});
+
 test('安装包图标满足 Windows 打包器的最小尺寸', () => {
   const icon = path.join(ROOT, 'src', 'main', 'assets', 'app-icon-256.png');
   assert.equal(fs.existsSync(icon), true);
