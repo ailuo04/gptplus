@@ -1650,6 +1650,48 @@ test('设置页：端口校验 / 网关开关 / 探活 / 还原注入都能走�
   }
 });
 
+test('设置页：选择回退版本后确认按钮立即显示', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const settingsMod = await import(pathToFileURL(path.join(tmp, 'views', 'settings.js')).href);
+    installFakeDom();
+
+    const state = fixtureState({
+      status: { ...fixtureState().status, appVersion: '0.2.2' },
+      update: {
+        enabled: true,
+        status: 'idle',
+        currentVersion: '0.2.2',
+        rollbackReleases: [{ version: '0.2.1', name: 'v0.2.1' }],
+      },
+    });
+    const ctx = makeCtx(appMod, state);
+    const root = new FakeNode('main');
+    const actions = new FakeNode('div');
+    const renders = [];
+    ctx.renderCurrent = (force) => {
+      renders.push(force);
+      // 模拟 app.js：焦点还在 select 时，非强制重绘会被焦点保护跳过。
+      if (force) settingsMod.renderSettings(root, ctx, actions);
+    };
+
+    settingsMod.renderSettings(root, ctx, actions);
+    const select = byAttr(root, 'aria-label', '选择回退版本')[0];
+    assert.ok(select, '应有回退版本选择框');
+    select.value = '0.2.1';
+    for (const handler of select.listeners.change || []) handler({ target: select });
+
+    assert.deepEqual(renders, [true], '选择版本后必须强制重绘，不能等失焦再刷新');
+    assert.equal(buttonsWithText(root, '确认回退到 v0.2.1').length, 1, '选择版本后确认回退按钮应立即显示');
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 // ============================================================
 // 12. 回归：使用量统计与默认模型标注
 // ============================================================

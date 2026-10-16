@@ -163,7 +163,7 @@ function rollbackCard(ctx) {
         value: selected,
         disabled: busy ? true : null,
         attrs: { 'aria-label': '\u9009\u62E9\u56DE\u9000\u7248\u672C' },
-        on: { change: (event) => { viewState.pendingRollback = event.target.value; ctx.renderCurrent(false, { preserveScrollTop: true }); } },
+        on: { change: (event) => { viewState.pendingRollback = event.target.value; ctx.renderCurrent(true, { preserveScrollTop: true }); } },
       }, [
         el('option', { value: '', text: '\u9009\u62E9\u4E00\u4E2A\u5386\u53F2\u7248\u672C' }),
         ...releases.map((release) => el('option', { value: release.version, text: 'v' + release.version })),
