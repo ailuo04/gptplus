@@ -331,6 +331,7 @@ const state = {
   modelLimits: null,
   gateway: null,
   network: null,
+  startup: null,
   inject: null,
   logs: [],
   usage: [],
@@ -352,7 +353,7 @@ const state = {
     rollbackReleases: null,
     lastCheckedAt: null,
   },
-  loaded: { status: false, providers: false, models: false, modelLimits: false, gateway: false, inject: false, update: false, logs: false, usage: false },
+  loaded: { status: false, providers: false, models: false, modelLimits: false, gateway: false, inject: false, startup: false, update: false, logs: false, usage: false },
 };
 
 const THEME_MODES = new Set(['dark', 'light', 'system']);
@@ -409,6 +410,7 @@ let subscribed = false;
 let relaunchTimer = 0;
 let themeSaveBusy = false;
 let networkSaveBusy = false;
+let startupSaveBusy = false;
 let networkFocusMode = null;
 let observedWriteAt = 0;
 let updatePromptedVersion = null;
@@ -613,6 +615,24 @@ async function loadStatus() {
   if (state.status && state.status.network) state.network = { ...state.status.network };
   setThemePreference(state.status && state.status.theme);
   state.loaded.status = true;
+}
+
+async function loadStartup() {
+  if (typeof api.getStartup !== 'function') {
+    state.startup = { supported: false, enabled: false };
+    state.loaded.startup = true;
+    return;
+  }
+  try {
+    const result = await api.getStartup();
+    state.startup = result && typeof result === 'object'
+      ? { supported: result.supported !== false, enabled: !!result.enabled }
+      : { supported: false, enabled: false };
+  } catch (err) {
+    state.startup = { supported: false, enabled: false };
+    logLocal('warn', `读取开机自启动状态失败: ${describeError(err)}`);
+  }
+  state.loaded.startup = true;
 }
 
 /** 读取主进程维护的更新状态，确保启动时不会错过可用版本事件。 */
@@ -947,6 +967,38 @@ function renderThemeControl() {
   );
 }
 
+/** 侧栏底部的开机自启动开关，状态由系统登录项 API 返回。 */
+function renderStartupControl() {
+  const current = state.startup || { supported: null, enabled: false };
+  const supported = current.supported !== false;
+  const enabled = !!current.enabled;
+  const buttonTitle = current.supported === null
+    ? '正在读取开机自启动状态'
+    : enabled ? '点击关闭开机自启动' : '点击开启开机自启动';
+  return el('section', { class: 'sidebar-startup', attrs: { 'aria-label': '开机自启动' } }, [
+    el('div', { class: 'sidebar-startup-head' }, [
+      icon('power', 13),
+      el('span', { class: 'sidebar-startup-title', text: '开机自启动' }),
+    ]),
+    el('button', {
+      class: 'sidebar-startup-toggle' + (enabled ? ' is-enabled' : ''),
+      type: 'button',
+      disabled: !api || !supported || current.supported === null || startupSaveBusy ? true : null,
+      title: buttonTitle,
+      attrs: {
+        role: 'switch',
+        'aria-checked': enabled ? 'true' : 'false',
+        'aria-label': '开机自启动',
+      },
+      on: { click: () => void saveStartupPreference(!enabled) },
+    }, [
+      el('span', { class: 'sidebar-startup-track', attrs: { 'aria-hidden': 'true' } }, [
+        el('span', { class: 'sidebar-startup-thumb' }),
+      ]),
+    ]),
+  ]);
+}
+
 /** 只在状态值真正变化时给侧栏徽标一次短反馈，避免状态广播导致持续闪烁。 */
 function setAnimatedText(node, value) {
   if (!node) return;
@@ -1010,6 +1062,28 @@ async function saveNetworkMode(nextMode) {
   }
 }
 
+async function saveStartupPreference(enabled) {
+  const current = state.startup || { supported: false, enabled: false };
+  if (startupSaveBusy || !api || current.supported === false || current.enabled === enabled) return;
+  startupSaveBusy = true;
+  state.startup = { ...current, enabled };
+  renderChrome();
+  try {
+    const next = await api.setStartup({ enabled });
+    state.startup = next && typeof next === 'object'
+      ? { supported: next.supported !== false, enabled: !!next.enabled }
+      : { supported: true, enabled };
+    toast(enabled ? '已开启开机自启动' : '已关闭开机自启动', 'ok');
+    logLocal('info', enabled ? '已开启开机自启动' : '已关闭开机自启动');
+  } catch (err) {
+    state.startup = current;
+    toastError(err, '设置开机自启动失败');
+  } finally {
+    startupSaveBusy = false;
+    renderChrome();
+  }
+}
+
 /** 侧栏里的全局客户端重启动作：所有页面共用同一份确认状态。 */
 function renderSidebarAction() {
   if (!dom.sidebarActions) return;
@@ -1052,6 +1126,7 @@ function renderSidebarAction() {
       networkOption('direct', '直连', '不使用系统代理，直接连接模型提供商', 'zap'),
     ]),
   ]);
+  const startupControl = renderStartupControl();
   const update = state.update || {};
   const updatePending = ['available', 'downloading', 'downloaded'].includes(update.status);
   const updateNotice = updatePending
@@ -1108,6 +1183,7 @@ function renderSidebarAction() {
   dom.sidebarActions.replaceChildren(
     ...(updateNotice ? [updateNotice] : []),
     networkControl,
+    startupControl,
     el('div', { class: 'sidebar-relaunch-wrap' }, [warning, button]),
   );
   if (networkFocusMode && !networkSaveBusy) {
@@ -1280,20 +1356,21 @@ function renderSidebarFoot(s) {
 /** 状态栏的「提供商 → 网关 → ChatGPT」链路：本界面唯一的记忆点，直接反映系统接线 */
 function renderFlow(s) {
   const nodes = [];
-  const sep = () => el('span', { class: 'flow-sep', text: '→' });
+  const sep = (live) => el('span', { class: 'flow-sep' + (live ? ' is-live' : ''), text: '→' });
 
-  const providersNode = el('span', { class: 'flow-node' }, [
+  const providersNode = el('span', { class: 'flow-node flow-provider' }, [
     el('span', { class: 'flow-key', text: '提供商' }),
     el('span', { class: 'flow-summary', text: s ? `${s.providers} 个 · 模型 ${s.models}` : '正在读取…' }),
   ]);
 
   const gw = (s && s.gateway) || null;
-  const gatewayNode = el('span', { class: 'flow-node' }, [
-    el('span', { class: 'dot ' + (gw ? (gw.running ? 'dot-ok' : gw.enabled ? 'dot-warn' : 'dot-off') : 'dot-off') }),
+  const gatewayRunning = !!gw?.running;
+  const gatewayNode = el('span', { class: 'flow-node flow-gateway' }, [
+    el('span', { class: 'dot ' + (gw ? (gatewayRunning ? 'dot-ok' : gw.enabled ? 'dot-warn' : 'dot-off') : 'dot-off') }),
     el('span', { class: 'flow-key', text: '网关' }),
     el('span', {
-      class: 'flow-val' + (gw && gw.running ? '' : ' is-dim'),
-      text: gw ? (gw.running ? `127.0.0.1:${gw.port}` : gw.enabled ? `未运行 · 端口 ${gw.port}` : '未启用') : '–',
+      class: 'flow-val' + (gw && gatewayRunning ? '' : ' is-dim'),
+      text: gw ? (gatewayRunning ? `127.0.0.1:${gw.port}` : gw.enabled ? `未运行 · 端口 ${gw.port}` : '未启用') : '–',
     }),
   ]);
 
@@ -1307,7 +1384,7 @@ function renderFlow(s) {
     }),
   ]);
 
-  nodes.push(providersNode, sep(), gatewayNode, sep(), codexNode);
+  nodes.push(providersNode, sep(gatewayRunning && !!inject?.enabled), gatewayNode, sep(!!inject?.enabled), codexNode);
   dom.flow.replaceChildren(...nodes);
 }
 
@@ -1722,7 +1799,10 @@ async function boot() {
 
   // 默认页只依赖全局状态和提供商列表，先画出可交互页面。
   await ensureLoaded('providers');
-  await tryLoad(loadUpdate, '更新状态');
+  await Promise.all([
+    tryLoad(loadStartup, '开机自启动状态'),
+    tryLoad(loadUpdate, '更新状态'),
+  ]);
   renderChrome();
   renderCurrent(true, { preserveScrollTop: false });
   syncUsageAutoRefresh();

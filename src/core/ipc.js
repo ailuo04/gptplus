@@ -62,11 +62,11 @@ function withDerived(p) {
 }
 
 /**
- * @param {{ ipcMain:any, shell:any, dialog:any, ctx:any, updater?:any,
+ * @param {{ ipcMain:any, shell:any, dialog:any, ctx:any, updater?:any, startup?:any,
  *           onStatus?:(s:any)=>void, onLog?:(e:any)=>void }} deps
  */
 function registerIpc(deps) {
-  const { ipcMain, shell, dialog, ctx, updater, onStatus = () => {}, onLog = () => {} } = deps;
+  const { ipcMain, shell, dialog, ctx, updater, startup, onStatus = () => {}, onLog = () => {} } = deps;
   const { store } = ctx;
 
   const handle = (channel, fn) => {
@@ -116,6 +116,26 @@ function registerIpc(deps) {
       draft.theme = theme;
     });
     return publish();
+  });
+
+  // ---- 开机自启动 ----
+  handle('gptplus:startup:get', () => {
+    const current = startup?.get?.();
+    return current && typeof current === 'object'
+      ? { supported: current.supported !== false, enabled: !!current.enabled }
+      : { supported: false, enabled: false };
+  });
+
+  handle('gptplus:startup:set', (patch = {}) => {
+    const raw = typeof patch === 'boolean' ? patch : patch && patch.enabled;
+    if (typeof raw !== 'boolean') throw new Error('开机自启动开关参数无效');
+    if (typeof startup?.set !== 'function') throw new Error('当前系统不支持开机自启动');
+    const result = startup.set(raw);
+    const next = result && typeof result === 'object'
+      ? { supported: result.supported !== false, enabled: !!result.enabled }
+      : { supported: true, enabled: raw };
+    ctx.log({ level: 'info', msg: next.enabled ? '已开启开机自启动' : '已关闭开机自启动' });
+    return next;
   });
 
   // ---- 网络与代理 ----
@@ -188,6 +208,11 @@ function registerIpc(deps) {
   });
 
   handle('gptplus:provider:test', (id) => ctx.providerClient.testProvider(id));
+  handle('gptplus:provider:models:test', (patch = {}) => {
+    const providerId = String(patch.providerId || '').trim();
+    const modelIds = Array.isArray(patch.modelIds) ? patch.modelIds : [];
+    return ctx.providerClient.testProviderModels(providerId, modelIds);
+  });
   handle('gptplus:provider:models:remote', (id) => ctx.providerClient.fetchRemoteModels(id));
 
   // ---- 模型与网关 ----

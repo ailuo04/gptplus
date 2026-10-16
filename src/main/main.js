@@ -151,10 +151,30 @@ function quitApplication() {
   app.quit();
 }
 
+function readStartupSettings() {
+  if (typeof app.getLoginItemSettings !== 'function') {
+    return { supported: false, enabled: false };
+  }
+  try {
+    const settings = app.getLoginItemSettings();
+    return { supported: true, enabled: !!settings.openAtLogin };
+  } catch {
+    return { supported: false, enabled: false };
+  }
+}
+
+function writeStartupSettings(enabled) {
+  if (typeof app.setLoginItemSettings !== 'function') {
+    throw new Error('当前系统不支持开机自启动');
+  }
+  app.setLoginItemSettings({ openAtLogin: !!enabled });
+  return readStartupSettings();
+}
+
 function createTray() {
   if (isSmoke || tray) return;
   tray = new Tray(nativeImage.createFromDataURL(TRAY_ICON_DATA_URL));
-  tray.setToolTip('gpt++ · 自定义模型注入');
+  tray.setToolTip('gpt++');
   tray.on('click', () => {
     if (win && !win.isDestroyed() && win.isVisible()) win.hide();
     else showWindow();
@@ -338,6 +358,7 @@ async function boot() {
     dialog,
     ctx,
     updater,
+    startup: { get: readStartupSettings, set: writeStartupSettings },
     onStatus: (s) => broadcast('gptplus:status', s),
     onLog: (e) => broadcast('gptplus:log', e),
   });

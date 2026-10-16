@@ -238,6 +238,9 @@ window.gptplus = {
   saveProvider(input: ProviderInput): Promise<Provider[]>;
   deleteProvider(id: string): Promise<Provider[]>;
   testProvider(id: string): Promise<{ ok: boolean; status?: number; latencyMs: number; error?: string }>;
+  testProviderModels(patch: { providerId: string; modelIds: string[] }): Promise<{
+    ok: boolean; results: { modelId: string; ok: boolean; status?: number; latencyMs: number; error?: string }[]; error?: string
+  }>;
   fetchRemoteModels(id: string): Promise<{ ok: boolean; models: {id:string;label:string}[]; error?: string }>;
 
   listModels(): Promise<ModelRef[]>;                    // 全部 provider 的全部模型（渠道名 slug 化，按 modelOrder）
@@ -315,6 +318,7 @@ createCodexConfig({ store, catalog, paths }) => {
 // src/core/provider-client.js
 createProviderClient({ store }) => {
   testProvider(id): Promise<{ ok, status, latencyMs, error }>       // GET {baseUrl}/models
+  testProviderModels(id, modelIds): Promise<{ ok, results }>        // 按渠道协议逐模型发送最小生成请求，记录各自状态与延时
   fetchRemoteModels(id): Promise<{ ok, models: [{id,label}], error }>
 }
 

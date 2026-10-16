@@ -52,11 +52,14 @@ contextBridge.exposeInMainWorld('gptplus', {
   // 状态与提供商
   getStatus: () => invoke('gptplus:status:get'),
   setTheme: (patch) => invoke('gptplus:theme:set', patch),
+  getStartup: () => invoke('gptplus:startup:get'),
+  setStartup: (patch) => invoke('gptplus:startup:set', patch),
   setNetwork: (patch) => invoke('gptplus:network:set', patch),
   listProviders: () => invoke('gptplus:provider:list'),
   saveProvider: (input) => invoke('gptplus:provider:save', input),
   deleteProvider: (id) => invoke('gptplus:provider:delete', id),
   testProvider: (id) => invoke('gptplus:provider:test', id),
+  testProviderModels: (patch) => invoke('gptplus:provider:models:test', patch),
   fetchRemoteModels: (id) => invoke('gptplus:provider:models:remote', id),
 
   // 模型与网关

@@ -185,6 +185,24 @@ test('代理/直连选择常驻左侧导航，不重复出现在设置页', () =
   assert.doesNotMatch(settingsSrc, /网络与代理|跟随系统代理/, '设置页不应再显示网络代理文案');
 });
 
+test('开机自启动开关常驻左侧底部并调用系统登录项 API', () => {
+  const appSrc = read(APP);
+  const preloadSrc = read(PRELOAD);
+  const cssSrc = read(path.join(ROOT, 'src/renderer/styles.css'));
+  assert.match(appSrc, /function renderStartupControl\(\)/, 'app.js 必须渲染开机自启动控件');
+  assert.match(appSrc, /function saveStartupPreference\(enabled\)/, 'app.js 必须处理开机自启动切换');
+  assert.match(appSrc, /api\.getStartup\(\)/, '启动时必须读取开机自启动状态');
+  assert.match(appSrc, /api\.setStartup\(\{ enabled \}\)/, '切换必须调用 setStartup');
+  assert.match(appSrc, /class: 'sidebar-startup'/, '控件必须位于左侧底部动作区');
+  assert.match(appSrc, /role: 'switch'/, '开机自启动必须使用 switch 语义');
+  assert.match(cssSrc, /\.sidebar-startup\s*\{[^}]*flex-direction:\s*row;/s, '开机自启动标题与开关应位于同一排');
+  assert.match(cssSrc, /\.sidebar-startup-toggle\s*\{[^}]*width:\s*40px;/s, '同排开关应保持紧凑的固定宽度');
+  assert.match(preloadSrc, /getStartup:.*gptplus:startup:get/, 'preload 必须暴露读取启动状态 API');
+  assert.match(preloadSrc, /setStartup:.*gptplus:startup:set/, 'preload 必须暴露设置启动状态 API');
+  assert.match(cssSrc, /\.sidebar-startup\s*\{/, '开机自启动控件必须有独立样式');
+  assert.match(cssSrc, /\.sidebar-startup-toggle\.is-enabled/, '开机自启动必须有开启态样式');
+});
+
 test('主题三态快捷控件位于底部状态栏，不重复出现在设置页', () => {
   const html = read(HTML);
   const appSrc = read(APP);
@@ -803,6 +821,9 @@ test('提供商表单支持多模型行与从 /models 拉取', () => {
   assert.match(src, /fetchRemoteModels/, '表单必须调用 fetchRemoteModels');
   assert.match(src, /saveProvider/, '表单必须调用 saveProvider');
   assert.match(src, /testProvider/, '卡片必须调用 testProvider');
+  assert.match(src, /testProviderModels/, '渠道有模型时必须支持逐模型测试');
+  assert.match(src, /openModelTestDialog/, '必须允许先选择要测试的模型');
+  assert.match(src, /model-test-result-latency/, '逐模型测试必须展示延时');
   assert.match(src, /deleteProvider/, '卡片必须调用 deleteProvider');
   assert.match(src, /添加一行/, '模型行必须可以手动新增');
   assert.match(src, /从 \/models 拉取/, '必须有拉取按钮');
@@ -1102,6 +1123,13 @@ function makeApi(state, calls) {
     testProvider: async (id) => {
       calls.push(['testProvider', id]);
       return { ok: true, status: 200, latencyMs: 12 };
+    },
+    testProviderModels: async (patch) => {
+      calls.push(['testProviderModels', patch]);
+      return {
+        ok: true,
+        results: patch.modelIds.map((modelId, index) => ({ modelId, ok: true, status: 200, latencyMs: 12 + index })),
+      };
     },
     fetchRemoteModels: async (id) => {
       calls.push(['fetchRemoteModels', id]);
@@ -1459,10 +1487,19 @@ test('提供商页：测试连接 / 删除 / 保存 / 从 /models 拉取都能�
     const root = new FakeNode('main');
     providersMod.renderProviders(root, ctx, new FakeNode('div'));
     click(buttonsWithText(root, '测试连接')[0]);
+    const testModal = ctx._calls.find((call) => call[0] === 'openModal')?.[1];
+    assert.ok(testModal, '已有模型时应先打开模型选择与测试结果弹窗');
+    assert.match(testModal.allText(), /选择/, '测试弹窗应允许选择模型');
+    assert.match(testModal.allText(), /GPT-6\.1 Sol/, '测试弹窗应显示模型名称');
+    click(buttonsWithText(testModal, '开始测试')[0]);
     await flush();
-    assert.deepEqual(callsOf(ctx, 'testProvider'), [['testProvider', 'p_demo0001']], '「测试连接」应调用 testProvider');
-    const probeToast = ctx._calls.find((c) => c[0] === 'toast' && String(c[2]).includes('连接正常'));
-    assert.ok(probeToast, '测试成功应给出带耗时结果的提示');
+    assert.deepEqual(callsOf(ctx, 'testProviderModels'), [[
+      'testProviderModels', { providerId: 'p_demo0001', modelIds: ['gpt-6.1-sol'] },
+    ]], '默认只选已启用模型，并将所选模型逐项提交');
+    assert.match(testModal.allText(), /通过 · HTTP 200/, '成功结果应显示状态码');
+    assert.match(testModal.allText(), /12ms/, '成功结果应显示单模型延时');
+    const probeToast = ctx._calls.find((c) => c[0] === 'toast' && String(c[2]).includes('模型测试：1/1 通过'));
+    assert.ok(probeToast, '测试完成应给出模型通过数量');
 
     // --- 删除（两步确认）---
     click(byAttr(root, 'title', '删除该提供商')[0]);

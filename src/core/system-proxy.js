@@ -3,7 +3,7 @@
 // Clash Verge 开启“系统代理”时，会把 ProxyEnable/ProxyServer 写到这里。
 const { execFileSync } = require('node:child_process');
 const { URL } = require('node:url');
-const { ProxyAgent } = require('undici');
+const { fetch: undiciFetch, ProxyAgent } = require('undici');
 
 const INTERNET_SETTINGS_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings';
 const PROXY_CACHE_MS = 500;
@@ -157,7 +157,7 @@ function detectSystemProxy(targetUrl, options = {}) {
  * @returns {Function & { close:()=>Promise<void> }}
  */
 function createSystemProxyFetch(options = {}) {
-  const fetchImpl = options.fetchImpl || globalThis.fetch;
+  const fetchImpl = options.fetchImpl || undiciFetch || globalThis.fetch;
   if (typeof fetchImpl !== 'function') throw new Error('当前 Node 运行时没有可用的 fetch，请升级到 Node 18+');
   const detectProxy = options.detectProxy || ((url) => detectSystemProxy(url));
   let mode = normalizeProxyMode(options.mode);

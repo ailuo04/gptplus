@@ -869,6 +869,72 @@ test('provider-client: 正常拉取 /models，带 Bearer 头', async (t) => {
   ]);
 });
 
+test('provider-client: 指定模型逐个请求实际生成接口并返回各自状态与延时', async (t) => {
+  const requests = [];
+  const { server, url } = await startServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    requests.push({ path: req.url, auth: req.headers.authorization, body });
+    res.writeHead(body.model === 'bad-model' ? 400 : 200, { 'content-type': 'application/json' });
+    res.end(body.model === 'bad-model'
+      ? JSON.stringify({ error: { message: 'model unavailable' } })
+      : JSON.stringify({ choices: [{ message: { content: 'OK' } }] }));
+  });
+  closeServer(t, server);
+  const dir = tmpDir('pc-model-test');
+  cleanup(t, dir);
+  const store = createStore({ configPath: path.join(dir, 'config.json') });
+  const provider = store.upsertProvider({
+    name: 'T', baseUrl: url, apiKey: 'sk-test', api: 'openai',
+    models: [{ id: 'good-model' }, { id: 'bad-model' }],
+  });
+  const client = createProviderClient({ store });
+
+  const result = await client.testProviderModels(provider.id, ['good-model', 'bad-model', 'good-model']);
+  assert.equal(result.ok, false);
+  assert.equal(result.results.length, 2, '重复模型只测试一次');
+  assert.deepEqual(result.results.map(({ modelId, ok, status }) => ({ modelId, ok, status })), [
+    { modelId: 'good-model', ok: true, status: 200 },
+    { modelId: 'bad-model', ok: false, status: 400 },
+  ]);
+  assert.ok(result.results.every((item) => item.latencyMs >= 0));
+  assert.match(result.results[1].error, /model unavailable/);
+  assert.equal(requests.length, 2);
+  assert.ok(requests.every((request) => request.path === '/v1/chat/completions'));
+  assert.ok(requests.every((request) => request.auth === 'Bearer sk-test'));
+  assert.deepEqual(requests.map((request) => request.body.model), ['good-model', 'bad-model']);
+});
+
+test('provider-client: 按 Anthropic 与 Responses 协议构造最小生成请求', async (t) => {
+  const requests = [];
+  const { server, url } = await startServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    requests.push({ path: req.url, headers: req.headers, body: JSON.parse(Buffer.concat(chunks).toString('utf8')) });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(req.url.endsWith('/messages')
+      ? JSON.stringify({ content: [{ type: 'text', text: 'OK' }] })
+      : JSON.stringify({ id: 'resp_test', status: 'completed', output: [] }));
+  });
+  closeServer(t, server);
+  const dir = tmpDir('pc-model-protocols');
+  cleanup(t, dir);
+  const store = createStore({ configPath: path.join(dir, 'config.json') });
+  const anthropic = store.upsertProvider({ name: 'A', baseUrl: url, apiKey: 'sk-ant', api: 'anthropic', models: [{ id: 'claude-test' }] });
+  const responses = store.upsertProvider({ name: 'R', baseUrl: url, apiKey: 'sk-res', api: 'responses', models: [{ id: 'gpt-test' }] });
+  const client = createProviderClient({ store });
+
+  assert.equal((await client.testProviderModels(anthropic.id, ['claude-test'])).ok, true);
+  assert.equal((await client.testProviderModels(responses.id, ['gpt-test'])).ok, true);
+  assert.equal(requests[0].path, '/v1/messages');
+  assert.equal(requests[0].headers['x-api-key'], 'sk-ant');
+  assert.equal(requests[0].body.model, 'claude-test');
+  assert.equal(requests[1].path, '/v1/responses');
+  assert.equal(requests[1].headers.authorization, 'Bearer sk-res');
+  assert.equal(requests[1].body.model, 'gpt-test');
+});
+
 test('provider-client: 401 / 非 JSON / 连接失败 / 未知 id 都返回结构化结果', async (t) => {
   const dir = tmpDir('pc-err');
   cleanup(t, dir);
@@ -942,6 +1008,40 @@ test('provider-client: 超时可配置且不抛异常', async (t) => {
   assert.equal(res.ok, false);
   assert.match(res.error, /超时/);
   assert.ok(elapsed < 5000, `超时应快速返回，实际 ${elapsed}ms`);
+});
+
+test('provider-client: 响应正文超时不能伪装成无效响应格式', async (t) => {
+  const dir = tmpDir('pc-body-timeout');
+  cleanup(t, dir);
+  const store = createStore({ configPath: path.join(dir, 'config.json') });
+  const provider = store.upsertProvider({ name: 'Slow body', baseUrl: 'https://api.example/v1', models: [{ id: 'slow-model' }] });
+  const client = createProviderClient({
+    store,
+    timeoutMs: 25,
+    fetchImpl: async (_url, { signal }) => ({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      text: () => new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => {
+          const error = new Error('The operation was aborted');
+          error.name = 'AbortError';
+          reject(error);
+        }, { once: true });
+      }),
+    }),
+  });
+
+  const connection = await client.testProvider(provider.id);
+  assert.equal(connection.ok, false);
+  assert.equal(connection.status, 200);
+  assert.match(connection.error, /超时/);
+
+  const generation = await client.testProviderModels(provider.id, ['slow-model']);
+  assert.equal(generation.ok, false);
+  assert.equal(generation.results[0].status, 200);
+  assert.match(generation.results[0].error, /超时/);
+  assert.doesNotMatch(generation.results[0].error, /有效的模型结果/);
 });
 
 test('provider-client: anthropic 用 x-api-key，自定义头可覆盖', async (t) => {
@@ -1345,6 +1445,41 @@ test('ipc: 网络代理模式可在系统代理与直连之间热切换', async 
   assert.deepEqual(modes, ['direct']);
   await assert.rejects(() => channels.get('gptplus:network:set')({}, { proxyMode: 'bad' }), /代理模式/);
   assert.equal(store.get().network.proxyMode, 'direct');
+});
+
+test('ipc: 开机自启动读取与切换委托给系统登录项设置', async (t) => {
+  const { registerIpc } = require(path.join(CORE, 'ipc.js'));
+  const dir = tmpDir('ipc-startup');
+  cleanup(t, dir);
+  const store = createStore({ configPath: path.join(dir, 'config.json') });
+  const channels = new Map();
+  let enabled = false;
+  const startup = {
+    get: () => ({ supported: true, enabled }),
+    set: (next) => { enabled = !!next; return { supported: true, enabled }; },
+  };
+  const ctx = {
+    paths: {},
+    store,
+    catalog: {},
+    codex: {},
+    providerClient: {},
+    models: () => [],
+    status: () => ({}),
+    gateway: { getState: () => ({ running: false, port: 18120, url: '', host: '127.0.0.1' }) },
+    log: () => {},
+    onLogEvent: () => () => {},
+    emitStatus: () => {},
+  };
+  registerIpc({ ipcMain: { handle: (ch, fn) => channels.set(ch, fn) }, shell: {}, dialog: {}, ctx, startup });
+
+  assert.deepEqual(await channels.get('gptplus:startup:get')({}), { supported: true, enabled: false });
+  assert.deepEqual(await channels.get('gptplus:startup:set')({}, { enabled: true }), { supported: true, enabled: true });
+  assert.equal(enabled, true);
+  await assert.rejects(
+    () => channels.get('gptplus:startup:set')({}, { enabled: 'yes' }),
+    /开机自启动开关参数无效/,
+  );
 });
 
 test('ipc: 批量排序会过滤未知和重复项，补齐缺失模型并触发状态更新', async () => {

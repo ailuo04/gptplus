@@ -214,7 +214,8 @@ function providerCard(ctx, p) {
         class: 'btn btn-sm btn-success' + (viewState.testing[p.id] ? ' is-busy' : ''),
         type: 'button',
         disabled: viewState.testing[p.id] ? true : null,
-        on: { click: () => testProvider(ctx, p) },
+        title: models.length ? '选择要测试的模型，并逐个检查实际生成请求' : '请求该提供商的 /models 检查接口连通性',
+        on: { click: () => (models.length ? openModelTestDialog(ctx, p) : testProvider(ctx, p)) },
       }, [icon('activity', 13), el('span', { text: viewState.testing[p.id] ? '测试中…' : '测试连接' })]),
       el('button', {
         class: 'btn btn-sm',
@@ -244,6 +245,31 @@ function providerCard(ctx, p) {
 
 function probeResult(ctx, p, probe) {
   const { el, icon, fmt } = ctx;
+  if (Array.isArray(probe.modelResults)) {
+    const passed = probe.modelResults.filter((result) => result && result.ok).length;
+    const total = probe.modelResults.length;
+    const latencies = probe.modelResults
+      .map((result) => Number(result && result.latencyMs))
+      .filter((latency) => Number.isFinite(latency) && latency >= 0);
+    const range = latencies.length
+      ? latencies.length === 1
+        ? fmt.dur(latencies[0])
+        : `${fmt.dur(Math.min(...latencies))}–${fmt.dur(Math.max(...latencies))}`
+      : '—';
+    const title = probe.modelResults.map((result) =>
+      `${result.modelId}: ${result.ok ? `通过 ${fmt.dur(result.latencyMs)}` : `失败 ${result.error || '未知错误'}`}`,
+    ).join('\n');
+    return el('div', {
+      class: 'probe-result ' + (probe.ok ? 'probe-ok' : 'probe-bad'),
+      title,
+    }, [
+      icon(probe.ok ? 'check' : 'alert', 13),
+      el('span', {
+        class: 'probe-text',
+        text: `模型测试 · ${passed}/${total} 通过 · ${range}`,
+      }),
+    ]);
+  }
   return el('div', {
     class: 'probe-result ' + (probe.ok ? 'probe-ok' : 'probe-bad'),
     title: probe.error || '',
@@ -295,6 +321,164 @@ async function testProvider(ctx, p) {
     viewState.testing[p.id] = false;
     ctx.renderCurrent(true);
   }
+}
+
+function openModelTestDialog(ctx, p) {
+  const { el, icon, fmt } = ctx;
+  const models = (p.models || []).filter((model) => String(model && model.id || '').trim());
+  const selected = new Set(models.filter((model) => model.enabled !== false).map((model) => model.id));
+  let running = false;
+  let results = [];
+
+  const selectedText = el('span', { class: 'model-test-selected-count' });
+  const modelList = el('div', { class: 'model-test-list' });
+  const resultBox = el('div', { class: 'model-test-results' });
+  const startBtn = el('button', {
+    class: 'btn btn-primary',
+    type: 'button',
+    on: { click: () => void runModelTest() },
+  }, [icon('activity', 13), el('span', { text: '开始测试' })]);
+
+  function updateControls() {
+    selectedText.textContent = `${selected.size}/${models.length} 个模型已选择`;
+    startBtn.disabled = running || selected.size === 0;
+    const buttons = modelList.querySelectorAll ? modelList.querySelectorAll('input') : [];
+    for (const input of buttons) input.disabled = running;
+  }
+
+  function renderModelList() {
+    modelList.replaceChildren(...models.map((model) => {
+      const id = model.id;
+      const label = model.label || id;
+      const checkbox = el('input', {
+        type: 'checkbox',
+        checked: selected.has(id) ? true : null,
+        attrs: { 'aria-label': `选择模型 ${label}`, 'data-model-id': id },
+        on: {
+          change: (event) => {
+            if (event.target.checked) selected.add(id);
+            else selected.delete(id);
+            updateControls();
+          },
+        },
+      });
+      return el('label', { class: 'model-test-option' }, [
+        checkbox,
+        el('span', { class: 'model-test-option-main' }, [
+          el('span', { class: 'model-test-option-label', text: label }),
+          el('span', { class: 'model-test-option-id mono', text: id }),
+        ]),
+        model.enabled === false ? el('span', { class: 'chip faint', text: '未启用' }) : null,
+      ]);
+    }));
+    updateControls();
+  }
+
+  function renderResults() {
+    if (running) {
+      resultBox.replaceChildren(el('div', { class: 'model-test-empty', text: '正在逐个发送最小生成请求，请稍候…' }));
+      return;
+    }
+    if (!results.length) {
+      resultBox.replaceChildren(el('div', { class: 'model-test-empty', text: '测试结果会显示在这里；每个模型都会单独统计延时。' }));
+      return;
+    }
+    resultBox.replaceChildren(...results.map((result) => {
+      const model = models.find((item) => item.id === result.modelId);
+      return el('div', { class: 'model-test-result ' + (result.ok ? 'is-ok' : 'is-error') }, [
+        el('span', { class: 'model-test-result-icon' }, [icon(result.ok ? 'check' : 'alert', 13)]),
+        el('span', { class: 'model-test-result-name', text: model?.label || result.modelId }),
+        el('span', { class: 'model-test-result-id mono', text: result.modelId }),
+        el('span', { class: 'model-test-result-status', text: result.ok ? `通过 · HTTP ${result.status ?? 200}` : `失败${result.status ? ` · HTTP ${result.status}` : ''}` }),
+        el('span', { class: 'model-test-result-latency mono', text: fmt.dur(result.latencyMs) }),
+        result.ok ? null : el('span', { class: 'model-test-result-error', title: result.error || '', text: result.error || '未知错误' }),
+      ]);
+    }));
+  }
+
+  async function runModelTest() {
+    if (running || selected.size === 0) {
+      if (!selected.size) ctx.toast('请至少选择一个模型', 'warn');
+      return;
+    }
+    running = true;
+    results = [];
+    updateControls();
+    renderResults();
+    try {
+      const response = await ctx.api.testProviderModels({
+        providerId: p.id,
+        modelIds: models.filter((model) => selected.has(model.id)).map((model) => model.id),
+      });
+      results = Array.isArray(response?.results) ? response.results : [];
+      viewState.probe[p.id] = {
+        ok: !!response?.ok,
+        modelResults: results,
+        at: Date.now(),
+      };
+      const passed = results.filter((result) => result && result.ok).length;
+      const summary = `「${p.name}」模型测试：${passed}/${results.length} 通过`;
+      ctx.logLocal(response?.ok ? 'info' : 'error', summary);
+      ctx.toast(summary, response?.ok ? 'ok' : 'warn');
+      ctx.renderCurrent(true);
+    } catch (err) {
+      const error = ctx.describeError(err);
+      results = [...selected].map((modelId) => ({ modelId, ok: false, latencyMs: 0, error }));
+      viewState.probe[p.id] = { ok: false, modelResults: results, at: Date.now() };
+      ctx.toastError(err, '模型测试失败');
+    } finally {
+      running = false;
+      updateControls();
+      renderResults();
+    }
+  }
+
+  const selectAllBtn = el('button', {
+    class: 'btn btn-sm btn-ghost',
+    type: 'button',
+    on: { click: () => { for (const model of models) selected.add(model.id); renderModelList(); } },
+  }, [el('span', { text: '全选' })]);
+  const clearBtn = el('button', {
+    class: 'btn btn-sm btn-ghost',
+    type: 'button',
+    on: { click: () => { selected.clear(); renderModelList(); } },
+  }, [el('span', { text: '清空' })]);
+  const closeBtn = el('button', {
+    class: 'btn btn-icon',
+    type: 'button',
+    title: '关闭',
+    attrs: { 'aria-label': '关闭' },
+    on: { click: () => { if (!running) ctx.closeModal(); } },
+  }, [icon('x', 15)]);
+  const modal = el('div', { class: 'modal model-test-modal', attrs: { role: 'dialog', 'aria-modal': 'true', 'aria-label': `测试${p.name}的模型` } }, [
+    el('div', { class: 'modal-head' }, [
+      el('div', { class: 'grow' }, [
+        el('h2', { text: `测试「${p.name}」的模型` }),
+        el('div', { class: 'modal-sub', text: '逐个发送最小生成请求，确认模型可用并测量响应延时' }),
+      ]),
+      closeBtn,
+    ]),
+    el('div', { class: 'modal-body' }, [
+      el('div', { class: 'model-test-toolbar' }, [
+        selectedText,
+        el('span', { class: 'right' }),
+        selectAllBtn,
+        clearBtn,
+      ]),
+      modelList,
+      resultBox,
+    ]),
+    el('div', { class: 'modal-foot' }, [
+      el('span', { class: 'hint', text: '每个模型发送一次最小生成请求，可能产生少量用量；不会修改配置' }),
+      el('span', { class: 'right' }),
+      el('button', { class: 'btn btn-ghost', type: 'button', disabled: running ? true : null, on: { click: () => ctx.closeModal() } }, [el('span', { text: '关闭' })]),
+      startBtn,
+    ]),
+  ]);
+
+  renderModelList();
+  renderResults();
+  ctx.openModal(modal, {});
 }
 
 async function removeProvider(ctx, p) {

@@ -4,7 +4,6 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
 const net = require('node:net');
-const { fetch } = require('undici');
 const {
   createSystemProxyFetch,
   detectSystemProxy,
@@ -80,7 +79,6 @@ test('system-proxy: 代理模式可真实切换，代理连接复用且直连不
   const targetUrl = `http://127.0.0.1:${targetPort}/probe`;
   const fetcher = createSystemProxyFetch({
     mode: 'system',
-    fetchImpl: fetch,
     detectProxy: () => `http://127.0.0.1:${proxyPort}/`,
   });
   t.after(() => fetcher.close());

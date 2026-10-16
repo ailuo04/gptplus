@@ -5,6 +5,9 @@ const DEFAULT_TIMEOUT = 10000;
 
 const { stripEndpoint } = require('./base-url.js');
 const { createSystemProxyFetch } = require('./system-proxy.js');
+const { buildRequest: buildChatRequest } = require('./gateway/adapters/openai.js');
+const { buildRequest: buildResponsesRequest } = require('./gateway/adapters/responses.js');
+const { buildRequest: buildAnthropicRequest } = require('./gateway/adapters/anthropic.js');
 
 function trimBase(baseUrl) {
   // 老配置里可能存了完整端点 URL（.../v1/chat/completions），剥成 base 再拼 /models
@@ -70,6 +73,46 @@ function normalizeList(list) {
   return out;
 }
 
+function setHeader(headers, name, value) {
+  const existing = Object.keys(headers).find((key) => key.toLowerCase() === name.toLowerCase());
+  if (existing) delete headers[existing];
+  headers[name] = value;
+}
+
+function requestHeaders(provider) {
+  const headers = {};
+  setHeader(headers, 'Accept', 'application/json');
+  setHeader(headers, 'Content-Type', 'application/json');
+  if (provider.api === 'anthropic') {
+    if (provider.apiKey) setHeader(headers, 'x-api-key', provider.apiKey);
+    setHeader(headers, 'anthropic-version', '2023-06-01');
+  } else if (provider.apiKey) {
+    setHeader(headers, 'Authorization', `Bearer ${provider.apiKey}`);
+  }
+  // 用户自定义请求头最后应用，可以覆盖默认头。
+  for (const [k, v] of Object.entries(provider.headers || {})) {
+    const key = String(k).trim();
+    if (!key) continue;
+    setHeader(headers, key, String(v == null ? '' : v));
+  }
+  return headers;
+}
+
+function generationError(api, json) {
+  const upstreamError = json && typeof json === 'object'
+    ? json.error?.message || json.error?.error?.message || json.message || (typeof json.error === 'string' ? json.error : '')
+    : '';
+  if (upstreamError) return String(upstreamError).slice(0, 500);
+  if (!json || typeof json !== 'object' || Array.isArray(json)) return '上游没有返回有效的模型结果';
+  if (api === 'anthropic' && !Array.isArray(json.content)) return '上游响应缺少 content';
+  if (api === 'responses' && json.status === 'failed') return '模型生成失败';
+  if (api === 'responses' && !Array.isArray(json.output) && !json.id) return '上游响应缺少生成结果';
+  if (api !== 'anthropic' && api !== 'responses' && (!Array.isArray(json.choices) || !json.choices.length)) {
+    return '上游响应缺少 choices';
+  }
+  return '';
+}
+
 /** 创建提供商客户端，默认让 /models 请求自动跟随 Windows 系统代理。 */
 /**
  * @param {{ store:any, timeoutMs?:number, fetchImpl?:Function }} deps
@@ -108,25 +151,7 @@ function createProviderClient({ store, timeoutMs = DEFAULT_TIMEOUT, fetchImpl } 
     if (!base) return fail('未配置 Base URL');
 
     const url = `${base}/models`;
-    const headers = {};
-    const setHeader = (name, value) => {
-      const existing = Object.keys(headers).find((h) => h.toLowerCase() === name.toLowerCase());
-      if (existing) delete headers[existing];
-      headers[name] = value;
-    };
-    setHeader('Accept', 'application/json');
-    if (provider.api === 'anthropic') {
-      if (provider.apiKey) setHeader('x-api-key', provider.apiKey);
-      setHeader('anthropic-version', '2023-06-01');
-    } else if (provider.apiKey) {
-      setHeader('Authorization', `Bearer ${provider.apiKey}`);
-    }
-    // 用户自定义请求头最后应用，可以覆盖默认头
-    for (const [k, v] of Object.entries(provider.headers || {})) {
-      const key = String(k).trim();
-      if (!key) continue;
-      setHeader(key, String(v == null ? '' : v));
-    }
+    const headers = requestHeaders(provider);
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), limit);
@@ -135,8 +160,8 @@ function createProviderClient({ store, timeoutMs = DEFAULT_TIMEOUT, fetchImpl } 
       let text = '';
       try {
         text = await res.text();
-      } catch {
-        text = '';
+      } catch (err) {
+        return fail(describeError(err, limit), { status: res.status });
       }
       let json = null;
       try {
@@ -180,6 +205,110 @@ function createProviderClient({ store, timeoutMs = DEFAULT_TIMEOUT, fetchImpl } 
   }
 
   /**
+   * 对指定模型发送一个最小非流式生成请求，确认模型本身可用并记录各自延时。
+   * @returns {Promise<{ok:boolean, results:Array<{modelId:string,ok:boolean,status?:number,latencyMs:number,error?:string}>, error?:string}>}
+   */
+  async function testProviderModels(id, modelIds) {
+    const provider = getProvider(id);
+    const ids = [];
+    const seen = new Set();
+    for (const raw of Array.isArray(modelIds) ? modelIds : []) {
+      const modelId = String(raw == null ? '' : raw).trim();
+      if (!modelId || seen.has(modelId)) continue;
+      seen.add(modelId);
+      ids.push(modelId);
+    }
+    if (!ids.length) return { ok: false, results: [], error: '请至少选择一个模型' };
+    if (!provider) {
+      return {
+        ok: false,
+        results: ids.map((modelId) => ({ modelId, ok: false, latencyMs: 0, error: `提供商不存在: ${id}` })),
+        error: `提供商不存在: ${id}`,
+      };
+    }
+
+    const configuredModels = new Set((provider.models || []).map((model) => String(model?.id || '').trim()).filter(Boolean));
+    const unknown = ids.filter((modelId) => !configuredModels.has(modelId));
+    if (unknown.length) {
+      return {
+        ok: false,
+        results: ids.map((modelId) => ({
+          modelId,
+          ok: false,
+          latencyMs: 0,
+          error: configuredModels.has(modelId) ? '未测试' : '模型不在该渠道的配置清单中',
+        })),
+        error: '所选模型已不属于该渠道的配置清单',
+      };
+    }
+
+    const base = trimBase(provider.baseUrl);
+    if (!base) {
+      return {
+        ok: false,
+        results: ids.map((modelId) => ({ modelId, ok: false, latencyMs: 0, error: '未配置 Base URL' })),
+        error: '未配置 Base URL',
+      };
+    }
+    if (!doFetch) {
+      return {
+        ok: false,
+        results: ids.map((modelId) => ({ modelId, ok: false, latencyMs: 0, error: '当前 Node 运行时没有可用的 fetch' })),
+        error: '当前 Node 运行时没有可用的 fetch',
+      };
+    }
+
+    const results = [];
+    for (const modelId of ids) {
+      const started = Date.now();
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), limit);
+      try {
+        const body = { input: 'Reply OK.', max_output_tokens: 1, stream: false };
+        const builder = provider.api === 'anthropic'
+          ? buildAnthropicRequest
+          : provider.api === 'responses' ? buildResponsesRequest : buildChatRequest;
+        const request = builder({ provider: { ...provider, baseUrl: base }, modelId, body, stream: false });
+        const res = await doFetch(request.url, {
+          method: 'POST',
+          headers: request.headers,
+          body: JSON.stringify(request.payload),
+          signal: controller.signal,
+        });
+        let text = '';
+        try {
+          text = await res.text();
+        } catch (err) {
+          results.push({
+            modelId,
+            ok: false,
+            status: res.status,
+            latencyMs: Date.now() - started,
+            error: describeError(err, limit),
+          });
+          continue;
+        }
+        const latencyMs = Date.now() - started;
+        if (!res.ok) {
+          let json = null;
+          try { json = text ? JSON.parse(text) : null; } catch { /* 上游不一定返回 JSON */ }
+          results.push({ modelId, ok: false, status: res.status, latencyMs, error: generationError(provider.api, json) || httpMessage(res.status, res.statusText) });
+        } else {
+          let json = null;
+          try { json = text ? JSON.parse(text) : null; } catch { /* 成功状态仍需校验响应体 */ }
+          const error = generationError(provider.api, json);
+          results.push({ modelId, ok: !error, status: res.status, latencyMs, ...(error ? { error } : {}) });
+        }
+      } catch (err) {
+        results.push({ modelId, ok: false, latencyMs: Date.now() - started, error: describeError(err, limit) });
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    return { ok: results.every((result) => result.ok), results };
+  }
+
+  /**
    * 拉取远端模型列表
    * @returns {Promise<{ok:boolean, models:{id:string,label:string}[], error?:string}>}
    */
@@ -195,7 +324,7 @@ function createProviderClient({ store, timeoutMs = DEFAULT_TIMEOUT, fetchImpl } 
     }
   }
 
-  return { testProvider, fetchRemoteModels, timeoutMs: limit };
+  return { testProvider, testProviderModels, fetchRemoteModels, timeoutMs: limit };
 }
 
 module.exports = { createProviderClient, normalizeList, DEFAULT_TIMEOUT };

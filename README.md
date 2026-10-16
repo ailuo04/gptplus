@@ -34,7 +34,7 @@ npm start                   # 启动 gpt++
 界面里：
 
 1. **提供商** → 添加提供商：填名称、Base URL（如 `https://api.deepseek.com/v1`）、API Key，
-   点「从 /models 拉取」自动带出模型列表，或手动添加。可先点「测试连接」验证。
+   点「从 /models 拉取」自动带出模型列表，或手动添加。点「测试连接」可选择模型逐个发送最小生成请求，查看每个模型是否可用及响应延时；未配置模型时会检查 `/models` 接口连通性。
 2. **模型** → 打开「注入到 ChatGPT」开关（会先检查网关是否在跑）。
 3. 点「重启 ChatGPT 客户端」，然后在对话框的模型选择器里选择你的模型。
 
@@ -59,8 +59,8 @@ npm run dist
 推送版本标签后，GitHub Actions 会在 Windows runner 上构建安装包，并创建 GitHub Release：
 
 ```powershell
-git tag v0.1.0
-git push origin v0.1.0
+git tag v1.1.0
+git push origin v1.1.0
 ```
 
 已安装的 gpt++ 会在启动约 8 秒后检查 GitHub Release。发现新版本时只弹窗提示，不会自动下载；点击“暂不更新”后，左侧设置导航和设置页会持续显示更新提示，用户可以稍后手动点击“立即更新”。
