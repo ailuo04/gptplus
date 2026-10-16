@@ -449,6 +449,29 @@ test('危险按钮默认保持中性，只在悬停时显示红色警示', () =>
   assert.match(read(HTML), /class="btn btn-danger btn-sm"[^>]*id="log-clear"/, '清空日志必须带危险语义类');
 });
 
+test('默认模型下拉展开时位于后续模型卡片之上', () => {
+  const css = read(CSS);
+  assert.match(css, /\.card:has\(\.model-picker\.is-open\)\s*\{[^}]*z-index:\s*20/s, '展开默认模型选择器时，父卡片必须提升层级');
+  assert.match(css, /\.model-picker-menu\s*\{[^}]*z-index:\s*30/s, '默认模型菜单必须有独立层级');
+  assert.match(css, /\.model-picker-menu\s*\{[^}]*background-color:\s*var\(--bg-panel\)/s, '默认模型菜单必须使用不透明背景');
+});
+
+test('使用量页把趋势与拆分统计放入同一概览网格', () => {
+  const css = read(CSS);
+  const usage = read(path.join(VIEWS, 'usage.js'));
+  assert.match(usage, /class: 'usage-overview-grid'/, '趋势和拆分统计应有共同容器');
+  assert.match(css, /\.usage-overview-grid\s*\{[^}]*display:\s*grid/s, '使用量概览应采用网格布局');
+  assert.match(css, /\.usage-recent\s*\{[^}]*max-height:/s, '请求记录应在卡片内部滚动，避免撑高整页');
+});
+
+test('上游网络模式使用独立的系统代理与直连语义色', () => {
+  const css = read(CSS);
+  assert.match(css, /--network-system:/, '缺少系统代理颜色令牌');
+  assert.match(css, /--network-direct:/, '缺少直连颜色令牌');
+  assert.match(css, /\.sidebar-network-option\[data-network-mode="system"\]\.is-selected/, '系统代理选中态必须有独立样式');
+  assert.match(css, /\.sidebar-network-option\[data-network-mode="direct"\]\.is-selected/, '直连选中态必须有独立样式');
+});
+
 test('样式包含窄窗口/矮窗口适配，避免 940x620 破版', () => {
   const css = read(CSS);
   assert.match(css, /@media\s*\(max-width:\s*1040px\)/, '需要针对窄窗口的适配断点');

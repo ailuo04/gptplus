@@ -362,6 +362,13 @@ export function renderUsage(root, ctx, actions) {
     ),
   ]);
   const trend = el('section', { class: 'card usage-trend' }, [el('header', { class: 'card-head' }, [el('span', { class: 'card-title', text: 'Token 使用趋势' }), el('span', { class: 'card-desc', text: '近一年 · 按完成时间' })]), buildTrend(el, rows)]);
+  const overview = el('div', { class: 'usage-overview-grid' }, [
+    trend,
+    el('div', { class: 'usage-breakdown-grid' }, [
+      breakdown(el, rows, '按模型', 'model', '暂无模型数据'),
+      breakdown(el, rows, '按提供商', 'providerName', '暂无提供商数据'),
+    ]),
+  ]);
   const table = el('section', { class: 'card usage-recent' }, [
     el('header', { class: 'card-head usage-recent-head' }, [
       el('span', { class: 'card-title', text: '请求记录' }),
@@ -385,5 +392,5 @@ export function renderUsage(root, ctx, actions) {
       ])),
     ]) : el('div', { class: 'usage-empty', text: '暂无可统计的请求。网关收到请求终结结果后，这里会自动出现数据。' }),
   ]);
-  root.replaceChildren(header, stats, trend, el('div', { class: 'usage-breakdown-grid' }, [breakdown(el, rows, '按模型', 'model', '暂无模型数据'), breakdown(el, rows, '按提供商', 'providerName', '暂无提供商数据')]), table);
+  root.replaceChildren(header, stats, overview, table);
 }
