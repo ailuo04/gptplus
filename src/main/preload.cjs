@@ -77,6 +77,8 @@ contextBridge.exposeInMainWorld('gptplus', {
   relaunchChatGpt: () => invoke('gptplus:chatgpt:relaunch'),
   getLogs: () => invoke('gptplus:logs:get'),
   getUsage: () => invoke('gptplus:usage:get'),
+  getUsageTrend: () => invoke('gptplus:usage:trend:get'),
+  clearUsage: (patch) => invoke('gptplus:usage:clear', patch),
 
   // 软件更新
   getUpdateState: () => invoke('gptplus:update:state'),

@@ -111,7 +111,13 @@ function createLogStore({ logPath, maxEntries = LOG_RING_SIZE, maxBytes = DEFAUL
     return entries.slice();
   }
 
-  return { load, append, all, logPath, maxEntries, maxBytes };
+  function clear() {
+    entries = [];
+    compact();
+    return true;
+  }
+
+  return { load, append, all, clear, logPath, maxEntries, maxBytes };
 }
 
 module.exports = { createLogStore, LOG_RING_SIZE, DEFAULT_MAX_BYTES };

@@ -480,6 +480,8 @@ function registerIpc(deps) {
 
   handle('gptplus:logs:get', () => ctx.logs());
   handle('gptplus:usage:get', () => ctx.usage());
+  handle('gptplus:usage:trend:get', () => ctx.usageTrend?.() || []);
+  handle('gptplus:usage:clear', ({ mode } = {}) => ctx.clearUsage(mode));
 
   ctx.onLogEvent((entry) => onLog(entry));
   return { publish };

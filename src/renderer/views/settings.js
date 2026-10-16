@@ -1,5 +1,7 @@
 ﻿// 设置页：本地网关（开关/端口/探活/令牌）、Codex 配置写入情况与还原注入。
 
+import { createSelectPicker } from '../app.js';
+
 const viewState = {
   portDraft: null,
   portError: '',
@@ -158,16 +160,17 @@ function rollbackCard(ctx) {
     children.push(el('div', { class: 'rollback-empty', text: '\u6CA1\u6709\u53EF\u7528\u7684\u66F4\u65E9\u7A33\u5B9A\u7248\u672C\u3002' }));
   } else if (releases) {
     children.push(el('div', { class: 'rollback-controls' }, [
-      el('select', {
-        class: 'select rollback-select',
+      createSelectPicker(ctx, {
+        className: 'rollback-select',
         value: selected,
-        disabled: busy ? true : null,
-        attrs: { 'aria-label': '\u9009\u62E9\u56DE\u9000\u7248\u672C' },
-        on: { change: (event) => { viewState.pendingRollback = event.target.value; ctx.renderCurrent(true, { preserveScrollTop: true }); } },
-      }, [
-        el('option', { value: '', text: '\u9009\u62E9\u4E00\u4E2A\u5386\u53F2\u7248\u672C' }),
-        ...releases.map((release) => el('option', { value: release.version, text: 'v' + release.version })),
-      ]),
+        disabled: busy,
+        ariaLabel: '\u9009\u62E9\u56DE\u9000\u7248\u672C',
+        options: [
+          { value: '', label: '\u9009\u62E9\u4E00\u4E2A\u5386\u53F2\u7248\u672C' },
+          ...releases.map((release) => ({ value: release.version, label: 'v' + release.version })),
+        ],
+        onChange: (value) => { viewState.pendingRollback = value; ctx.renderCurrent(true, { preserveScrollTop: true }); },
+      }),
       selected
         ? el('button', {
             class: 'btn btn-sm btn-warning',

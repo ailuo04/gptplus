@@ -42,6 +42,8 @@ const CATALOG_PATH = path.join(APP_DIR, 'model-catalog.json');
 const LOG_PATH = path.join(APP_DIR, 'gateway.log');
 /** 请求级使用量：一条请求一条记录，不受原始日志事件数量影响 */
 const USAGE_PATH = path.join(APP_DIR, 'usage.jsonl');
+/** Token 趋势按天聚合数据：细数据清空时保留，全部清空时一并删除 */
+const USAGE_TREND_PATH = path.join(APP_DIR, 'usage-trend.json');
 
 /**
  * 建目录，幂等。只创建 gpt++ 自己的目录，不碰用户的 ~/.codex。
@@ -64,5 +66,6 @@ module.exports = {
   CATALOG_PATH,
   LOG_PATH,
   USAGE_PATH,
+  USAGE_TREND_PATH,
   ensureDirs,
 };

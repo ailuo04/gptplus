@@ -1566,6 +1566,34 @@ test('usage-store: keeps one terminal record per request and survives partial li
   assert.equal(rows[1].status, 502, '半行损坏不能影响后续终结记录');
 });
 
+test('usage-store: 清空细数据时保留按天 Token 趋势，全部清空时连趋势一起删除', (t) => {
+  const dir = tmpDir('usage-clear');
+  cleanup(t, dir);
+  const usagePath = path.join(dir, 'usage.jsonl');
+  const trendPath = path.join(dir, 'usage-trend.json');
+  const store = createUsageStore({ usagePath, trendPath });
+  store.append({
+    at: new Date('2026-10-17T10:00:00').getTime(),
+    requestId: 'clear_req_1',
+    providerId: 'p_1',
+    model: 'p_1__m',
+    status: 200,
+    final: true,
+    tokens: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
+  });
+  assert.equal(store.all().length, 1);
+  assert.deepEqual(store.trend(), [{ day: '2026-10-17', tokens: 13, requests: 1 }]);
+
+  store.clear({ preserveTrend: true });
+  assert.deepEqual(store.all(), [], '细数据清空后请求明细应为空');
+  assert.deepEqual(store.trend(), [{ day: '2026-10-17', tokens: 13, requests: 1 }], '细数据清空应保留趋势');
+  assert.equal(fs.readFileSync(usagePath, 'utf8'), '', '细数据文件应被清空');
+
+  store.clear();
+  assert.deepEqual(store.trend(), [], '全部清空应删除趋势');
+  assert.equal(fs.existsSync(trendPath), false, '全部清空不应留下趋势文件');
+});
+
 test('context: 重启后从磁盘回放日志环，使用量统计不再清零（真子进程，隔离 GPTPLUS_HOME）', (t) => {
   const dir = tmpDir('context-replay');
   cleanup(t, dir);

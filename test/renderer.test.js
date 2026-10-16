@@ -2097,6 +2097,48 @@ test('使用量页：时间范围与请求记录显示条数会真实生效并�
   }
 });
 
+test('使用量页：提供全部清空与保留趋势的细数据清空入口', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const usageMod = await import(pathToFileURL(path.join(tmp, 'views', 'usage.js')).href);
+    installFakeDom();
+    const state = fixtureState({
+      logs: [],
+      usage: [],
+      usageTrend: [{ day: '2026-10-17', tokens: 13, requests: 1 }],
+    });
+    const calls = [];
+    const ctx = makeCtx(appMod, state, calls);
+    ctx.api.clearUsage = async (patch) => {
+      calls.push(['clearUsage', patch]);
+      return { mode: patch.mode, trend: state.usageTrend };
+    };
+    ctx.reload = async (scope) => calls.push(['reload', scope]);
+    const root = new FakeNode('main');
+    const actions = new FakeNode('div');
+    usageMod.renderUsage(root, ctx, actions);
+
+    assert.match(actions.allText(), /清空细数据/);
+    assert.match(actions.allText(), /全部清空/);
+    const detailButton = actions.children.find((node) => node.textContent.includes('清空细数据'));
+    detailButton.listeners.click[0]();
+    const modal = calls.find((entry) => entry[0] === 'openModal')[1];
+    assert.match(modal.allText(), /只保留 Token 使用趋势/);
+    const confirm = modal.findTag('button').find((node) => node.textContent.includes('清空细数据'));
+    confirm.listeners.click[0]();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(calls.find((entry) => entry[0] === 'clearUsage')[1], { mode: 'details' });
+    assert.deepEqual(state.usageTrend, [{ day: '2026-10-17', tokens: 13, requests: 1 }]);
+    assert.ok(calls.some((entry) => entry[0] === 'reload' && entry[1] === 'usage'));
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test('模型页：默认模型标注只跟着真正写进配置的 slug', async () => {
   const tmp = copyRendererToTemp();
   try {

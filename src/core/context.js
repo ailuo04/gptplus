@@ -30,7 +30,7 @@ async function createContext(opts = {}) {
   // 使用量页的数据源。启动时从磁盘回放，否则每次重进应用统计都会清零。
   const logStore = createLogStore({ logPath: paths.LOG_PATH });
   logStore.load();
-  const usageStore = createUsageStore({ usagePath: paths.USAGE_PATH });
+  const usageStore = createUsageStore({ usagePath: paths.USAGE_PATH, trendPath: paths.USAGE_TREND_PATH });
   usageStore.load();
   // 兼容升级前的混合日志：把旧日志里的终结请求迁移到独立统计文件。
   usageStore.importLogs(logStore.all());
@@ -187,6 +187,14 @@ async function createContext(opts = {}) {
     log,
     logs: () => logStore.all(),
     usage: () => usageStore.all(),
+    usageTrend: () => usageStore.trend(),
+    clearUsage: (mode = 'all') => {
+      const preserveTrend = mode === 'details';
+      if (mode !== 'all' && !preserveTrend) throw new Error('无效的数据清空模式');
+      logStore.clear();
+      usageStore.clear({ preserveTrend });
+      return { mode, usage: usageStore.all(), trend: usageStore.trend() };
+    },
     models,
     status,
     emitStatus,

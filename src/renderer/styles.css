@@ -155,6 +155,9 @@
   --toast-duration: 3400ms;
   --nav-indicator-y: 0px;
   --nav-indicator-h: 36px;
+  --tooltip-left: 50%;
+  --tooltip-top: auto;
+  --tooltip-transform: translate(-50%, 4px);
 }
 
 html { color-scheme: dark; }
@@ -356,6 +359,8 @@ a:hover { text-decoration: underline; }
 @keyframes row-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
 @keyframes modal-out { from { opacity: 1; transform: scale(1) translateY(0); } to { opacity: 0; transform: scale(0.985) translateY(5px); } }
 @keyframes modal-in { from { opacity: 0; transform: scale(0.96) translateY(6px); } to { opacity: 1; transform: scale(1) translateY(0); } }
+@keyframes heatmap-tooltip-pop-in { from { opacity: 0; transform: translateY(8px) scale(0.94); } 62% { opacity: 1; transform: translateY(-2px) scale(1.015); } to { opacity: 1; transform: translateY(0) scale(1); } }
+@keyframes heatmap-tooltip-pop-out { from { opacity: 1; transform: translateY(0) scale(1); } to { opacity: 0; transform: translateY(6px) scale(0.95); } }
 /* 接线上的电流：只位移，不重绘 */
 @keyframes current {
   from { transform: translateX(-100%); }
@@ -1124,6 +1129,89 @@ html.is-theme-switching .logs {
 .model-picker-option-check .icon { opacity: 0; }
 .model-picker-option-check.is-selected .icon { opacity: 1; }
 
+/* 通用下拉选择器：使用量筛选、历史版本等简单选项也跟随默认模型选择器的视觉语言。 */
+.select-picker {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+  z-index: 2;
+}
+.select-picker-native {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+.select-picker-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  min-height: var(--ctl-h);
+  padding: 6px 9px 6px 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: linear-gradient(180deg, var(--bg-panel-2), var(--bg-inset));
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  box-shadow: var(--e-1);
+  transition: border-color var(--dur-2) var(--ease-out), box-shadow var(--dur-2) var(--ease-out), background var(--dur-2) var(--ease-out), opacity var(--dur-2);
+}
+.select-picker-trigger:hover:not([disabled]) { border-color: var(--line-strong); background: var(--bg-hover); }
+.select-picker-trigger:focus { outline: none; border-color: var(--accent-line); box-shadow: var(--e-1), 0 0 0 3px var(--accent-soft); }
+.select-picker-trigger[disabled] { opacity: 0.5; cursor: default; }
+.select-picker-value { min-width: 0; flex: 1 1 auto; overflow: hidden; }
+.select-picker-label { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-body); line-height: 1.35; }
+.select-picker-chevron { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 22px; height: 22px; margin-left: 8px; color: var(--fg-faint); transition: transform var(--dur-2) var(--ease-out), color var(--dur-2) var(--ease-out); }
+.select-picker.is-open .select-picker-chevron { color: var(--accent-hi); transform: rotate(180deg); }
+.select-picker-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  left: 0;
+  display: none;
+  padding: 5px;
+  max-height: min(310px, 42vh);
+  overflow-y: auto;
+  z-index: 30;
+  isolation: isolate;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+  background-color: var(--bg-panel);
+  box-shadow: var(--e-3);
+}
+.select-picker.is-open .select-picker-menu { display: grid; gap: 2px; animation: pop var(--dur-2) var(--ease-out); }
+.select-picker-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 34px;
+  padding: 6px 8px 6px 10px;
+  border: 1px solid transparent;
+  border-radius: calc(var(--radius-sm) - 1px);
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease-out), border-color var(--dur-1) var(--ease-out), color var(--dur-1) var(--ease-out);
+}
+.select-picker-option:hover,
+.select-picker-option.is-active { border-color: var(--accent-line); background: var(--accent-soft); }
+.select-picker-option[aria-selected="true"] .select-picker-option-label { color: var(--accent-hi); }
+.select-picker-option-label { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-body); line-height: 1.35; }
+.select-picker-option-check { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 22px; height: 22px; color: transparent; }
+.select-picker-option-check.is-selected { color: var(--accent-hi); }
+.select-picker-option-check .icon { opacity: 0; }
+.select-picker-option-check.is-selected .icon { opacity: 1; }
+
 .input-group { display: flex; gap: 6px; align-items: center; min-width: 0; }
 .input-group .input { flex: 1 1 auto; }
 
@@ -1202,6 +1290,7 @@ html.is-theme-switching .logs {
 }
 .card:hover { border-color: var(--line-strong); box-shadow: var(--e-2); }
 .card:has(.model-picker.is-open) { z-index: 20; }
+.card:has(.select-picker.is-open) { z-index: 20; }
 
 .card-head {
   display: flex;
@@ -1314,35 +1403,52 @@ html.is-theme-switching .logs {
 /* ============ 8. 「接线」三节点：提供商 → 网关 → ChatGPT（本界面的记忆点） ============ */
 .wiring {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 38px minmax(0, 1fr) 38px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) 34px minmax(0, 1fr) 34px minmax(0, 1fr);
+  gap: 10px;
   align-items: stretch;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
-  background: var(--bg-panel);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), var(--e-1);
-  overflow: hidden;
+  background: transparent;
 }
 .wire-node {
   position: relative;
-  padding: 15px var(--sp-4);
+  padding: 17px var(--sp-4);
   min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 6px;
+  overflow: hidden;
+  border: 1px solid var(--wire-line, var(--line));
+  border-radius: var(--radius);
+  background: linear-gradient(145deg, var(--wire-soft, var(--bg-panel)) 0%, var(--bg-panel) 58%);
+  box-shadow: var(--e-1);
   transition: transform var(--dur-3) var(--ease-out), background var(--dur-2) var(--ease-out);
 }
-.wire-node:hover { background: var(--bg-hover); }
-.wire-node.is-codex.is-on:hover { background: var(--bg-hover); }
+.wiring > .wire-node:nth-child(1) {
+  --wire-color: var(--network-system);
+  --wire-soft: var(--network-system-soft);
+  --wire-line: var(--network-system-line);
+}
+.wiring > .wire-node:nth-child(3) {
+  --wire-color: var(--ok);
+  --wire-soft: var(--ok-soft);
+  --wire-line: var(--ok-line);
+}
+.wiring > .wire-node:nth-child(5) {
+  --wire-color: var(--codex);
+  --wire-soft: var(--codex-soft);
+  --wire-line: var(--codex-line);
+}
+.wire-node:hover { transform: translateY(-1px); background: linear-gradient(145deg, var(--wire-soft, var(--bg-hover)) 0%, var(--bg-panel) 68%); }
+.wire-node.is-codex.is-on:hover { background: linear-gradient(145deg, var(--wire-soft) 0%, var(--bg-panel) 68%); }
 .wire-node::before {
   content: "";
   position: absolute;
   inset: 0 0 auto 0;
-  height: 2px;
-  background: var(--line-strong);
-  opacity: 0.85;
+  height: 3px;
+  background: var(--wire-color, var(--line-strong));
+  opacity: 0.95;
+  box-shadow: 0 1px 7px var(--wire-soft, transparent);
 }
-.wire-node + .wire-node { border-left: 1px solid var(--line-soft); }
-.wire-eyebrow { color: var(--fg-faint); font-weight: 600; letter-spacing: 0.08em; }
+.wire-eyebrow { color: var(--wire-color, var(--fg-faint)); font-weight: 600; letter-spacing: 0.08em; }
 .wire-value {
   font-size: 16px;
   font-weight: 700;
@@ -1360,9 +1466,9 @@ html.is-theme-switching .logs {
   letter-spacing: 0;
 }
 .wire-detail { font-size: var(--fs-meta); color: var(--fg-faint); min-width: 0; }
-.wire-node.is-codex .wire-eyebrow { color: var(--codex); }
-.wire-node.is-codex.is-on { background: var(--bg-panel); }
-.wire-node.is-codex.is-on::before { background: var(--codex); opacity: 1; box-shadow: 0 0 8px var(--codex); }
+.wire-node.is-codex .wire-eyebrow { color: var(--wire-color, var(--codex)); }
+.wire-node.is-codex.is-on { background: linear-gradient(145deg, var(--wire-soft) 0%, var(--bg-panel) 68%); }
+.wire-node.is-codex.is-on::before { background: var(--wire-color, var(--codex)); opacity: 1; box-shadow: 0 0 8px var(--wire-color, var(--codex)); }
 
 /* 导线：一条横线 + 一个箭头，连通时电流沿线跑一次（只位移，不重绘） */
 .wire-link {
@@ -1372,20 +1478,32 @@ html.is-theme-switching .logs {
   justify-content: center;
   overflow: hidden;
   color: var(--line-strong);
-  border-left: 1px solid var(--line-soft);
-  background: rgba(0, 0, 0, 0.15);
+  background: transparent;
 }
 .wire-link::before {
   content: "";
   position: absolute;
-  left: 6px;
-  right: 6px;
+  left: -10px;
+  right: -10px;
   top: 50%;
   height: 1px;
   background: var(--line-strong);
   transform: translateY(-0.5px);
 }
-.wire-link .icon { position: relative; z-index: 1; background: transparent; transition: color var(--dur-3); }
+.wire-link .icon {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: auto;
+  height: auto;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--fg-faint);
+  transition: color var(--dur-3);
+}
 /* models.js 复用了 chevronDown，在横向链路里要转成向右 */
 .wire-link .icon svg { transform: rotate(-90deg); }
 .wire-link::after {
@@ -1402,6 +1520,7 @@ html.is-theme-switching .logs {
 }
 .wire-link.is-live { color: var(--accent); }
 .wire-link.is-live::before { background: var(--accent-line); }
+.wire-link.is-live .icon { color: var(--accent-hi); }
 .wire-link.is-live::after {
   opacity: 1;
   /* 只在真正通电时提层，避免空转的合成层 */
@@ -1428,7 +1547,7 @@ html.is-theme-switching .logs {
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
   overflow: hidden;
-  background: var(--bg-panel);
+  background: var(--bg-panel-2);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), var(--e-1);
 }
 .trow {
@@ -1442,7 +1561,7 @@ html.is-theme-switching .logs {
   min-width: 0;
 }
 .trow:first-child { border-top: 0; }
-.thead { font-size: 11px; background: var(--bg-inset); border-bottom: 1px solid var(--line-soft); font-weight: 650; }
+.thead { font-size: 11px; background: var(--bg-inset); border-bottom: 1px solid var(--line); font-weight: 650; }
 .tbody-row {
   position: relative;
   transition: background var(--dur-2) var(--ease-out);
@@ -1893,11 +2012,8 @@ html.is-theme-switching .logs {
   display: flex;
   align-items: center;
   gap: 16px;
-  padding: 12px var(--sp-4);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
-  background: var(--bg-panel);
-  box-shadow: var(--e-1);
+  padding: 2px 0 14px;
+  border-bottom: 1px solid var(--line-soft);
 }
 .usage-toolbar-copy { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1 1 auto; }
 .usage-toolbar-copy strong { font-size: 14px; font-weight: 700; color: var(--fg); letter-spacing: -0.01em; }
@@ -1914,10 +2030,10 @@ html.is-theme-switching .logs {
   align-items: center;
   gap: 10px;
   min-width: 0;
-  padding: 11px 12px;
+  padding: 13px 12px;
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
-  background: var(--bg-panel);
+  background: linear-gradient(135deg, var(--bg-panel) 0%, var(--bg-panel-2) 100%);
   box-shadow: var(--e-1);
   transition: transform var(--dur-2) var(--ease-out), border-color var(--dur-2) var(--ease-out), box-shadow var(--dur-2);
 }
@@ -1966,14 +2082,14 @@ html.is-theme-switching .logs {
   color: var(--fg);
 }
 .usage-stat-detail { overflow: hidden; color: var(--fg-faint); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
-.usage-overview-grid { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.9fr); gap: var(--sp-3); align-items: start; }
-.usage-trend { overflow: hidden; min-width: 0; }
-.usage-heatmap-scroll { overflow-x: auto; padding: 16px var(--sp-5) 14px; }
-.usage-heatmap-frame { width: max-content; min-width: 100%; }
+.usage-overview-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--sp-4); align-items: start; }
+.usage-trend { overflow: visible; min-width: 0; }
+.usage-heatmap-scroll { position: relative; overflow: visible; padding: 16px var(--sp-5) 14px; }
+.usage-heatmap-frame { position: relative; width: 100%; min-width: 0; }
 .usage-heatmap-months {
   display: grid;
-  grid-template-columns: repeat(var(--heatmap-weeks), 12px);
-  column-gap: 4px;
+  grid-template-columns: repeat(var(--heatmap-weeks), minmax(0, 1fr));
+  column-gap: 3px;
   min-height: 18px;
   color: var(--fg-faint);
   font-size: 10px;
@@ -1982,19 +2098,21 @@ html.is-theme-switching .logs {
 .usage-heatmap-month { white-space: nowrap; }
 .usage-heatmap-grid {
   display: grid;
-  grid-template-rows: repeat(7, 12px);
+  grid-template-rows: repeat(7, auto);
   grid-auto-flow: column;
-  grid-auto-columns: 12px;
-  gap: 4px;
+  grid-auto-columns: minmax(0, 1fr);
+  gap: 3px;
 }
 .usage-heatmap-cell {
   display: block;
-  width: 12px;
-  height: 12px;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 1;
+  min-width: 0;
   border-radius: 3px;
   background: var(--usage-heat-0);
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
-  transition: filter var(--dur-2), transform var(--dur-2), box-shadow var(--dur-2);
+  transition: box-shadow var(--dur-1);
 }
 .usage-heatmap-level-0 { background: var(--usage-heat-0); }
 .usage-heatmap-level-1 { background: var(--usage-heat-1); }
@@ -2002,15 +2120,14 @@ html.is-theme-switching .logs {
 .usage-heatmap-level-3 { background: var(--usage-heat-3); }
 .usage-heatmap-level-4 { background: var(--usage-heat-4); }
 .usage-heatmap-cell.is-future { background: transparent; box-shadow: none; }
-.usage-heatmap-cell[data-tooltip] { position: relative; }
 .usage-heatmap-cell[data-tooltip]:hover,
-.usage-heatmap-cell[data-tooltip]:focus-visible { z-index: 5; filter: brightness(1.25); transform: scale(1.15); box-shadow: 0 0 0 2px var(--accent-soft), inset 0 0 0 1px rgba(255, 255, 255, 0.15); }
-.usage-heatmap-cell[data-tooltip]::after {
+.usage-heatmap-cell[data-tooltip]:focus-visible { z-index: 5; box-shadow: 0 0 0 2px var(--accent-soft), inset 0 0 0 1px rgba(255, 255, 255, 0.15); }
+.usage-heatmap-tooltip {
   position: absolute;
-  left: 50%;
-  bottom: calc(100% + 8px);
+  display: none;
   z-index: 10;
-  max-width: 230px;
+  width: max-content;
+  max-width: min(270px, calc(100vw - 32px));
   padding: 7px 10px;
   border: 1px solid var(--line-strong);
   border-radius: var(--radius-sm);
@@ -2018,21 +2135,21 @@ html.is-theme-switching .logs {
   backdrop-filter: blur(14px);
   box-shadow: var(--e-3);
   color: var(--fg);
-  content: attr(data-tooltip);
   font-size: 11px;
   line-height: 1.4;
   pointer-events: none;
-  white-space: nowrap;
-  opacity: 0;
-  transform: translate(-50%, 4px);
-  transition: opacity var(--dur-1) var(--ease-out), transform var(--dur-1) var(--ease-out);
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
-.usage-heatmap-cell[data-tooltip]:hover::after,
-.usage-heatmap-cell[data-tooltip]:focus-visible::after { opacity: 1; transform: translate(-50%, 0); }
+.usage-heatmap-tooltip.is-visible { display: block; animation: heatmap-tooltip-pop-in var(--dur-3) var(--ease-spring) both; }
+.usage-heatmap-tooltip.is-hiding { display: block; animation: heatmap-tooltip-pop-out 220ms var(--ease-out) both; }
+/* 保留旧伪元素选择器的空壳，兼容主题/样式检查；实际提示由共享 tooltip 节点负责。 */
+.usage-heatmap-cell[data-tooltip]::after { content: none; transition: opacity var(--dur-1) var(--ease-out); }
+.usage-heatmap-cell[data-tooltip]:hover::after { content: none; }
 .usage-heatmap-legend { display: flex; align-items: center; justify-content: flex-end; gap: 5px; margin-top: 12px; color: var(--fg-faint); font-size: 10px; }
 .usage-heatmap-legend .usage-heatmap-cell { flex: 0 0 12px; }
 .usage-heatmap-legend-label { margin: 0 2px; }
-.usage-breakdown-grid { display: grid; grid-template-columns: 1fr; gap: var(--sp-3); min-width: 0; }
+.usage-breakdown-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-4); min-width: 0; }
 .usage-list { padding: 0 var(--sp-4) var(--sp-2); }
 .usage-list-row {
   display: grid;
@@ -2087,9 +2204,8 @@ html.is-theme-switching .logs {
   .usage-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .usage-overview-grid { grid-template-columns: 1fr; }
   .usage-table-row { grid-template-columns: 150px minmax(210px, 1fr) 90px 82px 76px 64px 78px 88px 78px 64px 84px 60px; min-width: 1260px; }
-  .usage-heatmap-months { grid-template-columns: repeat(var(--heatmap-weeks), 11px); column-gap: 3px; }
-  .usage-heatmap-grid { grid-template-rows: repeat(7, 11px); grid-auto-columns: 11px; gap: 3px; }
-  .usage-heatmap-cell { width: 11px; height: 11px; }
+  .usage-heatmap-grid { grid-template-rows: repeat(7, auto); gap: 3px; }
+  .usage-heatmap-cell { height: auto; }
   @keyframes current { from { transform: translateX(-100%); } to { transform: translateX(36px); } }
   .log-row { grid-template-columns: 62px 40px minmax(0, 1fr); }
   .log-meta { display: none; }
@@ -2125,9 +2241,12 @@ html.is-theme-switching .logs {
 
 @media (max-width: 700px) {
   .usage-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .usage-breakdown-grid { grid-template-columns: 1fr; }
   .usage-toolbar { align-items: stretch; flex-direction: column; }
   .usage-toolbar-controls { width: 100%; flex-direction: column; align-items: stretch; }
   .usage-range, .usage-display { width: 100%; }
   .usage-recent-head { flex-wrap: wrap; }
   .usage-recent-head .usage-display { margin-left: 0; }
+  .usage-heatmap-scroll { overflow-x: auto; overflow-y: visible; }
+  .usage-heatmap-frame { min-width: 0; }
 }

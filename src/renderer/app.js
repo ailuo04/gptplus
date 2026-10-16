@@ -117,6 +117,157 @@ function icon(name, size = 14) {
   return wrap;
 }
 
+// 共享下拉选择器：避免原生 option 弹层脱离应用主题，统一使用渲染层自己的 listbox。
+let pickerSequence = 0;
+
+function createSelectPicker(ctx, config = {}) {
+  const { el: createElement, icon: createIcon } = ctx;
+  const options = Array.isArray(config.options) ? config.options.map((option) => ({
+    value: String(option?.value ?? ''),
+    label: String(option?.label ?? option?.value ?? ''),
+  })) : [];
+  const pickerId = `select-picker-${++pickerSequence}`;
+  const selectedValue = String(config.value ?? '');
+  const selectedIndex = Math.max(0, options.findIndex((option) => option.value === selectedValue));
+  let activeIndex = selectedIndex;
+  let open = false;
+
+  const wrapper = createElement('div', { class: `select-picker${config.className ? ` ${config.className}` : ''}` });
+  // 保留一个不可见的原生 select 作为表单/自动化语义镜像；实际视觉和展开菜单由下方 listbox 负责。
+  const nativeSelect = createElement('select', {
+    class: 'select-picker-native',
+    value: selectedValue,
+    attrs: {
+      'aria-label': config.ariaLabel || '选择选项',
+      'aria-hidden': 'true',
+      tabindex: '-1',
+    },
+    on: {
+      change: (event) => {
+        const index = options.findIndex((option) => option.value === String(event.target.value));
+        if (index >= 0) choose(index);
+      },
+    },
+  }, options.map((option) => createElement('option', { value: option.value, text: option.label })));
+  const button = createElement('button', {
+    class: 'select-picker-trigger',
+    type: 'button',
+    disabled: config.disabled ? true : null,
+    attrs: {
+      role: 'combobox',
+      'aria-label': config.ariaLabel || '选择选项',
+      'aria-haspopup': 'listbox',
+      'aria-expanded': 'false',
+      'aria-controls': pickerId,
+    },
+  });
+  const valueNode = createElement('span', { class: 'select-picker-value' });
+  const valueLabel = createElement('span', { class: 'select-picker-label' });
+  const chevron = createElement('span', { class: 'select-picker-chevron' }, [createIcon('chevronDown', 14)]);
+  valueNode.append(valueLabel);
+  button.append(valueNode, chevron);
+
+  const menu = createElement('div', {
+    class: 'select-picker-menu',
+    id: pickerId,
+    attrs: { role: 'listbox', 'aria-label': config.ariaLabel || '可选项' },
+  });
+
+  function updateValue(index) {
+    const option = options[index] || options[0];
+    valueLabel.textContent = option ? option.label : '暂无可选项';
+    if (option) nativeSelect.value = option.value;
+    button.setAttribute('aria-activedescendant', option ? `${pickerId}-${index}` : '');
+  }
+
+  function updateActive(index) {
+    if (!options.length) return;
+    activeIndex = Math.max(0, Math.min(options.length - 1, index));
+    for (const option of menu.children) {
+      const isActive = Number(option.dataset.index) === activeIndex;
+      option.classList.toggle('is-active', isActive);
+      if (isActive) option.scrollIntoView?.({ block: 'nearest' });
+    }
+    button.setAttribute('aria-activedescendant', `${pickerId}-${activeIndex}`);
+  }
+
+  function close() {
+    if (!open) return;
+    open = false;
+    wrapper.classList.remove('is-open');
+    button.setAttribute('aria-expanded', 'false');
+    document.removeEventListener?.('pointerdown', onDocumentPointerDown, true);
+  }
+
+  function choose(index) {
+    const option = options[index];
+    if (!option) return;
+    close();
+    button.focus();
+    config.onChange?.(option.value);
+  }
+
+  function openMenu() {
+    if (open || button.disabled || !options.length) return;
+    open = true;
+    wrapper.classList.add('is-open');
+    button.setAttribute('aria-expanded', 'true');
+    updateActive(activeIndex);
+    document.addEventListener?.('pointerdown', onDocumentPointerDown, true);
+  }
+
+  function onDocumentPointerDown(event) {
+    if (!wrapper.contains?.(event.target)) close();
+  }
+
+  options.forEach((option, index) => {
+    menu.appendChild(createElement('button', {
+      class: 'select-picker-option',
+      type: 'button',
+      id: `${pickerId}-${index}`,
+      data: { index },
+      attrs: { role: 'option', 'aria-selected': index === selectedIndex ? 'true' : 'false' },
+      on: {
+        click: () => choose(index),
+        pointerenter: () => updateActive(index),
+      },
+    }, [
+      createElement('span', { class: 'select-picker-option-label', text: option.label }),
+      createElement('span', { class: `select-picker-option-check${index === selectedIndex ? ' is-selected' : ''}` }, [createIcon('check', 14)]),
+    ]));
+  });
+
+  button.addEventListener('click', () => (open ? close() : openMenu()));
+  button.addEventListener('keydown', (event) => {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (!open) openMenu();
+      updateActive(activeIndex + (event.key === 'ArrowDown' ? 1 : -1));
+      return;
+    }
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      if (open) choose(activeIndex);
+      else openMenu();
+      return;
+    }
+    if (event.key === 'Escape') close();
+    if (event.key === 'Home' && open) {
+      event.preventDefault();
+      updateActive(0);
+    }
+    if (event.key === 'End' && open) {
+      event.preventDefault();
+      updateActive(options.length - 1);
+    }
+  });
+
+  updateValue(selectedIndex);
+  updateActive(selectedIndex);
+  wrapper.append(nativeSelect, button, menu);
+  return wrapper;
+}
+
 // ============ 工具 ============
 const fmt = {
   clock(ts) {
@@ -183,6 +334,7 @@ const state = {
   inject: null,
   logs: [],
   usage: [],
+  usageTrend: [],
   logOpen: false,
   logFilter: 'all',
   logPaused: false,
@@ -509,12 +661,17 @@ async function loadLogs() {
 }
 
 async function loadUsage() {
-  let records = typeof api.getUsage === 'function' ? await api.getUsage() : null;
-  if ((!Array.isArray(records) || records.length === 0) && typeof api.getLogs === 'function') {
+  const hasUsageApi = typeof api.getUsage === 'function';
+  let records = hasUsageApi ? await api.getUsage() : null;
+  if (!hasUsageApi && typeof api.getLogs === 'function') {
     records = await api.getLogs();
   }
   if (Array.isArray(records)) {
     state.usage = records.map(normalizeLogEntry).sort((a, b) => Number(a.at || 0) - Number(b.at || 0));
+  }
+  if (typeof api.getUsageTrend === 'function') {
+    const trend = await api.getUsageTrend();
+    state.usageTrend = Array.isArray(trend) ? trend : [];
   }
   state.loaded.usage = true;
 }
@@ -574,7 +731,7 @@ const RELOAD_PLAN = {
     [loadUpdate, '更新状态'],
     [loadStatus, '全局状态'],
   ],
-  usage: [[loadUsage, '使用量统计']],
+  usage: [[loadUsage, '使用量统计'], [loadLogs, '使用量日志']],
 };
 
 async function reload(scope = 'providers', options = {}) {
@@ -608,11 +765,16 @@ async function refreshUsageIncrementally() {
   if (!api || (typeof api.getUsage !== 'function' && typeof api.getLogs !== 'function') || usageRefreshInFlight) return 0;
   usageRefreshInFlight = true;
   try {
-    let records = typeof api.getUsage === 'function' ? await api.getUsage() : null;
-    if ((!Array.isArray(records) || records.length === 0) && typeof api.getLogs === 'function') {
+    const hasUsageApi = typeof api.getUsage === 'function';
+    let records = hasUsageApi ? await api.getUsage() : null;
+    if (!hasUsageApi && typeof api.getLogs === 'function') {
       records = await api.getLogs();
     }
     const added = mergeUsageRecords(records);
+    if (typeof api.getUsageTrend === 'function') {
+      const trend = await api.getUsageTrend();
+      state.usageTrend = Array.isArray(trend) ? trend : [];
+    }
     state.loaded.usage = true;
     if (added && state.view === 'usage') {
       renderChrome();
@@ -1609,6 +1771,7 @@ if (typeof document !== 'undefined') {
 export {
   el,
   icon,
+  createSelectPicker,
   fmt,
   maskKey,
   state,

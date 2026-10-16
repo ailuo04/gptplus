@@ -1,5 +1,7 @@
 // 使用量页：从主进程已持久化的网关完成日志聚合请求数、Token 与响应耗时。
 
+import { createSelectPicker } from '../app.js';
+
 const viewState = { range: 'all', display: '20' };
 
 function tokenValue(value) {
@@ -202,7 +204,7 @@ function heatmapLevel(value, max) {
   return 4;
 }
 
-function buildTrend(el, rows) {
+function buildTrend(el, rows, aggregatedRows = null) {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   const firstDay = new Date(today);
@@ -210,12 +212,23 @@ function buildTrend(el, rows) {
   firstDay.setDate(firstDay.getDate() - firstDay.getDay());
 
   const byDay = new Map();
-  for (const row of rows) {
-    const key = localDayKey(Number(row.at || 0));
-    const day = byDay.get(key) || { value: 0, requests: 0 };
-    day.value += tokenCount(row);
-    day.requests += 1;
-    byDay.set(key, day);
+  if (Array.isArray(aggregatedRows)) {
+    for (const row of aggregatedRows) {
+      const key = String(row?.day || '');
+      if (!key) continue;
+      byDay.set(key, {
+        value: Math.max(0, Number(row.tokens) || 0),
+        requests: Math.max(0, Number(row.requests) || 0),
+      });
+    }
+  } else {
+    for (const row of rows) {
+      const key = localDayKey(Number(row.at || 0));
+      const day = byDay.get(key) || { value: 0, requests: 0 };
+      day.value += tokenCount(row);
+      day.requests += 1;
+      byDay.set(key, day);
+    }
   }
 
   const weeks = [];
@@ -250,6 +263,49 @@ function buildTrend(el, rows) {
     text: marker.label,
     style: { 'grid-column': `${marker.weekIndex + 1}` },
   })));
+  const viewport = el('div', { class: 'usage-heatmap-scroll' });
+  const tooltip = el('div', { class: 'usage-heatmap-tooltip', attrs: { role: 'tooltip' } });
+  let frame = null;
+  let hideTimer = 0;
+
+  function hideTooltip() {
+    if (!tooltip.classList.contains('is-visible')) return;
+    if (typeof window !== 'undefined') window.clearTimeout?.(hideTimer);
+    tooltip.classList.add('is-hiding');
+    hideTimer = typeof window !== 'undefined' ? window.setTimeout?.(() => {
+      tooltip.classList.remove('is-visible', 'is-hiding');
+    }, 240) || 0 : 0;
+  }
+
+  function showTooltip(cell) {
+    if (!frame || !cell || typeof cell.getBoundingClientRect !== 'function') return;
+    const text = cell.getAttribute('data-tooltip') || '';
+    if (!text) return;
+    if (typeof window !== 'undefined') window.clearTimeout?.(hideTimer);
+    const wasVisible = tooltip.classList.contains('is-visible') && !tooltip.classList.contains('is-hiding');
+    tooltip.classList.remove('is-hiding');
+    if (!wasVisible) {
+      tooltip.classList.remove('is-visible');
+      void tooltip.offsetWidth;
+      tooltip.classList.add('is-visible');
+    }
+    tooltip.textContent = text;
+    const cellRect = cell.getBoundingClientRect();
+    const frameRect = frame.getBoundingClientRect();
+    const gap = 8;
+    const width = tooltip.offsetWidth || 220;
+    const height = tooltip.offsetHeight || 32;
+    const maxLeft = Math.max(0, frameRect.width - width);
+    const left = Math.max(0, Math.min(
+      cellRect.left - frameRect.left + (cellRect.width - width) / 2,
+      maxLeft,
+    ));
+    let top = cellRect.top - frameRect.top - height - gap;
+    if (top < 0) top = cellRect.bottom - frameRect.top + gap;
+    tooltip.style.left = `${left}px`;
+    tooltip.style.top = `${top}px`;
+  }
+
   const cells = [];
   for (const week of weeks) {
     for (const day of week) {
@@ -264,6 +320,12 @@ function buildTrend(el, rows) {
           'aria-label': `${day.key} · ${detail}`,
           tabindex: '0',
         },
+        on: {
+          pointerenter: (event) => showTooltip(event.currentTarget),
+          pointerleave: hideTooltip,
+          focus: (event) => showTooltip(event.currentTarget),
+          blur: hideTooltip,
+        },
       }));
     }
   }
@@ -273,7 +335,9 @@ function buildTrend(el, rows) {
     ...[1, 2, 3, 4].map((level) => el('i', { class: `usage-heatmap-cell usage-heatmap-level-${level}`, attrs: { 'aria-hidden': 'true' } })),
     el('span', { class: 'usage-heatmap-legend-label', text: '多' }),
   ]);
-  return el('div', { class: 'usage-heatmap-scroll' }, [el('div', { class: 'usage-heatmap-frame' }, [monthRow, grid, legend])]);
+  frame = el('div', { class: 'usage-heatmap-frame' }, [monthRow, grid, legend, tooltip]);
+  viewport.append(frame);
+  return viewport;
 }
 
 function breakdown(el, rows, title, key, emptyText) {
@@ -302,6 +366,74 @@ function breakdown(el, rows, title, key, emptyText) {
   ]);
 }
 
+function clearUsageData(ctx, mode) {
+  const { el, icon } = ctx;
+  const isDetails = mode === 'details';
+  const title = isDetails ? '清空细数据' : '全部清空数据';
+  const description = isDetails
+    ? '将删除请求记录、按模型/提供商统计和概览卡片，只保留 Token 使用趋势。'
+    : '将删除所有使用量数据，包括请求记录、概览统计和 Token 使用趋势。';
+  const state = { busy: false };
+  let confirmBtn = null;
+
+  const run = async () => {
+    if (state.busy) return;
+    state.busy = true;
+    confirmBtn.disabled = true;
+    confirmBtn.classList.add('is-busy');
+    confirmBtn.lastElementChild.textContent = '清空中…';
+    try {
+      const result = await ctx.api.clearUsage({ mode });
+      ctx.state.usage = [];
+      ctx.state.logs = [];
+      if (Array.isArray(result?.trend)) ctx.state.usageTrend = result.trend;
+      ctx.closeModal();
+      ctx.toast(isDetails ? '细数据已清空，Token 使用趋势已保留' : '全部使用量数据已清空', 'ok');
+      await ctx.reload('usage');
+    } catch (err) {
+      ctx.toastError(err, '清空数据失败');
+    } finally {
+      state.busy = false;
+      if (confirmBtn) {
+        confirmBtn.disabled = false;
+        confirmBtn.classList.remove('is-busy');
+        confirmBtn.lastElementChild.textContent = isDetails ? '清空细数据' : '全部清空';
+      }
+    }
+  };
+
+  confirmBtn = el('button', {
+    class: 'btn btn-danger',
+    type: 'button',
+    on: { click: () => void run() },
+  }, [icon('trash', 13), el('span', { text: isDetails ? '清空细数据' : '全部清空' })]);
+  const modal = el('section', { class: 'modal usage-clear-modal', attrs: { role: 'dialog', 'aria-modal': 'true', 'aria-label': title } }, [
+    el('div', { class: 'modal-head' }, [
+      el('div', { class: 'grow' }, [
+        el('h2', { text: title }),
+        el('div', { class: 'modal-sub', text: isDetails ? '不可恢复，但不会影响趋势图' : '不可恢复操作' }),
+      ]),
+      el('button', {
+        class: 'btn btn-icon',
+        type: 'button',
+        title: '关闭',
+        attrs: { 'aria-label': '关闭' },
+        on: { click: () => ctx.closeModal() },
+      }, [icon('x', 15)]),
+    ]),
+    el('div', { class: 'modal-body' }, [
+      el('div', { class: 'note note-warn' }, [icon('alert', 14), el('div', { text: description })]),
+    ]),
+    el('div', { class: 'modal-foot' }, [
+      el('span', { class: 'hint', text: '清空后无法恢复历史明细' }),
+      el('span', { class: 'right' }),
+      el('button', { class: 'btn btn-ghost', type: 'button', on: { click: () => ctx.closeModal() } }, [el('span', { text: '取消' })]),
+      confirmBtn,
+    ]),
+  ]);
+  ctx.openModal(modal);
+}
+
 /** 渲染使用量页。统计范围受主进程日志环大小限制，页面明确展示该边界。 */
 export function renderUsage(root, ctx, actions) {
   const { el, icon, state, fmt } = ctx;
@@ -327,20 +459,44 @@ export function renderUsage(root, ctx, actions) {
   const failedCount = settled.length - successCount;
   const successRate = settled.length ? Math.round((successCount / settled.length) * 100) : 0;
 
-  actions.replaceChildren(el('button', { class: 'btn btn-ghost btn-sm', type: 'button', on: { click: () => ctx.reload('usage') } }, [icon('refresh', 13), el('span', { text: '刷新统计' })]));
+  const trendData = Array.isArray(state.usageTrend) && state.usageTrend.length
+    ? state.usageTrend.filter((row) => {
+      if (viewState.range === 'all') return true;
+      const dayAt = new Date(`${String(row.day || '')}T00:00:00`).getTime();
+      return Number.isFinite(dayAt) && dayAt >= start - 24 * 60 * 60 * 1000;
+    })
+    : null;
 
-  const range = el('select', { class: 'select usage-range', value: viewState.range, attrs: { 'aria-label': '统计时间范围' }, on: { change: (e) => { viewState.range = e.target.value; ctx.renderCurrent(true); } } }, [
-    el('option', { value: 'all', text: '全部历史' }),
-    el('option', { value: '24h', text: '最近 24 小时' }),
-    el('option', { value: '7d', text: '最近 7 天' }),
-  ]);
-  const display = el('select', { class: 'select usage-display', value: viewState.display, attrs: { 'aria-label': '显示请求条数' }, on: { change: (e) => { viewState.display = e.target.value; ctx.renderCurrent(true); } } }, [
-    el('option', { value: '20', text: '显示 20 条' }),
-    el('option', { value: '50', text: '显示 50 条' }),
-    el('option', { value: '100', text: '显示 100 条' }),
-    el('option', { value: '200', text: '显示 200 条' }),
-    el('option', { value: 'all', text: '显示全部' }),
-  ]);
+  actions.replaceChildren(
+    el('button', { class: 'btn btn-ghost btn-sm', type: 'button', on: { click: () => ctx.reload('usage') } }, [icon('refresh', 13), el('span', { text: '刷新统计' })]),
+    el('button', { class: 'btn btn-danger btn-sm', type: 'button', on: { click: () => clearUsageData(ctx, 'details') } }, [icon('trash', 13), el('span', { text: '清空细数据' })]),
+    el('button', { class: 'btn btn-danger btn-sm', type: 'button', on: { click: () => clearUsageData(ctx, 'all') } }, [icon('trash', 13), el('span', { text: '全部清空' })]),
+  );
+
+  const range = createSelectPicker(ctx, {
+    className: 'usage-range',
+    value: viewState.range,
+    ariaLabel: '统计时间范围',
+    options: [
+      { value: 'all', label: '全部历史' },
+      { value: '24h', label: '最近 24 小时' },
+      { value: '7d', label: '最近 7 天' },
+    ],
+    onChange: (value) => { viewState.range = value; ctx.renderCurrent(true); },
+  });
+  const display = createSelectPicker(ctx, {
+    className: 'usage-display',
+    value: viewState.display,
+    ariaLabel: '显示请求条数',
+    options: [
+      { value: '20', label: '显示 20 条' },
+      { value: '50', label: '显示 50 条' },
+      { value: '100', label: '显示 100 条' },
+      { value: '200', label: '显示 200 条' },
+      { value: 'all', label: '显示全部' },
+    ],
+    onChange: (value) => { viewState.display = value; ctx.renderCurrent(true); },
+  });
   const rangeLabel = viewState.range === 'all' ? '全部历史' : viewState.range === '24h' ? '最近 24 小时' : '最近 7 天';
   const tableRows = rows.slice(0, displayLimit(viewState.display, rows.length));
   const header = el('div', { class: 'usage-toolbar' }, [
@@ -361,7 +517,7 @@ export function renderUsage(root, ctx, actions) {
       'cache',
     ),
   ]);
-  const trend = el('section', { class: 'card usage-trend' }, [el('header', { class: 'card-head' }, [el('span', { class: 'card-title', text: 'Token 使用趋势' }), el('span', { class: 'card-desc', text: '近一年 · 按完成时间' })]), buildTrend(el, rows)]);
+  const trend = el('section', { class: 'card usage-trend' }, [el('header', { class: 'card-head' }, [el('span', { class: 'card-title', text: 'Token 使用趋势' }), el('span', { class: 'card-desc', text: '近一年 · 按完成时间' })]), buildTrend(el, rows, trendData)]);
   const overview = el('div', { class: 'usage-overview-grid' }, [
     trend,
     el('div', { class: 'usage-breakdown-grid' }, [
