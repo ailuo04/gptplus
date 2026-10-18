@@ -76,7 +76,7 @@ function updateCard(ctx) {
       icon('download', 14),
       el('span', { class: 'card-title', text: '软件更新' }),
       el('span', { class: 'chip ' + (pending ? 'chip-warn' : update.status === 'latest' ? 'chip-ok' : ''), text: `当前 v${current}` }),
-      el('span', { class: 'card-desc', text: '启动时只检查，不会自动下载；更新由你确认后开始' }),
+      el('span', { class: 'card-desc', text: '更新前需要确认，不会自动下载' }),
     ]),
     el('div', { class: 'card-body' }, [
       el('div', { class: 'setting' }, [
@@ -229,14 +229,14 @@ function modelLimitsCard(ctx, { modelLimits, inject }) {
       el('div', { class: 'setting' }, [
         el('div', { class: 'setting-main' }, [
           el('div', { class: 'setting-title', text: '上下文窗口 Token' }),
-          el('div', { class: 'setting-desc', text: '写入模型的 context_window / max_context_window；这是客户端展示与压缩计算的声明值，不会改变上游模型的真实上下文能力，建议按最小模型的真实上限填写。' }),
+          el('div', { class: 'setting-desc', text: '仅声明客户端上下文，不改变模型实际能力。建议不超过最小模型的真实上限。' }),
         ]),
         el('div', { class: 'setting-ctl' }, [contextInput]),
       ]),
       el('div', { class: 'setting' }, [
         el('div', { class: 'setting-main' }, [
           el('div', { class: 'setting-title', text: '自动压缩阈值 Token' }),
-          el('div', { class: 'setting-desc', text: `达到该用量后客户端触发自动压缩；必须小于上下文窗口，留空表示交给客户端默认处理。当前：${ratio}` }),
+          el('div', { class: 'setting-desc', text: `必须小于上下文窗口；留空使用客户端默认值。当前：${ratio}` }),
         ]),
         el('div', { class: 'setting-ctl' }, [compactInput]),
       ]),

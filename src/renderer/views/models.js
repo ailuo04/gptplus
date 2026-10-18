@@ -116,10 +116,10 @@ export function renderModels(root, ctx, actions) {
         el('span', { class: 'grow', style: { 'max-width': '460px' } }, [select]),
         el('span', { class: 'chip chip-mono', title: '写入 Codex 配置的 model 键', text: storedDefault || '未设置' }),
       ]),
-      el('div', {
-        class: 'hint',
-        text: '对应 Codex 配置里的 model = "<slug>"；如果客户端里手动选了别的模型，以你在客户端里的选择为准。',
-      }),
+      el('details', { class: 'technical-details' }, [
+        el('summary', { text: '配置说明' }),
+        el('div', { class: 'hint', text: '写入 Codex 的 model 字段；客户端内手动选择的模型优先。' }),
+      ]),
     ]),
   ]);
 
@@ -300,18 +300,16 @@ function injectNode(ctx, { inject, gateway, enabledModels }) {
     el('div', { class: 'wire-eyebrow', text: '3 · ChatGPT 客户端' }),
     el('div', { class: 'wire-value' }, [
       el('span', { class: 'dot ' + (on ? 'dot-warn' : 'dot-off') }),
-      el('span', { class: 'ellipsis', text: on ? `已注入 ${enabledModels.length} 个模型` : '未接入（官方模型）' }),
+      el('span', { class: 'ellipsis', text: on ? `已注入 ${enabledModels.length} 个模型` : '未注入' }),
       el('span', { class: 'right' }),
       switchBtn,
     ]),
-    el('div', {
+    !on ? el('div', {
       class: 'wire-detail ellipsis',
-      text: on
-        ? '重启客户端后出现在模型选择器里'
-        : gateway.running
+      text: gateway.running
           ? '打开开关即可写入模型清单'
           : '需要先让本地网关运行起来',
-    }),
+    }) : null,
   ]);
 }
 
@@ -369,7 +367,7 @@ function modelTable(ctx, models, defaultModel) {
 
     const head = el('div', { class: 'trow thead' }, [
       el('span', { text: '显示名' }),
-      el('span', { text: 'slug（写进 ChatGPT 的模型 ID）' }),
+      el('span', { text: '模型 ID', title: 'slug：写进 ChatGPT 的模型 ID' }),
       el('span', { text: '来源提供商' }),
       el('span', { text: '状态' }),
       el('span', { text: '推理' }),

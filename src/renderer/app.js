@@ -991,26 +991,26 @@ function renderStartupControl() {
       'aria-label': `${label}：${description}`,
     },
     on: { click: () => void saveStartupPreference(true, value) },
-  }, [el('span', { text: label })]);
+  }, [el('span', { text: value === 'both' ? '+ ChatGPT' : label })]);
   return el('section', { class: 'sidebar-startup', attrs: { 'aria-label': '开机自启动' } }, [
     el('div', { class: 'sidebar-startup-head' }, [
       icon('power', 13),
       el('span', { class: 'sidebar-startup-title', text: '开机自启动' }),
-    ]),
-    el('button', {
-      class: 'sidebar-startup-toggle' + (enabled ? ' is-enabled' : ''),
-      type: 'button',
-      disabled: !api || !supported || current.supported === null || startupSaveBusy ? true : null,
-      title: buttonTitle,
-      attrs: {
-        role: 'switch',
-        'aria-checked': enabled ? 'true' : 'false',
-        'aria-label': '开机自启动',
-      },
-      on: { click: () => void saveStartupPreference(!enabled) },
-    }, [
-      el('span', { class: 'sidebar-startup-track', attrs: { 'aria-hidden': 'true' } }, [
-        el('span', { class: 'sidebar-startup-thumb' }),
+      el('button', {
+        class: 'sidebar-startup-toggle' + (enabled ? ' is-enabled' : ''),
+        type: 'button',
+        disabled: !api || !supported || current.supported === null || startupSaveBusy ? true : null,
+        title: buttonTitle,
+        attrs: {
+          role: 'switch',
+          'aria-checked': enabled ? 'true' : 'false',
+          'aria-label': '开机自启动',
+        },
+        on: { click: () => void saveStartupPreference(!enabled) },
+      }, [
+        el('span', { class: 'sidebar-startup-track', attrs: { 'aria-hidden': 'true' } }, [
+          el('span', { class: 'sidebar-startup-thumb' }),
+        ]),
       ]),
     ]),
     el('div', { class: 'sidebar-startup-options', role: 'radiogroup', attrs: { 'aria-label': '选择开机自启动应用' } }, [
@@ -1353,32 +1353,9 @@ function enabledModelCount() {
 }
 
 function renderSidebarFoot(s) {
-  const rows = [];
-  if (!s) {
-    rows.push(el('div', { class: 'foot-row' }, [el('span', { class: 'muted', text: '正在读取本地状态…' })]));
-  } else {
-    const gw = s.gateway || {};
-    const addr = `${gw.host || '127.0.0.1'}:${gw.port ?? '—'}`;
-    rows.push(
-      el('div', { class: 'foot-row' }, [
-        el('span', { class: 'foot-key', text: '网关' }),
-        el('span', { class: 'dot ' + (gw.running ? 'dot-ok' : gw.enabled ? 'dot-warn' : 'dot-off') }),
-        el('span', {
-          class: 'foot-val grow ellipsis',
-          title: gw.url || addr,
-          text: gw.running ? addr : gw.enabled ? `未运行 · ${gw.port ?? '—'}` : '未启用',
-        }),
-      ]),
-    );
-    const on = !!(s.inject && s.inject.enabled);
-    rows.push(
-      el('div', { class: 'foot-row' }, [
-        el('span', { class: 'foot-key', text: '注入' }),
-        el('span', { class: 'chip ' + (on ? 'chip-codex' : ''), text: on ? `已注入 ${enabledModelCount()}` : '未注入' }),
-      ]),
-    );
-  }
-  dom.sidebarFoot.replaceChildren(el('div', { class: 'foot-card' }, rows));
+  // Connection state has one permanent home in the status bar.
+  dom.sidebarFoot.hidden = true;
+  dom.sidebarFoot.replaceChildren();
 }
 
 /** 状态栏的「提供商 → 网关 → ChatGPT」链路：本界面唯一的记忆点，直接反映系统接线 */
@@ -1398,7 +1375,8 @@ function renderFlow(s) {
     el('span', { class: 'flow-key', text: '网关' }),
     el('span', {
       class: 'flow-val' + (gw && gatewayRunning ? '' : ' is-dim'),
-      text: gw ? (gatewayRunning ? `127.0.0.1:${gw.port}` : gw.enabled ? `未运行 · 端口 ${gw.port}` : '未启用') : '–',
+      title: gw?.url || (gw ? `${gw.host || '127.0.0.1'}:${gw.port}` : ''),
+      text: gw ? (gatewayRunning ? `运行中 :${gw.port}` : gw.enabled ? `未运行 :${gw.port}` : '未启用') : '–',
     }),
   ]);
 
@@ -1408,7 +1386,7 @@ function renderFlow(s) {
     el('span', { class: 'flow-key', text: 'ChatGPT' }),
     el('span', {
       class: 'flow-val',
-      text: inject && inject.enabled ? `已注入 ${enabledModelCount()} 个模型` : '未注入（官方模型）',
+      text: inject && inject.enabled ? `已注入 ${enabledModelCount()} 个` : '未注入',
     }),
   ]);
 
