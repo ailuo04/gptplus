@@ -7,7 +7,7 @@
 
 import { renderProviders, openProviderForm, closeProviderForm } from './views/providers.js';
 import { dragRowOffsets, dragTargetIndex, renderModels, reorderModelKeys } from './views/models.js';
-import { renderUsage } from './views/usage.js';
+import { renderUsage, usageRows } from './views/usage.js';
 import { renderSettings } from './views/settings.js';
 
 // ============ 静态图标（纯字面量，不含任何变量） ============
@@ -518,6 +518,7 @@ function handleIncomingLog(entry, rerender = renderCurrent) {
   if (state.logs.some((current) => logIdentity(current) === identity)) return;
   pushLog(normalized);
   if (normalized.final === true || normalized.usageRecord === true) mergeUsageRecords([normalized]);
+  updateUsageBadge();
   if (state.view === 'usage') rerender(false, { preserveScrollTop: true });
 }
 
@@ -619,17 +620,21 @@ async function loadStatus() {
 
 async function loadStartup() {
   if (typeof api.getStartup !== 'function') {
-    state.startup = { supported: false, enabled: false };
+    state.startup = { supported: false, enabled: false, target: 'gptplus' };
     state.loaded.startup = true;
     return;
   }
   try {
     const result = await api.getStartup();
     state.startup = result && typeof result === 'object'
-      ? { supported: result.supported !== false, enabled: !!result.enabled }
-      : { supported: false, enabled: false };
+      ? {
+          supported: result.supported !== false,
+          enabled: !!result.enabled,
+          target: result.target === 'both' ? 'both' : 'gptplus',
+        }
+      : { supported: false, enabled: false, target: 'gptplus' };
   } catch (err) {
-    state.startup = { supported: false, enabled: false };
+    state.startup = { supported: false, enabled: false, target: 'gptplus' };
     logLocal('warn', `读取开机自启动状态失败: ${describeError(err)}`);
   }
   state.loaded.startup = true;
@@ -796,7 +801,7 @@ async function refreshUsageIncrementally() {
       state.usageTrend = Array.isArray(trend) ? trend : [];
     }
     state.loaded.usage = true;
-    if (added && state.view === 'usage') {
+    if (state.view === 'usage') {
       renderChrome();
       renderCurrent(false, { preserveScrollTop: true });
     }
@@ -863,13 +868,11 @@ function renderChrome() {
   }
   const providerBadge = dom.nav.querySelector('[data-badge="providers"]');
   const modelBadge = dom.nav.querySelector('[data-badge="models"]');
-  const usageBadge = dom.nav.querySelector('[data-badge="usage"]');
   const gatewayBadge = dom.nav.querySelector('[data-badge="gateway"]');
   const updateBadge = dom.nav.querySelector('[data-badge="update"]');
   setAnimatedText(providerBadge, s ? String(s.providers) : '–');
   setAnimatedText(modelBadge, s ? String(s.models) : '–');
-  const usageRows = Array.isArray(state.usage) && state.usage.length ? state.usage : state.logs;
-  setAnimatedText(usageBadge, String(usageRows.filter((entry) => entry && entry.tokens && (entry.final === true || entry.usageRecord === true || entry.status === 200)).length));
+  updateUsageBadge();
   if (gatewayBadge) {
     const running = !!(s && s.gateway && s.gateway.running);
     setAnimatedText(gatewayBadge, s ? (running ? '运行' : '停') : '–');
@@ -967,14 +970,28 @@ function renderThemeControl() {
   );
 }
 
-/** 侧栏底部的开机自启动开关，状态由系统登录项 API 返回。 */
+/** 侧栏底部的开机自启动设置，状态由系统登录项 API 返回。 */
 function renderStartupControl() {
-  const current = state.startup || { supported: null, enabled: false };
+  const current = state.startup || { supported: null, enabled: false, target: 'gptplus' };
   const supported = current.supported !== false;
   const enabled = !!current.enabled;
+  const target = current.target === 'both' ? 'both' : 'gptplus';
   const buttonTitle = current.supported === null
     ? '正在读取开机自启动状态'
     : enabled ? '点击关闭开机自启动' : '点击开启开机自启动';
+  const targetOption = (value, label, description) => el('button', {
+    class: `sidebar-startup-option${target === value ? ' is-selected' : ''}`,
+    type: 'button',
+    disabled: !api || !supported || !enabled || startupSaveBusy ? true : null,
+    title: description,
+    data: { startupTarget: value },
+    attrs: {
+      role: 'radio',
+      'aria-checked': target === value ? 'true' : 'false',
+      'aria-label': `${label}：${description}`,
+    },
+    on: { click: () => void saveStartupPreference(true, value) },
+  }, [el('span', { text: label })]);
   return el('section', { class: 'sidebar-startup', attrs: { 'aria-label': '开机自启动' } }, [
     el('div', { class: 'sidebar-startup-head' }, [
       icon('power', 13),
@@ -995,6 +1012,10 @@ function renderStartupControl() {
       el('span', { class: 'sidebar-startup-track', attrs: { 'aria-hidden': 'true' } }, [
         el('span', { class: 'sidebar-startup-thumb' }),
       ]),
+    ]),
+    el('div', { class: 'sidebar-startup-options', role: 'radiogroup', attrs: { 'aria-label': '选择开机自启动应用' } }, [
+      targetOption('gptplus', '仅 gpt++', '开机只启动 gpt++'),
+      targetOption('both', 'gpt++ + ChatGPT', '开机同时启动 gpt++ 和 ChatGPT'),
     ]),
   ]);
 }
@@ -1062,19 +1083,26 @@ async function saveNetworkMode(nextMode) {
   }
 }
 
-async function saveStartupPreference(enabled) {
-  const current = state.startup || { supported: false, enabled: false };
-  if (startupSaveBusy || !api || current.supported === false || current.enabled === enabled) return;
+async function saveStartupPreference(enabled, nextTarget) {
+  const current = state.startup || { supported: false, enabled: false, target: 'gptplus' };
+  const target = nextTarget === 'both' ? 'both' : current.target === 'both' ? 'both' : 'gptplus';
+  if (startupSaveBusy || !api || current.supported === false
+    || (current.enabled === enabled && current.target === target)) return;
   startupSaveBusy = true;
-  state.startup = { ...current, enabled };
+  state.startup = { ...current, enabled, target };
   renderChrome();
   try {
-    const next = await api.setStartup({ enabled });
+    const next = await api.setStartup({ enabled, target });
     state.startup = next && typeof next === 'object'
-      ? { supported: next.supported !== false, enabled: !!next.enabled }
-      : { supported: true, enabled };
-    toast(enabled ? '已开启开机自启动' : '已关闭开机自启动', 'ok');
-    logLocal('info', enabled ? '已开启开机自启动' : '已关闭开机自启动');
+      ? {
+          supported: next.supported !== false,
+          enabled: !!next.enabled,
+          target: next.target === 'both' ? 'both' : 'gptplus',
+        }
+      : { supported: true, enabled, target };
+    const targetLabel = target === 'both' ? 'gpt++ 和 ChatGPT' : '仅 gpt++';
+    toast(enabled ? `已开启开机自启动：${targetLabel}` : '已关闭开机自启动', 'ok');
+    logLocal('info', enabled ? `已开启开机自启动：${targetLabel}` : '已关闭开机自启动');
   } catch (err) {
     state.startup = current;
     toastError(err, '设置开机自启动失败');
@@ -1388,6 +1416,10 @@ function renderFlow(s) {
   dom.flow.replaceChildren(...nodes);
 }
 
+function updateUsageBadge(badge = dom.nav?.querySelector('[data-badge="usage"]')) {
+  setAnimatedText(badge, String(usageRows(state).length));
+}
+
 function updateLogBadge() {
   const n = state.logs.length;
   setAnimatedText(dom.logToggleCount, String(n));
@@ -1537,6 +1569,7 @@ function renderCurrent(force = false, options = {}) {
   dom.view.replaceChildren();
   try {
     meta.render(dom.view, ctx, dom.viewActions);
+    updateUsageBadge();
   } catch (err) {
     dom.view.replaceChildren(
       el('div', { class: 'note note-err' }, [
@@ -1856,6 +1889,7 @@ export {
   maskKey,
   state,
   handleIncomingLog,
+  updateUsageBadge,
   mergeUsageLogs,
   refreshUsageIncrementally,
   USAGE_REFRESH_INTERVAL_MS,

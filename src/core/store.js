@@ -12,6 +12,7 @@ const DEFAULT_THEME = 'dark';
 const DEFAULT_CONTEXT_WINDOW = 1_000_000;
 const DEFAULT_AUTO_COMPACT_TOKEN_LIMIT = null;
 const KEEP_BACKUPS = 10;
+const DEFAULT_STARTUP_TARGET = 'gptplus';
 
 const DEFAULT_PROXY_MODE = 'system';
 
@@ -44,6 +45,10 @@ function isPlainObject(v) {
 
 function normalizeTheme(raw) {
   return raw === 'light' || raw === 'system' ? raw : DEFAULT_THEME;
+}
+
+function normalizeStartupTarget(raw) {
+  return raw === 'both' ? 'both' : DEFAULT_STARTUP_TARGET;
 }
 
 function normalizeModelLimits(raw) {
@@ -130,6 +135,7 @@ function normalizeConfig(raw) {
   const g = isPlainObject(src.gateway) ? src.gateway : {};
   const inj = isPlainObject(src.inject) ? src.inject : {};
   const chatgpt = isPlainObject(src.chatgpt) ? src.chatgpt : {};
+  const startup = isPlainObject(src.startup) ? src.startup : {};
   const network = isPlainObject(src.network) ? src.network : {};
 
   let port = Number(g.port);
@@ -169,6 +175,9 @@ function normalizeConfig(raw) {
           ? chatgpt.executablePath.trim()
           : null,
     },
+    startup: {
+      target: normalizeStartupTarget(startup.target),
+    },
     providers,
   };
 }
@@ -183,6 +192,7 @@ function defaultConfig() {
     modelOrder: [],
     inject: { enabled: false, catalogPath: null, defaultModel: null },
     chatgpt: { executablePath: null },
+    startup: { target: DEFAULT_STARTUP_TARGET },
     providers: [],
   });
 }
@@ -409,4 +419,6 @@ module.exports = {
   DEFAULT_PROXY_MODE,
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_AUTO_COMPACT_TOKEN_LIMIT,
+  DEFAULT_STARTUP_TARGET,
+  normalizeStartupTarget,
 };

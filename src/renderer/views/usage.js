@@ -116,6 +116,11 @@ function completedRows(state) {
     .sort((a, b) => Number(b.at || 0) - Number(a.at || 0));
 }
 
+export function usageRows(state, now = Date.now()) {
+  const start = rangeStart(viewState.range, now);
+  return completedRows(state).filter((entry) => Number(entry.at) >= start);
+}
+
 /**
  * 所有「已经出结果」的网关请求日志：开始请求那条 status 是 0（还在飞），
  * 失败/客户端中断的是 4xx/5xx，成功是 200。成功率的分母必须是这些，
@@ -442,7 +447,7 @@ export function renderUsage(root, ctx, actions) {
   // allRows 按时间倒序，最后一条就是已持久化历史里最早的那次请求
   const oldestDay = allRows.length ? localDayKey(Number(allRows[allRows.length - 1].at || 0)) : null;
   const start = rangeStart(viewState.range, now);
-  const rows = allRows.filter((entry) => Number(entry.at) >= start);
+  const rows = usageRows(state, now);
   const totalTokens = rows.reduce((sum, row) => sum + tokenCount(row), 0);
   const inputTokens = rows.reduce((sum, row) => sum + inputTokenCount(row), 0);
   const outputTokens = rows.reduce((sum, row) => sum + tokenMetrics(row).output, 0);

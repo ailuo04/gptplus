@@ -19,6 +19,7 @@ const { createCodexConfig, _internal: codexToml } = require(path.join(CORE, 'cod
 const { createProviderClient } = require(path.join(CORE, 'provider-client.js'));
 const { createLogStore, LOG_RING_SIZE } = require(path.join(CORE, 'log-store.js'));
 const { createUsageStore } = require(path.join(CORE, 'usage-store.js'));
+const { launchChatGpt } = require(path.join(CORE, 'chatgpt-launch.js'));
 
 function countMatches(text, re) {
   return (text.match(re) || []).length;
@@ -57,7 +58,7 @@ function cleanup(t, dir) {
 // ---------------------------------------------------------------- 0. 模块可加载
 
 test('core 模块都是纯 Node CommonJS（不依赖 electron）', () => {
-  const files = ['paths.js', 'store.js', 'catalog.js', 'codex-config.js', 'provider-client.js', 'log-store.js', 'usage-store.js'];
+  const files = ['paths.js', 'store.js', 'catalog.js', 'codex-config.js', 'provider-client.js', 'log-store.js', 'usage-store.js', 'chatgpt-launch.js'];
   const stripComments = (src) =>
     src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1');
   for (const f of files) {
@@ -139,6 +140,7 @@ test('store: 默认值 / provider CRUD / 深拷贝隔离', (t) => {
   assert.equal(cfg.gateway.token.length, 32);
   assert.deepEqual(cfg.modelLimits, { contextWindow: 1_000_000, autoCompactTokenLimit: null });
   assert.deepEqual(cfg.inject, { enabled: false, catalogPath: null, defaultModel: null });
+  assert.deepEqual(cfg.startup, { target: 'gptplus' });
   assert.deepEqual(cfg.modelOrder, []);
   assert.deepEqual(cfg.providers, []);
   // 首次加载即落盘，保证 token 稳定
@@ -211,6 +213,42 @@ test('store: 默认值 / provider CRUD / 深拷贝隔离', (t) => {
   assert.equal(typeof token, 'string');
   assert.equal(token.length, 32);
   assert.notEqual(token, store.newGatewayToken());
+});
+
+test('startup: 启动目标只允许 gptplus 或 both，并能持久化', (t) => {
+  const dir = tmpDir('store-startup');
+  cleanup(t, dir);
+  const store = createStore({ configPath: path.join(dir, 'config.json') });
+
+  store.update((draft) => {
+    draft.startup.target = 'both';
+  });
+  assert.equal(store.get().startup.target, 'both');
+
+  store.update((draft) => {
+    draft.startup.target = 'invalid';
+  });
+  assert.equal(store.get().startup.target, 'gptplus');
+});
+
+test('startup: 找到 ChatGPT.exe 后以分离进程启动，不会结束已有客户端', async () => {
+  const calls = [];
+  const child = { unref: () => calls.push('unref') };
+  const result = await launchChatGpt({
+    preferredPath: 'C:\\ChatGPT.exe',
+    resolveExe: async () => 'C:\\ChatGPT.exe',
+    spawnImpl: (...args) => {
+      calls.push(args);
+      return child;
+    },
+  });
+
+  assert.deepEqual(result, { ok: true, exe: 'C:\\ChatGPT.exe' });
+  assert.equal(calls[0][0], 'C:\\ChatGPT.exe');
+  assert.deepEqual(calls[0][1], []);
+  assert.equal(calls[0][2].detached, true);
+  assert.equal(calls[0][2].windowsHide, false);
+  assert.deepEqual(calls.slice(1), ['unref']);
 });
 
 test('store: 损坏文件恢复 + 备份损坏内容', (t) => {
@@ -1454,9 +1492,14 @@ test('ipc: 开机自启动读取与切换委托给系统登录项设置', async 
   const store = createStore({ configPath: path.join(dir, 'config.json') });
   const channels = new Map();
   let enabled = false;
+  let target = 'gptplus';
   const startup = {
-    get: () => ({ supported: true, enabled }),
-    set: (next) => { enabled = !!next; return { supported: true, enabled }; },
+    get: () => ({ supported: true, enabled, target }),
+    set: (patch) => {
+      enabled = !!patch.enabled;
+      target = patch.target;
+      return { supported: true, enabled, target };
+    },
   };
   const ctx = {
     paths: {},
@@ -1473,9 +1516,17 @@ test('ipc: 开机自启动读取与切换委托给系统登录项设置', async 
   };
   registerIpc({ ipcMain: { handle: (ch, fn) => channels.set(ch, fn) }, shell: {}, dialog: {}, ctx, startup });
 
-  assert.deepEqual(await channels.get('gptplus:startup:get')({}), { supported: true, enabled: false });
-  assert.deepEqual(await channels.get('gptplus:startup:set')({}, { enabled: true }), { supported: true, enabled: true });
+  assert.deepEqual(await channels.get('gptplus:startup:get')({}), { supported: true, enabled: false, target: 'gptplus' });
+  assert.deepEqual(
+    await channels.get('gptplus:startup:set')({}, { enabled: true, target: 'both' }),
+    { supported: true, enabled: true, target: 'both' },
+  );
   assert.equal(enabled, true);
+  assert.equal(target, 'both');
+  await assert.rejects(
+    () => channels.get('gptplus:startup:set')({}, { enabled: true, target: 'invalid' }),
+    /开机自启动目标无效/,
+  );
   await assert.rejects(
     () => channels.get('gptplus:startup:set')({}, { enabled: 'yes' }),
     /开机自启动开关参数无效/,

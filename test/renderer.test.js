@@ -190,17 +190,29 @@ test('开机自启动开关常驻左侧底部并调用系统登录项 API', () =
   const preloadSrc = read(PRELOAD);
   const cssSrc = read(path.join(ROOT, 'src/renderer/styles.css'));
   assert.match(appSrc, /function renderStartupControl\(\)/, 'app.js 必须渲染开机自启动控件');
-  assert.match(appSrc, /function saveStartupPreference\(enabled\)/, 'app.js 必须处理开机自启动切换');
+  assert.match(appSrc, /function saveStartupPreference\(enabled, nextTarget\)/, 'app.js 必须处理开机自启动切换');
   assert.match(appSrc, /api\.getStartup\(\)/, '启动时必须读取开机自启动状态');
-  assert.match(appSrc, /api\.setStartup\(\{ enabled \}\)/, '切换必须调用 setStartup');
+  assert.match(appSrc, /api\.setStartup\(\{ enabled, target \}\)/, '切换必须调用 setStartup 并带启动目标');
   assert.match(appSrc, /class: 'sidebar-startup'/, '控件必须位于左侧底部动作区');
   assert.match(appSrc, /role: 'switch'/, '开机自启动必须使用 switch 语义');
-  assert.match(cssSrc, /\.sidebar-startup\s*\{[^}]*flex-direction:\s*row;/s, '开机自启动标题与开关应位于同一排');
+  assert.match(appSrc, /data: \{ startupTarget: value \}/, '启动目标选项必须带有可定位的数据属性');
+  assert.match(appSrc, /role: 'radiogroup'/, '启动目标选项组必须有 radiogroup 语义');
+  assert.match(appSrc, /gpt\+\+ \+ ChatGPT/, '界面必须提供同时启动 ChatGPT 的选项');
+  assert.match(cssSrc, /\.sidebar-startup-options\s*\{/, '启动目标选项必须有独立样式');
   assert.match(cssSrc, /\.sidebar-startup-toggle\s*\{[^}]*width:\s*40px;/s, '同排开关应保持紧凑的固定宽度');
   assert.match(preloadSrc, /getStartup:.*gptplus:startup:get/, 'preload 必须暴露读取启动状态 API');
   assert.match(preloadSrc, /setStartup:.*gptplus:startup:set/, 'preload 必须暴露设置启动状态 API');
   assert.match(cssSrc, /\.sidebar-startup\s*\{/, '开机自启动控件必须有独立样式');
   assert.match(cssSrc, /\.sidebar-startup-toggle\.is-enabled/, '开机自启动必须有开启态样式');
+  assert.match(cssSrc, /\.sidebar-startup-option\.is-selected/, '启动目标必须有选中态样式');
+});
+
+test('系统登录启动且目标为 both 时才会拉起 ChatGPT', () => {
+  const mainSrc = read(path.join(ROOT, 'src/main/main.js'));
+  assert.match(mainSrc, /wasOpenedAtLogin/, '主进程必须只在系统登录启动时判断是否拉起 ChatGPT');
+  assert.match(mainSrc, /startup\.target !== 'both'/, '主进程必须尊重启动目标选择');
+  assert.match(mainSrc, /launchChatGpt\(\{ preferredPath \}\)/, '主进程必须复用 ChatGPT 启动助手');
+  assert.match(mainSrc, /await launchChatGptAtLogin\(\)/, '主进程启动流程必须执行登录启动检查');
 });
 
 test('主题三态快捷控件位于底部状态栏，不重复出现在设置页', () => {
@@ -1869,6 +1881,57 @@ test('使用量页：优先使用 state.usage，并纳入 final/usageRecord 失�
     assert.match(root.allText(), /请求数/);
     assert.match(root.allText(), /成功率 0%/);
     assert.match(root.allText(), /失败 2 次/);
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('usage badge counts all final requests and follows the overview range', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const app = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const usage = await import(pathToFileURL(path.join(tmp, 'views', 'usage.js')).href);
+    installFakeDom();
+    const now = Date.now();
+    const request = (patch) => ({ at: now, model: 'demo', status: 200, final: true, ...patch });
+    app.state.usage = [
+      request({ tokens: { total_tokens: 10 } }),
+      request({ status: 502 }),
+      request({ status: 499, final: false, usageRecord: true }),
+      request({ at: now - 3 * 86400000 }),
+      request({ at: now - 10 * 86400000 }),
+      request({ status: 0 }),
+      request({ final: false, msg: '上游返回 HTTP 200', tokens: {} }),
+    ];
+    app.state.logs = [request({})];
+    const badge = new FakeNode('span');
+    const root = new FakeNode('main');
+    const actions = new FakeNode('div');
+    const ctx = makeCtx(app, app.state);
+    ctx.renderCurrent = () => {
+      usage.renderUsage(root, ctx, actions);
+      app.updateUsageBadge(badge);
+    };
+    ctx.renderCurrent();
+    assert.equal(badge.textContent, '5');
+    assert.match(root.allText(), /共 5 次请求/);
+    for (const [range, expected] of [['24h', 3], ['7d', 4], ['all', 5]]) {
+      const select = root.findTag('select')[0];
+      select.value = range;
+      for (const handler of select.listeners.change) handler({ target: select });
+      assert.equal(badge.textContent, String(expected));
+      assert.match(root.allText(), new RegExp(`共 ${expected} 次请求`));
+    }
+    app.state.usage = [];
+    app.state.logs = [request({ status: 502 }), request({ tokens: {} }), request({ status: 0 })];
+    ctx.renderCurrent();
+    assert.equal(badge.textContent, '2', 'legacy logs use the same final-result rules');
+    app.state.logs = [];
+    ctx.renderCurrent();
+    assert.equal(badge.textContent, '0');
   } finally {
     delete globalThis.document;
     delete globalThis.window;

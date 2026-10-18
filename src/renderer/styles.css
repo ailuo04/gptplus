@@ -667,8 +667,8 @@ html.is-theme-switching .logs {
 .sidebar-network-option:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .sidebar-startup {
   display: flex;
-  flex-direction: row;
-  align-items: center;
+  flex-direction: column;
+  align-items: stretch;
   justify-content: space-between;
   gap: 8px;
   padding: 7px 9px;
@@ -677,7 +677,7 @@ html.is-theme-switching .logs {
   background: linear-gradient(180deg, var(--bg-panel) 0%, var(--bg-deep) 100%);
   box-shadow: var(--e-1);
 }
-.sidebar-startup-head { display: flex; align-items: center; gap: 7px; min-width: 0; color: var(--fg-dim); }
+.sidebar-startup-head { display: flex; align-items: center; justify-content: space-between; gap: 7px; min-width: 0; color: var(--fg-dim); }
 .sidebar-startup-title { flex: 1 1 auto; min-width: 0; color: var(--fg); font-size: var(--fs-meta); font-weight: 650; }
 .sidebar-startup-toggle {
   display: flex;
@@ -727,6 +727,26 @@ html.is-theme-switching .logs {
   transition: transform var(--dur-2) var(--ease-pop);
 }
 .sidebar-startup-toggle.is-enabled .sidebar-startup-thumb { transform: translateX(11px); }
+.sidebar-startup-options { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
+.sidebar-startup-option {
+  min-width: 0;
+  min-height: 28px;
+  padding: 4px 5px;
+  border: 1px solid var(--line-soft);
+  border-radius: 5px;
+  background: var(--bg-inset);
+  color: var(--fg-dim);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.2;
+  cursor: pointer;
+  transition: color var(--dur-2) var(--ease-out), background var(--dur-2) var(--ease-out), border-color var(--dur-2) var(--ease-out);
+}
+.sidebar-startup-option:hover:not([disabled]) { color: var(--fg); background: var(--bg-hover); border-color: var(--accent-line); }
+.sidebar-startup-option.is-selected { color: var(--ok); background: var(--ok-soft); border-color: var(--ok-line); }
+.sidebar-startup-option:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.sidebar-startup-option[disabled] { opacity: 0.55; cursor: default; }
 .sidebar-relaunch-wrap { display: flex; flex-direction: column; gap: 6px; }
 .sidebar-relaunch {
   width: 100%;

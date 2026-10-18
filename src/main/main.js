@@ -52,6 +52,7 @@ const { createWindowLifecycle } = require('./window-lifecycle.js');
 const { TRAY_ICON_DATA_URL } = require('./tray-icon.js');
 const { setupAutoUpdater, cleanupInstalledUpdateCache } = require('./updater.js');
 const { autoUpdater } = require('electron-updater');
+const { launchChatGpt } = require('../core/chatgpt-launch.js');
 
 const isDev = process.argv.includes('--dev');
 const isQuitRequest = process.argv.includes('--quit');
@@ -157,18 +158,48 @@ function readStartupSettings() {
   }
   try {
     const settings = app.getLoginItemSettings();
-    return { supported: true, enabled: !!settings.openAtLogin };
+    const target = ctx?.store?.get?.()?.startup?.target === 'both' ? 'both' : 'gptplus';
+    return { supported: true, enabled: !!settings.openAtLogin, target };
   } catch {
-    return { supported: false, enabled: false };
+    return { supported: false, enabled: false, target: 'gptplus' };
   }
 }
 
-function writeStartupSettings(enabled) {
+function writeStartupSettings(patch) {
   if (typeof app.setLoginItemSettings !== 'function') {
     throw new Error('当前系统不支持开机自启动');
   }
-  app.setLoginItemSettings({ openAtLogin: !!enabled });
+  const current = ctx?.store?.get?.()?.startup?.target;
+  const enabled = typeof patch === 'boolean' ? patch : !!patch?.enabled;
+  const target = typeof patch === 'object' && patch?.target !== undefined
+    ? patch.target
+    : current;
+  if (target !== 'gptplus' && target !== 'both') throw new Error('开机自启动目标无效');
+  app.setLoginItemSettings({ openAtLogin: enabled });
+  ctx?.store?.update?.((draft) => {
+    draft.startup.target = target;
+  });
   return readStartupSettings();
+}
+
+async function launchChatGptAtLogin() {
+  if (isDev || isSmoke || typeof app.getLoginItemSettings !== 'function') return;
+  let openedAtLogin = false;
+  try {
+    openedAtLogin = !!app.getLoginItemSettings().wasOpenedAtLogin;
+  } catch {
+    return;
+  }
+  const startup = readStartupSettings();
+  if (!openedAtLogin || !startup.enabled || startup.target !== 'both') return;
+
+  const preferredPath = ctx?.store?.get?.()?.chatgpt?.executablePath || null;
+  const result = await launchChatGpt({ preferredPath });
+  if (result.ok) {
+    ctx?.log?.({ level: 'info', msg: '已按开机自启动设置启动 ChatGPT 客户端' });
+  } else {
+    ctx?.log?.({ level: 'warn', msg: `开机自启动 ChatGPT 失败: ${result.error}` });
+  }
 }
 
 function createTray() {
@@ -381,6 +412,7 @@ async function boot() {
       ctx.emitStatus?.();
       refreshTrayMenu();
     }
+    await launchChatGptAtLogin();
   })();
 
   app.on('second-instance', (_event, commandLine) => {

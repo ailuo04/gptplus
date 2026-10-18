@@ -122,18 +122,33 @@ function registerIpc(deps) {
   handle('gptplus:startup:get', () => {
     const current = startup?.get?.();
     return current && typeof current === 'object'
-      ? { supported: current.supported !== false, enabled: !!current.enabled }
-      : { supported: false, enabled: false };
+      ? {
+          supported: current.supported !== false,
+          enabled: !!current.enabled,
+          target: current.target === 'both' ? 'both' : 'gptplus',
+        }
+      : { supported: false, enabled: false, target: 'gptplus' };
   });
 
   handle('gptplus:startup:set', (patch = {}) => {
     const raw = typeof patch === 'boolean' ? patch : patch && patch.enabled;
     if (typeof raw !== 'boolean') throw new Error('开机自启动开关参数无效');
     if (typeof startup?.set !== 'function') throw new Error('当前系统不支持开机自启动');
-    const result = startup.set(raw);
+    const current = startup.get?.();
+    const target = typeof patch === 'object' && patch?.target !== undefined
+      ? patch.target
+      : current?.target;
+    if (target !== undefined && target !== 'gptplus' && target !== 'both') {
+      throw new Error('开机自启动目标无效');
+    }
+    const result = startup.set({ enabled: raw, target: target === 'both' ? 'both' : 'gptplus' });
     const next = result && typeof result === 'object'
-      ? { supported: result.supported !== false, enabled: !!result.enabled }
-      : { supported: true, enabled: raw };
+      ? {
+          supported: result.supported !== false,
+          enabled: !!result.enabled,
+          target: result.target === 'both' ? 'both' : 'gptplus',
+        }
+      : { supported: true, enabled: raw, target: target === 'both' ? 'both' : 'gptplus' };
     ctx.log({ level: 'info', msg: next.enabled ? '已开启开机自启动' : '已关闭开机自启动' });
     return next;
   });
