@@ -1966,6 +1966,13 @@ html.is-theme-switching .logs {
   background: var(--flow-color, var(--line-strong));
   opacity: 0.95;
 }
+.flow-node > .dot {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 6px;
+  box-shadow: none;
+  animation: none;
+}
 .flow-node:hover { color: var(--fg); }
 .flow-provider { --flow-color: var(--network-system); --flow-line: var(--network-system-line); }
 .flow-gateway { --flow-color: var(--ok); --flow-line: var(--ok-line); }

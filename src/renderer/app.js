@@ -1085,7 +1085,9 @@ async function saveNetworkMode(nextMode) {
 
 async function saveStartupPreference(enabled, nextTarget) {
   const current = state.startup || { supported: false, enabled: false, target: 'gptplus' };
-  const target = nextTarget === 'both' ? 'both' : current.target === 'both' ? 'both' : 'gptplus';
+  const target = nextTarget === undefined
+    ? (current.target === 'both' ? 'both' : 'gptplus')
+    : nextTarget === 'both' ? 'both' : 'gptplus';
   if (startupSaveBusy || !api || current.supported === false
     || (current.enabled === enabled && current.target === target)) return;
   startupSaveBusy = true;

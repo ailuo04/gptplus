@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const root = path.resolve(__dirname, '..');
-const output = path.join(root, 'probe', 'startup-ui');
+const output = path.resolve(process.env.GPTPLUS_STARTUP_UI_OUTPUT || path.join(root, 'probe', 'startup-ui'));
 const reports = [];
 let win;
 const run = (fn, ...args) => win.webContents.executeJavaScript(`(${fn})(${args.map((v) => JSON.stringify(v)).join(',')})`);
@@ -170,6 +170,15 @@ app.whenReady().then(async () => {
     await until(idle);
     assert.equal(await run(() => document.querySelector('[data-startup-target="both"]').getAttribute('aria-checked')), 'true');
     await shot('dark-both', (await inspect('both-selected')).card);
+    await click('[data-startup-target="gptplus"]');
+    await until(idle);
+    assert.equal(await run(() => document.querySelector('[data-startup-target="gptplus"]').getAttribute('aria-checked')), 'true', 'Must switch back from both to gptplus');
+    assert.equal(await run(() => document.querySelector('[data-startup-target="both"]').getAttribute('aria-checked')), 'false');
+    assert.deepEqual(await run(() => window.__startupTest.calls().slice(-1)), [{ enabled: true, target: 'gptplus' }]);
+    await shot('dark-gptplus-restored', (await inspect('gptplus-restored')).card);
+    await click('[data-startup-target="both"]');
+    await until(idle);
+    assert.equal(await run(() => document.querySelector('[data-startup-target="both"]').getAttribute('aria-checked')), 'true');
     await click('.sidebar-startup-toggle');
     await until(idle);
     assert.equal(await run(() => document.querySelector('.sidebar-startup-toggle').getAttribute('aria-checked')), 'false');
@@ -208,7 +217,9 @@ app.whenReady().then(async () => {
     }
     const calls = await run(() => window.__startupTest.calls());
     assert.deepEqual(calls[0], { enabled: true, target: 'both' });
-    assert.deepEqual(calls[1], { enabled: false, target: 'both' });
+    assert.deepEqual(calls[1], { enabled: true, target: 'gptplus' });
+    assert.deepEqual(calls[2], { enabled: true, target: 'both' });
+    assert.deepEqual(calls[3], { enabled: false, target: 'both' });
     fs.writeFileSync(path.join(output, 'report.json'), JSON.stringify({ result: 'passed', reports, calls }, null, 2));
     console.log(`[pass] mode selection, off/on, saving lock, error rollback, keyboard; ${reports.length} layout checks`);
     app.exit(0);

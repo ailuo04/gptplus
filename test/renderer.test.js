@@ -193,6 +193,11 @@ test('开机自启动开关常驻左侧底部并调用系统登录项 API', () =
   assert.match(appSrc, /function saveStartupPreference\(enabled, nextTarget\)/, 'app.js 必须处理开机自启动切换');
   assert.match(appSrc, /api\.getStartup\(\)/, '启动时必须读取开机自启动状态');
   assert.match(appSrc, /api\.setStartup\(\{ enabled, target \}\)/, '切换必须调用 setStartup 并带启动目标');
+  assert.match(
+    appSrc,
+    /nextTarget === undefined\s*\?\s*\(current\.target === 'both' \? 'both' : 'gptplus'\)\s*:\s*nextTarget === 'both' \? 'both' : 'gptplus'/,
+    '明确选择仅 gpt++ 时必须切回 gptplus，不能沿用当前 both 目标',
+  );
   assert.match(appSrc, /class: 'sidebar-startup'/, '控件必须位于左侧底部动作区');
   assert.match(appSrc, /role: 'switch'/, '开机自启动必须使用 switch 语义');
   assert.match(appSrc, /data: \{ startupTarget: value \}/, '启动目标选项必须带有可定位的数据属性');
@@ -1485,6 +1490,63 @@ async function flush() {
 function callsOf(ctx, name) {
   return ctx._calls.filter((c) => c[0] === name);
 }
+
+test('开机自启动目标支持双向切换，关闭再开启时保留所选目标', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    installFakeDom();
+    const nodes = new Map([...read(HTML).matchAll(/\bid="([^"]+)"/g)]
+      .map((match) => [match[1], new FakeNode('div')]));
+    document.getElementById = (id) => nodes.get(id) || null;
+    let saved = { supported: true, enabled: true, target: 'gptplus' };
+    const calls = [];
+    window.gptplus = {
+      ...makeApi(fixtureState(), calls),
+      getStartup: async () => ({ ...saved }),
+      setStartup: async (patch) => {
+        calls.push(['setStartup', { ...patch }]);
+        saved = { ...saved, ...patch };
+        return { ...saved };
+      },
+    };
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    await flush();
+    assert.equal(document.documentElement.dataset.ready, '1', '真实启动流程必须完成');
+    const sidebar = nodes.get('sidebar-actions');
+    const option = (target) => sidebar.find('sidebar-startup-option')
+      .find((node) => node.dataset.startupTarget === target);
+    const toggle = () => sidebar.find('sidebar-startup-toggle')[0];
+
+    for (const target of ['both', 'gptplus', 'both']) {
+      assert.equal(option(target).disabled, false, '目标选项必须可以点击');
+      click(option(target));
+      await flush();
+      assert.deepEqual(appMod.state.startup, { supported: true, enabled: true, target }, '点击后必须切换到所选目标');
+      assert.equal(option(target).getAttribute('aria-checked'), 'true', '所选目标必须同步到界面');
+      assert.equal(option(target === 'both' ? 'gptplus' : 'both').getAttribute('aria-checked'), 'false');
+      assert.deepEqual(calls.at(-1), ['setStartup', { enabled: true, target }], '必须将所选目标交给主进程保存');
+    }
+
+    for (const enabled of [false, true]) {
+      click(toggle());
+      await flush();
+      assert.deepEqual(appMod.state.startup, { supported: true, enabled, target: 'both' }, '切换总开关不能重置启动目标');
+      assert.deepEqual(calls.at(-1), ['setStartup', { enabled, target: 'both' }]);
+      assert.equal(option('gptplus').disabled, !enabled);
+      assert.equal(option('both').disabled, !enabled);
+    }
+
+    const count = calls.length;
+    click(option('both'));
+    await flush();
+    assert.equal(calls.length, count, '重复点击当前目标不应再次保存');
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
 
 test('提供商页：测试连接 / 删除 / 保存 / 从 /models 拉取都能走通', async () => {
   const tmp = copyRendererToTemp();
