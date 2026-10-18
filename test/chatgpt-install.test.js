@@ -9,6 +9,7 @@ const {
   buildChatGptCandidates,
   prioritizePreferredPath,
   resolveChatGptExe,
+  resolveChatGptAppId,
 } = require('../src/core/chatgpt-install.js');
 
 test('ChatGPT 安装目录解析会去重并忽略空行', () => {
@@ -82,4 +83,24 @@ test('手动选择的 ChatGPT.exe 会优先于动态发现结果', () => {
     preferred,
     'C:\\Program Files\\WindowsApps\\OpenAI.Codex_2\\app\\ChatGPT.exe',
   ]);
+});
+
+test('package activation resolves the registered application ID only for the chosen executable', async () => {
+  const entries = [
+    { appId: 'OpenAI.Codex_publisher!App', executablePath: 'C:\\Apps\\app/ChatGPT.exe' },
+  ];
+  const options = { execText: async () => JSON.stringify(entries) };
+  assert.equal(await resolveChatGptAppId({ ...options, executablePath: 'c:\\apps\\app\\ChatGPT.exe' }), 'OpenAI.Codex_publisher!App');
+  assert.equal(await resolveChatGptAppId({ ...options, executablePath: 'D:\\Custom\\ChatGPT.exe' }), null);
+});
+
+test('package activation tolerates a single JSON object and unavailable package metadata', async () => {
+  const executablePath = 'C:\\Apps\\ChatGPT.exe';
+  assert.equal(await resolveChatGptAppId({
+    executablePath,
+    execText: async () => JSON.stringify({ appId: 'OpenAI.Codex_publisher!App', executablePath }),
+  }), 'OpenAI.Codex_publisher!App');
+  for (const raw of ['', 'not json', 'null', '{}']) {
+    assert.equal(await resolveChatGptAppId({ executablePath, execText: async () => raw }), null);
+  }
 });

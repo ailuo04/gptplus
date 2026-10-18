@@ -157,9 +157,16 @@ function readStartupSettings() {
     return { supported: false, enabled: false };
   }
   try {
-    const settings = app.getLoginItemSettings();
+    let settings = app.getLoginItemSettings(
+      process.platform === 'win32' ? { args: ['--gptplus-startup'] } : {},
+    );
+    if (process.platform === 'win32' && !settings.openAtLogin) {
+      settings = app.getLoginItemSettings({ args: [] });
+    }
     const target = ctx?.store?.get?.()?.startup?.target === 'both' ? 'both' : 'gptplus';
-    return { supported: true, enabled: !!settings.openAtLogin, target };
+    const enabled = !!settings.openAtLogin
+      && (process.platform !== 'win32' || settings.executableWillLaunchAtLogin !== false);
+    return { supported: true, enabled, target };
   } catch {
     return { supported: false, enabled: false, target: 'gptplus' };
   }
@@ -175,30 +182,52 @@ function writeStartupSettings(patch) {
     ? patch.target
     : current;
   if (target !== 'gptplus' && target !== 'both') throw new Error('开机自启动目标无效');
-  app.setLoginItemSettings({ openAtLogin: enabled });
+  app.setLoginItemSettings({
+    openAtLogin: enabled,
+    ...(process.platform === 'win32' ? { args: ['--gptplus-startup'] } : {}),
+  });
   ctx?.store?.update?.((draft) => {
     draft.startup.target = target;
   });
   return readStartupSettings();
 }
 
-async function launchChatGptAtLogin() {
-  if (isDev || isSmoke || typeof app.getLoginItemSettings !== 'function') return;
-  let openedAtLogin = false;
+function migrateStartupSettings() {
+  if (isDev || isSmoke || process.platform !== 'win32' || !readStartupSettings().enabled) return;
   try {
-    openedAtLogin = !!app.getLoginItemSettings().wasOpenedAtLogin;
+    if (!app.getLoginItemSettings({ args: ['--gptplus-startup'] }).openAtLogin) {
+      app.setLoginItemSettings({ openAtLogin: true, args: ['--gptplus-startup'] });
+    }
+  } catch (err) {
+    ctx?.log?.({ level: 'warn', msg: `迁移开机自启动设置失败: ${err.message}` });
+  }
+}
+
+let loginChatGptLaunchRequested = false;
+
+async function launchChatGptAtLogin(commandLine = process.argv) {
+  if (isDev || isSmoke || typeof app.getLoginItemSettings !== 'function') return;
+  let openedAtLogin = commandLine.includes('--gptplus-startup');
+  try {
+    // wasOpenedAtLogin is macOS-only; Windows login entries carry an explicit marker.
+    if (process.platform === 'darwin') openedAtLogin = !!app.getLoginItemSettings().wasOpenedAtLogin;
   } catch {
     return;
   }
   const startup = readStartupSettings();
-  if (!openedAtLogin || !startup.enabled || startup.target !== 'both') return;
+  if (!openedAtLogin || !startup.enabled || startup.target !== 'both' || loginChatGptLaunchRequested) return;
+  loginChatGptLaunchRequested = true;
 
   const preferredPath = ctx?.store?.get?.()?.chatgpt?.executablePath || null;
-  const result = await launchChatGpt({ preferredPath });
-  if (result.ok) {
-    ctx?.log?.({ level: 'info', msg: '已按开机自启动设置启动 ChatGPT 客户端' });
-  } else {
-    ctx?.log?.({ level: 'warn', msg: `开机自启动 ChatGPT 失败: ${result.error}` });
+  try {
+    const result = await launchChatGpt({ preferredPath });
+    if (result.ok) {
+      ctx?.log?.({ level: 'info', msg: '已按开机自启动设置启动 ChatGPT 客户端' });
+    } else {
+      ctx?.log?.({ level: 'warn', msg: `开机自启动 ChatGPT 失败: ${result.error}` });
+    }
+  } catch (err) {
+    ctx?.log?.({ level: 'warn', msg: `开机自启动 ChatGPT 失败: ${err.message}` });
   }
 }
 
@@ -394,6 +423,7 @@ async function boot() {
     onLog: (e) => broadcast('gptplus:log', e),
   });
 
+  migrateStartupSettings();
   createWindow();
   createTray();
   if (updater.enabled) {
@@ -401,7 +431,7 @@ async function boot() {
   }
 
   // 网关启动需要等待端口监听，不应阻塞窗口和首屏；完成后再广播最新状态。
-  void (async () => {
+  const gatewayReady = (async () => {
     try {
       await ctx.gateway.autoStart();
     } catch (err) {
@@ -412,8 +442,8 @@ async function boot() {
       ctx.emitStatus?.();
       refreshTrayMenu();
     }
-    await launchChatGptAtLogin();
   })();
+  void gatewayReady.then(() => launchChatGptAtLogin());
 
   app.on('second-instance', (_event, commandLine) => {
     if (commandLine.includes('--quit')) {
@@ -421,6 +451,7 @@ async function boot() {
       return;
     }
     showWindow();
+    void gatewayReady.then(() => launchChatGptAtLogin(commandLine));
   });
 }
 

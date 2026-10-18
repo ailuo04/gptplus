@@ -170,6 +170,40 @@ async function resolveChatGptExe(options = {}) {
   }) || null;
 }
 
+/** Resolve the Windows application identity without overriding a manually selected executable. */
+async function resolveChatGptAppId(options = {}) {
+  if (!options.executablePath) return null;
+  const run = options.execText || execText;
+  const query = String.raw`
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Get-AppxPackage -Name '${CHATGPT_PACKAGE}' -ErrorAction SilentlyContinue | ForEach-Object {
+  $package = $_
+  $manifest = Get-AppxPackageManifest -Package $package.PackageFullName -ErrorAction SilentlyContinue
+  foreach ($application in $manifest.Package.Applications.Application) {
+    if ($application.Executable -match '(^|[\\/])ChatGPT\.exe$') {
+      [PSCustomObject]@{
+        appId = $package.PackageFamilyName + '!' + $application.Id
+        executablePath = Join-Path $package.InstallLocation $application.Executable
+      }
+    }
+  }
+} | ConvertTo-Json -Compress
+`;
+  try {
+    const raw = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', query]);
+    const parsed = JSON.parse(raw);
+    const entries = Array.isArray(parsed) ? parsed : [parsed];
+    const selectedPath = path.win32.normalize(options.executablePath).toLowerCase();
+    const match = entries.find((entry) => typeof entry?.appId === 'string'
+      && entry.appId.startsWith(`${CHATGPT_PACKAGE}_`) && entry.appId.includes('!')
+      && typeof entry.executablePath === 'string'
+      && path.win32.normalize(entry.executablePath).toLowerCase() === selectedPath);
+    return match?.appId || null;
+  } catch {
+    return null;
+  }
+}
+
 module.exports = {
   CHATGPT_PACKAGE,
   CHATGPT_EXE,
@@ -178,5 +212,6 @@ module.exports = {
   buildChatGptCandidates,
   prioritizePreferredPath,
   resolveChatGptExe,
+  resolveChatGptAppId,
   _internal: { execText },
 };

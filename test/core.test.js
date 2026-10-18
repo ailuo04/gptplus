@@ -8,6 +8,7 @@ const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
 const { spawnSync } = require('node:child_process');
+const { EventEmitter } = require('node:events');
 
 const ROOT = path.resolve(__dirname, '..');
 const CORE = path.join(ROOT, 'src', 'core');
@@ -233,12 +234,15 @@ test('startup: 启动目标只允许 gptplus 或 both，并能持久化', (t) =>
 
 test('startup: 找到 ChatGPT.exe 后以分离进程启动，不会结束已有客户端', async () => {
   const calls = [];
-  const child = { unref: () => calls.push('unref') };
+  const child = new EventEmitter();
+  child.unref = () => calls.push('unref');
   const result = await launchChatGpt({
     preferredPath: 'C:\\ChatGPT.exe',
     resolveExe: async () => 'C:\\ChatGPT.exe',
+    resolveAppId: async () => null,
     spawnImpl: (...args) => {
       calls.push(args);
+      process.nextTick(() => child.emit('spawn'));
       return child;
     },
   });

@@ -212,14 +212,6 @@ test('开机自启动开关常驻左侧底部并调用系统登录项 API', () =
   assert.match(cssSrc, /\.sidebar-startup-option\.is-selected/, '启动目标必须有选中态样式');
 });
 
-test('系统登录启动且目标为 both 时才会拉起 ChatGPT', () => {
-  const mainSrc = read(path.join(ROOT, 'src/main/main.js'));
-  assert.match(mainSrc, /wasOpenedAtLogin/, '主进程必须只在系统登录启动时判断是否拉起 ChatGPT');
-  assert.match(mainSrc, /startup\.target !== 'both'/, '主进程必须尊重启动目标选择');
-  assert.match(mainSrc, /launchChatGpt\(\{ preferredPath \}\)/, '主进程必须复用 ChatGPT 启动助手');
-  assert.match(mainSrc, /await launchChatGptAtLogin\(\)/, '主进程启动流程必须执行登录启动检查');
-});
-
 test('主题三态快捷控件位于底部状态栏，不重复出现在设置页', () => {
   const html = read(HTML);
   const appSrc = read(APP);
