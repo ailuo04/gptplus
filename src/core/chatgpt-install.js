@@ -90,6 +90,35 @@ function windowsAppsRoots(env = process.env) {
 }
 
 /**
+ * 非 MSIX 安装的常见目录。官方客户端也可能通过普通安装器装到用户目录；
+ * 这些路径只作为候选，仍然会检查文件是否真实存在。
+ * @param {NodeJS.ProcessEnv} env 环境变量
+ * @returns {string[]} 候选安装目录
+ */
+function conventionalInstallLocations(env = process.env) {
+  const roots = [
+    [env.LOCALAPPDATA, 'Programs', 'ChatGPT'],
+    [env.LOCALAPPDATA, 'Programs', 'OpenAI', 'ChatGPT'],
+    [env.LOCALAPPDATA, 'ChatGPT'],
+    [env.ProgramFiles, 'ChatGPT'],
+    [env['ProgramFiles(x86)'], 'ChatGPT'],
+  ];
+  const locations = [];
+  const seen = new Set();
+  for (const parts of roots) {
+    const [root, ...rest] = parts;
+    const raw = String(root || '').trim();
+    if (!raw) continue;
+    const location = path.join(raw, ...rest.filter(Boolean));
+    const key = location.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    locations.push(location);
+  }
+  return locations;
+}
+
+/**
  * 生成候选 ChatGPT.exe 路径。MSIX 版本目录名只作为扫描结果使用，绝不写死。
  * @param {string[]} installLocations 系统返回的包安装目录
  * @param {NodeJS.ProcessEnv} env 环境变量
@@ -110,6 +139,9 @@ function buildChatGptCandidates(installLocations = [], env = process.env, fsImpl
       // WindowsApps 通常拒绝普通用户列目录；系统查询结果仍然可用。
     }
   }
+  // 非 MSIX 的常见目录放在最后：优先使用系统注册的包安装位置，
+  // 避免用户目录里遗留的旧 ChatGPT.exe 抢在真正的应用包前面。
+  locations.push(...conventionalInstallLocations(env));
 
   const candidates = [];
   const seen = new Set();
@@ -170,17 +202,97 @@ async function resolveChatGptExe(options = {}) {
   }) || null;
 }
 
+/**
+ * 从 WindowsApps 下的安装目录推导 PackageFamilyName。
+ * 安装目录形如 `<包名>_<版本>_<架构>__<发布者ID>`，PackageFamilyName 为 `<包名>_<发布者ID>`。
+ * @param {string} executablePath 包内可执行文件路径
+ * @returns {string|null} 包族名；不是 WindowsApps 安装路径时返回 null
+ */
+function packageFamilyFromPath(executablePath) {
+  const normalized = path.win32.normalize(String(executablePath || ''));
+  const folderMatch = /[\\/]WindowsApps[\\/]([^\\/]+)[\\/]/i.exec(normalized);
+  if (!folderMatch) return null;
+  const familyMatch = /^(.+?)_\d+(?:\.\d+){1,3}_[^_]+__(.+)$/.exec(folderMatch[1]);
+  if (!familyMatch) return null;
+  return `${familyMatch[1]}_${familyMatch[2]}`;
+}
+
+/**
+ * 直接从 MSIX 安装目录读取应用身份：包目录名给出 PackageFamilyName，
+ * AppxManifest.xml 给出 Application Id。用于 Get-AppxPackage 不可用或在登录初期超时的场景。
+ * @param {string} executablePath 包内可执行文件路径
+ * @param {{readFileSync?: Function}} [fsImpl] 文件系统实现（供测试注入）
+ * @returns {string|null} 应用 ID；不是包安装路径或读取失败时返回 null
+ */
+function resolveChatGptAppIdFromPackageFiles(executablePath, fsImpl = fs) {
+  const normalized = path.win32.normalize(String(executablePath || ''));
+  const family = packageFamilyFromPath(normalized);
+  if (!family) return null;
+
+  // exe 可能在 <包目录>\app\ChatGPT.exe，也可能直接在 <包目录>\ChatGPT.exe。
+  const packageRootMatch = /^(.*[\\/]WindowsApps[\\/][^\\/]+)[\\/]/i.exec(normalized);
+  if (!packageRootMatch) return null;
+  const packageRoot = packageRootMatch[1];
+  let xml = '';
+  try {
+    xml = fsImpl.readFileSync(path.win32.join(packageRoot, 'AppxManifest.xml'), 'utf8');
+  } catch {
+    return null;
+  }
+
+  const executableName = path.win32.basename(normalized).toLowerCase();
+  for (const tag of String(xml).match(/<Application\b[^>]*>/gi) || []) {
+    const executable = /\bExecutable="([^"]+)"/i.exec(tag);
+    if (!executable) continue;
+    if (path.win32.basename(executable[1]).toLowerCase() !== executableName) continue;
+    const id = /\bId="([^"]+)"/i.exec(tag);
+    if (id && id[1]) return `${family}!${id[1]}`;
+  }
+  return null;
+}
+
+/**
+ * 从开始菜单注册的应用入口里找 ChatGPT 的应用 ID。
+ * 这是 `Get-AppxPackage` / 清单查询失败时的兜底：开始菜单仍会列出已注册的 MSIX 应用，
+ * 只要 AppID 形如 `<包名>_<发布者ID>!<应用ID>` 就能直接用于 shell 激活。
+ * @param {{execText?: Function, family?: string|null}} [options]
+ * @returns {Promise<string|null>} 应用 ID；找不到时返回 null
+ */
+async function resolveChatGptAppIdFromStartApps(options = {}) {
+  const run = options.execText || execText;
+  const query = String.raw`
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Get-StartApps | Select-Object -ExpandProperty AppID | ConvertTo-Json -Compress
+`;
+  try {
+    const raw = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', query]);
+    const parsed = JSON.parse(raw);
+    const entries = Array.isArray(parsed) ? parsed : [parsed];
+    const candidates = entries.filter((appId) => typeof appId === 'string' && appId.includes('!'));
+    const family = String(options.family || '').trim();
+    if (family) {
+      // 已知安装路径对应的包族时，不能退而求其次去激活另一个版本的 ChatGPT。
+      return candidates.find((appId) => appId.startsWith(`${family}!`)) || null;
+    }
+    return candidates.find((appId) => appId.startsWith(`${CHATGPT_PACKAGE}_`)) || null;
+  } catch {
+    return null;
+  }
+}
+
 /** Resolve the Windows application identity without overriding a manually selected executable. */
 async function resolveChatGptAppId(options = {}) {
   if (!options.executablePath) return null;
   const run = options.execText || execText;
+  const executableName = path.win32.basename(path.win32.normalize(String(options.executablePath)));
+  const safeExecutableName = String(executableName || CHATGPT_EXE).replace(/'/g, "''");
   const query = String.raw`
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Get-AppxPackage -Name '${CHATGPT_PACKAGE}' -ErrorAction SilentlyContinue | ForEach-Object {
   $package = $_
   $manifest = Get-AppxPackageManifest -Package $package.PackageFullName -ErrorAction SilentlyContinue
   foreach ($application in $manifest.Package.Applications.Application) {
-    if ($application.Executable -match '(^|[\\/])ChatGPT\.exe$') {
+    if ((Split-Path $application.Executable -Leaf) -eq '${safeExecutableName}') {
       [PSCustomObject]@{
         appId = $package.PackageFamilyName + '!' + $application.Id
         executablePath = Join-Path $package.InstallLocation $application.Executable
@@ -189,19 +301,35 @@ Get-AppxPackage -Name '${CHATGPT_PACKAGE}' -ErrorAction SilentlyContinue | ForEa
   }
 } | ConvertTo-Json -Compress
 `;
+  let entries = [];
   try {
     const raw = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', query]);
     const parsed = JSON.parse(raw);
-    const entries = Array.isArray(parsed) ? parsed : [parsed];
-    const selectedPath = path.win32.normalize(options.executablePath).toLowerCase();
-    const match = entries.find((entry) => typeof entry?.appId === 'string'
-      && entry.appId.startsWith(`${CHATGPT_PACKAGE}_`) && entry.appId.includes('!')
-      && typeof entry.executablePath === 'string'
-      && path.win32.normalize(entry.executablePath).toLowerCase() === selectedPath);
-    return match?.appId || null;
+    entries = Array.isArray(parsed) ? parsed : [parsed];
   } catch {
-    return null;
+    entries = [];
   }
+  const selectedPath = path.win32.normalize(options.executablePath).toLowerCase();
+  const match = entries.find((entry) => typeof entry?.appId === 'string'
+    && entry.appId.startsWith(`${CHATGPT_PACKAGE}_`) && entry.appId.includes('!')
+    && typeof entry.executablePath === 'string'
+    && path.win32.normalize(entry.executablePath).toLowerCase() === selectedPath);
+  if (match) return match.appId;
+
+  // 只有 WindowsApps 包安装目录里的 exe 才能套用包身份；
+  // 用户手动选择的外部 exe 直接启动即可，不能套用系统里另一个 ChatGPT 安装的入口。
+  const family = packageFamilyFromPath(options.executablePath);
+  if (!family) return null;
+
+  // 登录初期 AppX/开始菜单可能还没就绪：先直接读包目录里的清单，避免掉回直接运行 exe
+  // （那会丢失包身份，任务栏显示成通用文档图标）。
+  const localAppId = resolveChatGptAppIdFromPackageFiles(
+    options.executablePath,
+    options.fsImpl || fs,
+  );
+  if (localAppId) return localAppId;
+
+  return resolveChatGptAppIdFromStartApps({ execText: run, family });
 }
 
 module.exports = {
@@ -209,9 +337,13 @@ module.exports = {
   CHATGPT_EXE,
   parseInstallLocations,
   windowsAppsRoots,
+  conventionalInstallLocations,
   buildChatGptCandidates,
   prioritizePreferredPath,
   resolveChatGptExe,
   resolveChatGptAppId,
+  packageFamilyFromPath,
+  resolveChatGptAppIdFromPackageFiles,
+  resolveChatGptAppIdFromStartApps,
   _internal: { execText },
 };

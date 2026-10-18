@@ -2,10 +2,10 @@
 // IPC 注册：把渲染层调用映射到 core 模块。契约见 spec.md 第 7 节。
 const fs = require('node:fs');
 const path = require('node:path');
-const { spawn } = require('node:child_process');
 const { normalizeModelLimits, normalizeTheme } = require('./store.js');
 const { normalizeBaseUrl } = require('./base-url.js');
 const { resolveChatGptExe } = require('./chatgpt-install.js');
+const { relaunchChatGpt } = require('./chatgpt-launch.js');
 
 function sanitizeProviderInput(input, existing) {
   if (!input || typeof input !== 'object') throw new Error('缺少提供商数据');
@@ -465,21 +465,9 @@ function registerIpc(deps) {
   });
 
   handle('gptplus:chatgpt:relaunch', async () => {
-    // 结束正在运行的 ChatGPT 客户端，再重新拉起，使其重新读取配置。
-    try {
-      await new Promise((resolve) => {
-        const ps = spawn(
-          'taskkill',
-          ['/IM', 'ChatGPT.exe', '/F'],
-          { windowsHide: true, stdio: 'ignore' },
-        );
-        ps.on('close', resolve);
-        ps.on('error', resolve);
-      });
-    } catch {
-      /* 没在运行也无所谓 */
-    }
-    await new Promise((r) => setTimeout(r, 1200));
+    // 结束正在运行的 ChatGPT 客户端，再通过 Windows 应用入口重新拉起，使其重新读取配置。
+    // 不能直接 spawn 包内 exe：那样会丢掉 MSIX 应用身份，任务栏显示成通用图标，
+    // 客户端也未必能正常加载资源。
     const savedPath = store.get().chatgpt?.executablePath || null;
     let exe = await resolveChatGptExe({ preferredPath: savedPath });
     if (!exe) {
@@ -492,30 +480,32 @@ function registerIpc(deps) {
         const selected = picked && !picked.canceled && Array.isArray(picked.filePaths)
           ? picked.filePaths[0]
           : '';
-        if (selected) {
-          exe = await resolveChatGptExe({
-            preferredPath: selected,
-            execText: async () => '',
+        if (selected && fs.existsSync(selected)) {
+          exe = selected;
+          store.update((draft) => {
+            draft.chatgpt.executablePath = exe;
           });
-          if (exe) {
-            store.update((draft) => {
-              draft.chatgpt.executablePath = exe;
-            });
-          }
         }
       }
     }
     if (!exe) {
       return { ok: false, error: '找不到 ChatGPT.exe，请选择客户端可执行文件后重试' };
     }
-    try {
-      const child = spawn(exe, [], { detached: true, stdio: 'ignore', windowsHide: false });
-      child.unref();
-      ctx.log({ level: 'info', msg: '正在重启 ChatGPT 客户端以加载新的模型清单' });
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
+
+    const result = await relaunchChatGpt({ executablePath: exe });
+    if (result.ok) {
+      ctx.log({
+        level: 'info',
+        msg: `已重启 ChatGPT 客户端（PID ${result.pid ?? '未知'}`
+          + `${result.appId ? `，应用入口 ${result.appId}` : ''}）: ${result.exe}`,
+      });
+    } else {
+      ctx.log({
+        level: 'warn',
+        msg: `重启 ChatGPT 客户端失败（${exe}）: ${result.error || '未知错误'}`,
+      });
     }
+    return result;
   });
 
   handle('gptplus:logs:get', () => ctx.logs());

@@ -10,6 +10,7 @@ const viewState = {
 
 const dragState = {
   row: null,
+  rowsBox: null,
   rows: [],
   startIndex: -1,
   targetIndex: -1,
@@ -21,10 +22,14 @@ const dragState = {
   lastY: 0,
   pointerId: null,
   finish: null,
+  onBlur: null,
 };
 
 /** 渲染模型页 */
 export function renderModels(root, ctx, actions) {
+  // 页面重绘会销毁当前的拖拽行。先收尾，避免模块里的拖拽状态继续指向已移除的节点，
+  // 导致之后每次按下都在入口被静默忽略（界面表现为“拖不动、也没有报错”）。
+  if (dragState.row) cancelModelDrag();
   const { el, icon, state } = ctx;
   const models = state.models || [];
   const inject = state.inject || (state.status && state.status.inject) || { enabled: false, defaultModel: null };
@@ -548,19 +553,25 @@ function bindDragRows(ctx, rowsBox, models, rows) {
       beginModelDrag(ctx, event, row);
     });
   });
-  rowsBox.addEventListener('pointerleave', () => {
-    if (dragState.row && dragState.row.parentNode === rowsBox) scheduleDragFrame(ctx);
-  });
 }
 
 function beginModelDrag(ctx, event, row) {
-  if (viewState.busy || dragState.row || event.button !== undefined && event.button !== 0) return;
+  if (event.button !== undefined && event.button !== 0) return;
   const rowsBox = row.parentNode;
-  const rows = rowsBox ? Array.from(rowsBox.children).filter((child) => child.classList.contains('tbody-row')) : [];
+  if (dragState.row) {
+    // 上一次拖拽没有正常收尾时（页面重绘、窗口失焦、指针丢事件），状态会一直停在旧行上。
+    // 旧行还属于当前这张表就说明拖拽真的在进行，否则必须清掉——否则之后每次按下都会
+    // 在第一道检查处被静默忽略，表现为“怎么拖都不换位置且没有任何提示”。
+    if (rowsBox && dragState.rowsBox === rowsBox && dragState.row.isConnected !== false) return;
+    cancelModelDrag();
+  }
+  if (viewState.busy || !rowsBox) return;
+  const rows = Array.from(rowsBox.children).filter((child) => child.classList.contains('tbody-row'));
   const startIndex = rows.indexOf(row);
-  if (!rowsBox || startIndex < 0 || rows.length < 2) return;
+  if (startIndex < 0 || rows.length < 2) return;
   const rect = row.getBoundingClientRect();
   dragState.row = row;
+  dragState.rowsBox = rowsBox;
   dragState.rows = rows;
   dragState.startIndex = startIndex;
   dragState.targetIndex = startIndex;
@@ -571,13 +582,65 @@ function beginModelDrag(ctx, event, row) {
   dragState.grabOffsetY = event.clientY - rect.top;
   dragState.pointerId = event.pointerId ?? null;
   dragState.finish = (finishEvent) => finishModelDrag(ctx, rowsBox, finishEvent);
+  dragState.onBlur = () => cancelModelDrag();
   row.classList.add('is-dragging');
   row.setPointerCapture?.(event.pointerId);
   rowsBox.classList.add('is-dragging-list');
   rowsBox.addEventListener('pointermove', onModelDragMove);
   rowsBox.addEventListener('pointerup', dragState.finish);
   rowsBox.addEventListener('pointercancel', dragState.finish);
+  // 指针在表格外松开、或窗口在拖拽中失焦时，rowsBox 收不到 pointerup。
+  // 窗口级监听保证拖拽一定能收尾，不会把状态永久卡住。
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('pointermove', onModelDragMove, true);
+    window.addEventListener('pointerup', dragState.finish, true);
+    window.addEventListener('pointercancel', dragState.finish, true);
+    window.addEventListener('blur', dragState.onBlur);
+  }
   event.preventDefault?.();
+}
+
+/** 摘掉拖拽期间挂在列表和窗口上的监听。 */
+function removeDragListeners() {
+  const rowsBox = dragState.rowsBox;
+  if (rowsBox) {
+    rowsBox.removeEventListener('pointermove', onModelDragMove);
+    rowsBox.removeEventListener('pointerup', dragState.finish);
+    rowsBox.removeEventListener('pointercancel', dragState.finish);
+  }
+  if (typeof window !== 'undefined') {
+    window.removeEventListener?.('pointermove', onModelDragMove, true);
+    window.removeEventListener?.('pointerup', dragState.finish, true);
+    window.removeEventListener?.('pointercancel', dragState.finish, true);
+    window.removeEventListener?.('blur', dragState.onBlur);
+    if (dragState.moveFrame) window.cancelAnimationFrame?.(dragState.moveFrame);
+  }
+  dragState.moveFrame = 0;
+}
+
+/** 放弃当前拖拽：撤销位移、摘掉监听，不写入顺序。 */
+function cancelModelDrag() {
+  const rows = Array.isArray(dragState.rows) ? dragState.rows : [];
+  removeDragListeners();
+  if (dragState.rowsBox) dragState.rowsBox.classList.remove('is-dragging-list');
+  rows.forEach((row) => {
+    row.classList.remove('is-dragging');
+    row.style.setProperty('transform', 'none');
+  });
+  resetDragState();
+}
+
+/** 只复位模块状态，不动 DOM：保存成功后由 finishModelDrag 复用。 */
+function resetDragState() {
+  dragState.row = null;
+  dragState.rowsBox = null;
+  dragState.rows = [];
+  dragState.rowTops = [];
+  dragState.startIndex = -1;
+  dragState.targetIndex = -1;
+  dragState.pointerId = null;
+  dragState.finish = null;
+  dragState.onBlur = null;
 }
 
 function onModelDragMove(event) {
@@ -604,8 +667,6 @@ function updateDragVisual(ctx) {
   if (!dragState.row) return;
   const rows = dragState.rows;
   const draggedY = dragState.lastY - dragState.startY;
-  const draggedTop = dragState.lastY - dragState.grabOffsetY;
-  const draggedBottom = draggedTop + dragState.rowHeight;
   const targetIndex = dragTargetIndex(
     dragState.rowTops,
     dragState.startIndex,
@@ -613,12 +674,13 @@ function updateDragVisual(ctx) {
     dragState.lastY,
     dragState.grabOffsetY,
   );
+  // 让位与提交共用同一个 targetIndex，并且按整格位移：预览里看到的顺序就是
+  // 松手后写入的顺序，不会再出现“看着已经换位、松手却弹回原位”。
   const rowOffsets = dragRowOffsets(
     dragState.rowTops,
     dragState.startIndex,
+    targetIndex,
     dragState.rowHeight,
-    draggedTop,
-    draggedBottom,
   );
   dragState.targetIndex = targetIndex;
   rows.forEach((row, index) => {
@@ -631,44 +693,41 @@ function updateDragVisual(ctx) {
   });
 }
 
-/** 根据拖动行经过相邻行位置的进度，连续计算让位位移，避免整行突然吸附。 */
-export function dragRowOffsets(rowTops, startIndex, rowHeight, draggedTop, draggedBottom) {
+/** 预览位移：被拖行已经越过的格子整格让位，保证预览顺序 == 提交顺序。 */
+export function dragRowOffsets(rowTops, startIndex, targetIndex, rowHeight) {
   if (!Array.isArray(rowTops) || !rowTops.length || rowHeight <= 0) return [];
   if (startIndex < 0 || startIndex >= rowTops.length) return rowTops.map(() => 0);
 
   const offsets = rowTops.map(() => 0);
-  const clamp = (value) => Math.max(0, Math.min(1, value));
-  if (draggedTop >= rowTops[startIndex]) {
-    for (let index = startIndex + 1; index < rowTops.length; index += 1) {
-      const progress = clamp((draggedBottom - rowTops[index]) / rowHeight);
-      if (progress > 0) offsets[index] = -rowHeight * progress;
+  if (targetIndex > startIndex) {
+    for (let index = startIndex + 1; index <= targetIndex && index < rowTops.length; index += 1) {
+      offsets[index] = -rowHeight;
     }
-  } else {
-    for (let index = startIndex - 1; index >= 0; index -= 1) {
-      const rowBottom = rowTops[index] + rowHeight;
-      const progress = clamp((rowBottom - draggedTop) / rowHeight);
-      if (progress > 0) offsets[index] = rowHeight * progress;
+  } else if (targetIndex >= 0 && targetIndex < startIndex) {
+    for (let index = targetIndex; index < startIndex; index += 1) {
+      offsets[index] = rowHeight;
     }
   }
   return offsets;
 }
 
-/** 被拖行中心越过相邻行中线时切换目标，正反方向使用同一条边界。 */
+/** 被拖行中心越过相邻格边界时换位（拖半行就换一格），正反方向使用同一条边界。 */
 export function dragTargetIndex(rowTops, startIndex, rowHeight, pointerY, grabOffsetY) {
   if (!Array.isArray(rowTops) || !rowTops.length || rowHeight <= 0) return startIndex;
   if (startIndex < 0 || startIndex >= rowTops.length) return startIndex;
 
   const draggedCenter = pointerY - grabOffsetY + rowHeight / 2;
   let naturalIndex = startIndex;
-  const startMidpoint = rowTops[startIndex] + rowHeight / 2;
-  if (draggedCenter > startMidpoint) {
+  if (draggedCenter > rowTops[startIndex]) {
+    // 向下：中心越过下一格的上边界，就算进入下一格
     for (let index = startIndex + 1; index < rowTops.length; index += 1) {
-      if (draggedCenter <= rowTops[index] + rowHeight / 2) break;
+      if (draggedCenter <= rowTops[index]) break;
       naturalIndex = index;
     }
-  } else if (draggedCenter < startMidpoint) {
+  } else if (draggedCenter < rowTops[startIndex]) {
+    // 向上：中心越过上一格的下边界，就算进入上一格
     for (let index = startIndex - 1; index >= 0; index -= 1) {
-      if (draggedCenter >= rowTops[index] + rowHeight / 2) break;
+      if (draggedCenter >= rowTops[index] + rowHeight) break;
       naturalIndex = index;
     }
   }
@@ -691,16 +750,8 @@ async function finishModelDrag(ctx, rowsBox, event) {
   const nextKeys = reorderModelKeys(orderKeys, fromIndex, toIndex);
   const firstRects = new Map(rows.map((row) => [row, row.getBoundingClientRect()]));
   const movedRows = reorderModelRows(rowsBox, rows, fromIndex, toIndex);
-  rowsBox.removeEventListener('pointermove', onModelDragMove);
-  rowsBox.removeEventListener('pointerup', dragState.finish);
-  rowsBox.removeEventListener('pointercancel', dragState.finish);
-  if (dragState.moveFrame && typeof window !== 'undefined') window.cancelAnimationFrame?.(dragState.moveFrame);
-  dragState.moveFrame = 0;
-  dragState.row = null;
-  dragState.rows = [];
-  dragState.rowTops = [];
-  dragState.pointerId = null;
-  dragState.finish = null;
+  removeDragListeners();
+  resetDragState();
   if (fromIndex === toIndex || !nextKeys.length) {
     rowsBox.classList.remove('is-dragging-list');
     rows.forEach((row) => {
@@ -757,6 +808,8 @@ function animateRowsToFinalPosition(rowsBox, firstRects, movedRows) {
   rowsBox.classList.add('is-dragging-list');
   movedRows.forEach((row) => {
     row.classList.remove('is-dragging');
+    // 先关掉过渡再归零：拖拽期间非拖动行带让位过渡，否则这里量到的 lastRects 会落在动画中途。
+    row.style.setProperty('transition', 'none');
     row.style.setProperty('transform', 'none');
   });
   const lastRects = new Map(movedRows.map((row) => [row, row.getBoundingClientRect()]));

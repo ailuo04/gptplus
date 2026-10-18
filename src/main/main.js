@@ -52,7 +52,7 @@ const { createWindowLifecycle } = require('./window-lifecycle.js');
 const { TRAY_ICON_DATA_URL } = require('./tray-icon.js');
 const { setupAutoUpdater, cleanupInstalledUpdateCache } = require('./updater.js');
 const { autoUpdater } = require('electron-updater');
-const { launchChatGpt } = require('../core/chatgpt-launch.js');
+const { launchChatGptAndVerify } = require('../core/chatgpt-launch.js');
 
 const isDev = process.argv.includes('--dev');
 const isQuitRequest = process.argv.includes('--quit');
@@ -220,9 +220,15 @@ async function launchChatGptAtLogin(commandLine = process.argv) {
 
   const preferredPath = ctx?.store?.get?.()?.chatgpt?.executablePath || null;
   try {
-    const result = await launchChatGpt({ preferredPath });
+    // 日志里必须区分“已请求唤起”和“客户端真的起来了”：登录时没有界面反馈，
+    // 只 spawn explorer 成功并不代表 ChatGPT 主窗口出现。
+    const result = await launchChatGptAndVerify({ preferredPath });
     if (result.ok) {
-      ctx?.log?.({ level: 'info', msg: '已按开机自启动设置启动 ChatGPT 客户端' });
+      ctx?.log?.({
+        level: 'info',
+        msg: `已按开机自启动设置启动 ChatGPT 客户端（PID ${result.pid ?? '未知'}`
+          + `${result.appId ? `，应用入口 ${result.appId}` : ''}）: ${result.exe}`,
+      });
     } else {
       ctx?.log?.({ level: 'warn', msg: `开机自启动 ChatGPT 失败: ${result.error}` });
     }

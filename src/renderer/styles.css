@@ -1721,6 +1721,10 @@ html.is-theme-switching .logs {
 .tbody-row:not(.is-dragging) { transition: transform var(--dur-2) var(--ease-out), background var(--dur-2) var(--ease-out); }
 .table.is-dragging-list { user-select: none; }
 .table.is-dragging-list .tbody-row { transition: background var(--dur-2) var(--ease-out); }
+/* 拖拽中：被越过的行整格让位，用短过渡表现成被推开，而不是闪跳 */
+.table.is-dragging-list .tbody-row:not(.is-dragging) {
+  transition: transform 140ms var(--ease-out), background var(--dur-2) var(--ease-out);
+}
 .table.is-dragging-list .tbody-row.is-dragging {
   z-index: 2;
   background: var(--bg-hover);

@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 // 渲染层静态自检 + 无 Electron 的渲染冒烟测试（node:test）。
 //
 // 这个测试守的是最容易在并行开发里悄悄坏掉的东西：
@@ -35,7 +35,9 @@ const VIEW_FILES = ['providers.js', 'models.js', 'usage.js', 'settings.js'];
 const JS_FILES = ['app.js', ...VIEW_FILES.map((f) => path.join('views', f))];
 
 function read(file) {
-  return fs.readFileSync(file, 'utf8');
+  // Windows 上 core.autocrlf=true 会把工作区里的部分文件换成 CRLF，而下面按 '\n'
+  // 做的源码切片断言会因此找不到锚点。统一成 LF，保证本地与 CI 结果一致。
+  return fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n');
 }
 
 function readJs(rel) {
@@ -605,77 +607,109 @@ test('模型排序辅助函数支持把任意拖动项插入目标位置', async
   }
 });
 
-test('模型拖动按被拖行中心点越过相邻行中线判断目标', async () => {
+test('模型拖动按被拖行中心越过格边界判断目标（拖半行即换位）', async () => {
   const tmp = copyRendererToTemp();
   try {
     const modelsMod = await import(pathToFileURL(path.join(tmp, 'views', 'models.js')).href);
     const rowTops = [100, 150, 200];
-    assert.equal(
-      modelsMod.dragTargetIndex(rowTops, 1, 50, 226, 25),
-      2,
-      '被拖行中心点越过下一行中线后换到下一行',
-    );
-    assert.equal(
-      modelsMod.dragTargetIndex(rowTops, 1, 50, 224, 25),
-      1,
-      '被拖行中心点反向越过中线后应立即回到上一位置',
-    );
-    assert.equal(
-      modelsMod.dragTargetIndex(rowTops, 1, 50, 201, 0),
-      2,
-      '抓取位置变化不应改变被拖行中心点对应的目标判断',
-    );
-    assert.equal(
-      modelsMod.dragTargetIndex(rowTops, 1, 50, 126, 25),
-      1,
-      '向上拖动未越过上一行中线时保持原位',
-    );
-    assert.equal(
-      modelsMod.dragTargetIndex(rowTops, 1, 50, 124, 25),
-      0,
-      '向上拖动越过上一行中线后换到上一行',
-    );
+    // grabOffsetY = 25 时，被拖行中心正好等于 pointerY；起始中心 175
+    assert.equal(modelsMod.dragTargetIndex(rowTops, 1, 50, 200, 25), 1, '中心正好压在格边界上时保持原位');
+    assert.equal(modelsMod.dragTargetIndex(rowTops, 1, 50, 201, 25), 2, '中心越过下一格上边界后换到下一行');
+    assert.equal(modelsMod.dragTargetIndex(rowTops, 1, 50, 226, 25), 2, '继续向下仍停在下一行');
+    assert.equal(modelsMod.dragTargetIndex(rowTops, 1, 50, 152, 25), 1, '向上还没越过边界时保持原位');
+    assert.equal(modelsMod.dragTargetIndex(rowTops, 1, 50, 148, 25), 0, '向上越过边界后换到上一行');
+    assert.equal(modelsMod.dragTargetIndex(rowTops, 1, 50, 201, 25), 2, '向下 26px 就换位，不需要拖满一整行');
+    assert.equal(modelsMod.dragTargetIndex(rowTops, 1, 50, 251, 50), 2, '同一个中心点对应同一个目标，与抓取位置无关');
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
 
-test('模型拖动让相邻行按连续位置进度让位，避免整行吸附跳动', async () => {
+test('模型拖动预览按整格让位，不做“半格后弹回”的无效位移', async () => {
   const tmp = copyRendererToTemp();
   try {
     const modelsMod = await import(pathToFileURL(path.join(tmp, 'views', 'models.js')).href);
     const rowTops = [100, 150, 200, 250];
-    assert.deepEqual(
-      modelsMod.dragRowOffsets(rowTops, 1, 50, 150, 200),
-      [0, 0, 0, 0],
-      '拖动行尚未接触下一行时不应推动其它行',
-    );
-    assert.deepEqual(
-      modelsMod.dragRowOffsets(rowTops, 1, 50, 160, 210),
-      [0, 0, -10, 0],
-      '拖动行只重叠 10px 时，下一行应只让位 10px',
-    );
-    assert.deepEqual(
-      modelsMod.dragRowOffsets(rowTops, 1, 50, 170, 220),
-      [0, 0, -20, 0],
-      '拖动行继续向下时，让位位移应连续增加',
-    );
-    assert.deepEqual(
-      modelsMod.dragRowOffsets(rowTops, 1, 50, 210, 260),
-      [0, 0, -50, -10],
-      '向下越过一行后应保持完整让位，并开始推动下一行',
-    );
-    assert.deepEqual(
-      modelsMod.dragRowOffsets(rowTops, 2, 50, 190, 240),
-      [0, 10, 0, 0],
-      '向上拖动只重叠 10px 时，上一行应只让位 10px',
-    );
-    assert.deepEqual(
-      modelsMod.dragRowOffsets(rowTops, 2, 50, 140, 190),
-      [10, 50, 0, 0],
-      '向上越过上一行后应保持完整让位，并开始推动再上一行',
-    );
+    assert.deepEqual(modelsMod.dragRowOffsets(rowTops, 1, 1, 50), [0, 0, 0, 0], '没有换位时其它行不动');
+    assert.deepEqual(modelsMod.dragRowOffsets(rowTops, 1, 2, 50), [0, 0, -50, 0], '向下换一格：下一行整格让位');
+    assert.deepEqual(modelsMod.dragRowOffsets(rowTops, 1, 3, 50), [0, 0, -50, -50], '向下换两格：中间各行整格上移');
+    assert.deepEqual(modelsMod.dragRowOffsets(rowTops, 2, 1, 50), [0, 50, 0, 0], '向上换一格：上一行整格让位');
+    assert.deepEqual(modelsMod.dragRowOffsets(rowTops, 2, 0, 50), [50, 50, 0, 0], '向上换两格：经过的行整格下移');
   } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('松手提交的顺序与拖动预览里行让位显示的顺序一致', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const modelsMod = await import(pathToFileURL(path.join(tmp, 'views', 'models.js')).href);
+    installFakeDom();
+    // 同步执行 rAF，指针一动就能在 DOM 上量到预览位移
+    window.requestAnimationFrame = (callback) => {
+      callback();
+      return 0;
+    };
+    window.cancelAnimationFrame = () => {};
+
+    const state = fixtureState();
+    const ctx = makeCtx(appMod, state);
+    const saved = [];
+    ctx.api.reorderModels = async ({ orderKeys }) => {
+      saved.push(orderKeys);
+      return state.status;
+    };
+
+    const runCase = async (deltaY) => {
+      saved.length = 0;
+      const root = new FakeNode('main');
+      modelsMod.renderModels(root, ctx, new FakeNode('div'));
+      const rows = root.find('tbody-row');
+      const rowsBox = root.find('table')[0];
+      rows.forEach((row, index) => {
+        // DOM 替身不会把 setAttribute('class') 同步进 classList，这里手动补上
+        row.classList.add('tbody-row');
+        row.getBoundingClientRect = () => ({ top: 100 + index * 50, left: 0, width: 600, height: 50 });
+      });
+      const keys = rows.map((row) => row.dataset.orderKey);
+      const startIndex = 1;
+      const startY = 100 + startIndex * 50 + 25;
+
+      rows[startIndex].find('model-drag-handle')[0].listeners.pointerdown[0]({
+        button: 0,
+        pointerId: 9,
+        clientY: startY,
+        preventDefault() {},
+      });
+      rowsBox.listeners.pointermove[0]({ pointerId: 9, clientY: startY + deltaY, preventDefault() {} });
+
+      // 预览里已经“让开”的格数，就是这一拖实际插入的位置
+      let previewTarget = startIndex;
+      rows.forEach((row, index) => {
+        const match = /translateY\((-?[\d.]+)px\)/.exec(row.style.getPropertyValue('transform') || '');
+        const offset = match ? Number(match[1]) : 0;
+        if (index > startIndex && offset < 0) previewTarget = index;
+        if (index < startIndex && offset > 0) previewTarget = index;
+      });
+      const previewOrder = modelsMod.reorderModelKeys(keys, startIndex, previewTarget);
+
+      await rowsBox.listeners.pointerup[0]({ pointerId: 9, clientY: startY + deltaY });
+
+      if (previewTarget === startIndex) {
+        assert.equal(saved.length, 0, `位移 ${deltaY}px 时预览没有换位，松手也不应提交`);
+      } else {
+        assert.deepEqual(saved[0], previewOrder, `位移 ${deltaY}px 时松手提交的顺序应与预览一致`);
+      }
+    };
+
+    for (const delta of [-130, -80, -30, -24, 0, 24, 30, 80, 130]) {
+      await runCase(delta);
+    }
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
@@ -740,6 +774,65 @@ test('模型拖动松手时同步最终指针位置并立即更新 DOM 顺序', 
       state.models.map((model) => model.orderKey || `${model.providerId}::${model.modelId}`),
       expected,
       '内存状态也应同步为新顺序',
+    );
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('页面重绘打断拖拽后，后续拖拽仍能生效', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const modelsMod = await import(pathToFileURL(path.join(tmp, 'views', 'models.js')).href);
+    installFakeDom();
+    window.requestAnimationFrame = () => 0;
+    window.cancelAnimationFrame = () => {};
+
+    const state = fixtureState();
+    const ctx = makeCtx(appMod, state);
+    const savedOrders = [];
+    ctx.api.reorderModels = async ({ orderKeys }) => {
+      savedOrders.push(orderKeys);
+      return state.status;
+    };
+
+    const root = new FakeNode('main');
+    const actions = new FakeNode('div');
+    modelsMod.renderModels(root, ctx, actions);
+
+    const prepare = (rows) => rows.map((row, index) => {
+      row.classList.add('tbody-row');
+      row.getBoundingClientRect = () => ({ top: 100 + index * 50, left: 0, width: 600, height: 50 });
+      const handle = row.find('model-drag-handle')[0];
+      handle.getBoundingClientRect = () => ({ top: 100 + index * 50, left: 0, width: 28, height: 28 });
+      return handle;
+    });
+
+    const handles = prepare(root.find('tbody-row'));
+    assert.equal(handles.length, 3, '测试需要三行模型');
+    // 按下把手开始拖拽，但还没松手
+    handles[0].listeners.pointerdown[0]({ button: 0, pointerId: 11, clientY: 125, preventDefault() {} });
+
+    // 模拟拖拽途中页面被重绘（点刷新、其它操作触发 reload 等）
+    root.replaceChildren();
+    modelsMod.renderModels(root, ctx, new FakeNode('div'));
+    const handlesAfter = prepare(root.find('tbody-row'));
+    const rowsBox = root.find('table')[0];
+
+    // 重绘后必须还能重新开始拖拽，而不是被上一次的残留状态永久卡住
+    handlesAfter[0].listeners.pointerdown[0]({ button: 0, pointerId: 12, clientY: 125, preventDefault() {} });
+    rowsBox.listeners.pointermove[0]({ pointerId: 12, clientY: 245, preventDefault() {} });
+    await rowsBox.listeners.pointerup[0]({ pointerId: 12, clientY: 245 });
+
+    assert.equal(savedOrders.length, 1, '重绘后的拖拽应正常提交一次排序');
+    assert.deepEqual(
+      rowsBox.children.filter((row) => row.classList.contains('tbody-row')).map((row) => row.dataset.orderKey),
+      savedOrders[0],
+      '重绘后的拖拽应真正换位',
     );
   } finally {
     delete globalThis.document;
@@ -1532,6 +1625,93 @@ test('开机自启动目标支持双向切换，关闭再开启时保留所选�
     click(option('both'));
     await flush();
     assert.equal(calls.length, count, '重复点击当前目标不应再次保存');
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('重启 ChatGPT：确认后立即撤下红色警示，失败时才恢复', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    installFakeDom();
+    const nodes = new Map([...read(HTML).matchAll(/\bid="([^"]+)"/g)]
+      .map((match) => [match[1], new FakeNode('div')]));
+    document.getElementById = (id) => nodes.get(id) || null;
+    const calls = [];
+    let resolveRelaunch = null;
+    let onStatus = null;
+    window.gptplus = {
+      ...makeApi(fixtureState(), calls),
+      onStatus: (cb) => {
+        onStatus = cb;
+        return () => {};
+      },
+      relaunchChatGpt: () => {
+        calls.push(['relaunchChatGpt']);
+        return new Promise((resolve) => { resolveRelaunch = resolve; });
+      },
+    };
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    await flush();
+    assert.equal(document.documentElement.dataset.ready, '1', '真实启动流程必须完成');
+
+    const sidebar = nodes.get('sidebar-actions');
+    const button = () => sidebar.find('sidebar-relaunch')[0];
+    const isDanger = () => String(button().className).split(/\s+/).includes('btn-danger');
+    const buttonText = () => button().textContent;
+    let writeAt = Date.now() - 1000;
+    const simulateWrite = async () => {
+      writeAt += 1000;
+      onStatus({
+        ...fixtureState().status,
+        codex: { ...fixtureState().status.codex, lastWrite: { at: writeAt, ok: true } },
+      });
+      await flush();
+    };
+
+    await simulateWrite();
+    assert.equal(isDanger(), true, '有未生效配置时按钮必须是红色');
+    assert.match(buttonText(), /配置待生效/);
+
+    click(button());
+    await flush();
+    assert.match(buttonText(), /确认重启/, '第一次点击只进入确认态');
+    click(button());
+    await flush();
+    assert.equal(calls.filter((call) => call[0] === 'relaunchChatGpt').length, 1, '确认后必须调用重启 API');
+    assert.equal(isDanger(), false, '确认后应立即撤下红色，而不是等主进程结束进程');
+    assert.match(buttonText(), /正在重启/, '重启期间应显示进行中状态');
+    assert.equal(button().disabled, true, '重启期间按钮必须禁用，避免重复点击');
+
+    // 旧写入的状态广播可能比 IPC 回复更晚到达：不能让它把红色又标回来。
+    onStatus({
+      ...fixtureState().status,
+      codex: { ...fixtureState().status.codex, lastWrite: { at: writeAt, ok: true } },
+    });
+    await flush();
+    assert.equal(isDanger(), false, '迟到的旧状态广播不应重新亮起红色警示');
+    assert.match(buttonText(), /正在重启/);
+
+    resolveRelaunch({ ok: true });
+    await flush();
+    assert.equal(appMod.state.relaunchNeeded, false);
+    assert.equal(isDanger(), false);
+    assert.match(buttonText(), /重启 ChatGPT 客户端/, '成功后恢复为普通重启入口');
+
+    // 失败路径：红色警示必须回来，用户才知道配置仍未生效。
+    await simulateWrite();
+    click(button());
+    await flush();
+    click(button());
+    await flush();
+    resolveRelaunch({ ok: false, error: 'ChatGPT 没有退出' });
+    await flush();
+    assert.equal(appMod.state.relaunchNeeded, true, '重启失败后必须恢复待重启警示');
+    assert.equal(isDanger(), true);
+    assert.equal(button().disabled, false);
   } finally {
     delete globalThis.document;
     delete globalThis.window;

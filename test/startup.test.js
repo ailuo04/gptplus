@@ -43,10 +43,10 @@ function setup(options = {}) {
       store: { get: () => config, update: (fn) => fn(config) },
       log: (entry) => logs.push(entry),
     },
-    launchChatGpt: async (launchOptions) => {
+    launchChatGptAndVerify: async (launchOptions) => {
       calls.push({ type: 'launch', preferredPath: launchOptions.preferredPath });
       if (options.launchError) throw new Error(options.launchError);
-      return options.launchResult || { ok: true, exe: 'C:\\ChatGPT.exe' };
+      return options.launchResult || { ok: true, exe: 'C:\\ChatGPT.exe', pid: 1234 };
     },
   };
   const api = vm.runInNewContext(`${startupSource}\n({

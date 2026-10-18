@@ -408,6 +408,7 @@ const MAX_TOASTS = 4;
 let api = null;
 let subscribed = false;
 let relaunchTimer = 0;
+let relaunchBusy = false;
 let themeSaveBusy = false;
 let networkSaveBusy = false;
 let startupSaveBusy = false;
@@ -1177,14 +1178,18 @@ function renderSidebarAction() {
       ])
     : null;
   const button = el('button', {
-    class: 'btn btn-sm sidebar-relaunch ' + (pending || needed ? 'btn-danger' : 'btn-ghost'),
+    class: 'btn btn-sm sidebar-relaunch '
+      + (relaunchBusy ? 'btn-ghost is-busy' : pending || needed ? 'btn-danger' : 'btn-ghost'),
     type: 'button',
-    disabled: !api,
-    title: pending
-      ? '再次点击确认，立即结束并重新启动 ChatGPT.exe'
-      : '结束 ChatGPT.exe 再重新启动，让它重新读取模型清单',
+    disabled: !api || relaunchBusy ? true : null,
+    title: relaunchBusy
+      ? '正在结束旧的 ChatGPT 进程并重新启动，请稍候'
+      : pending
+        ? '再次点击确认，立即结束并重新启动 ChatGPT.exe'
+        : '结束 ChatGPT.exe 再重新启动，让它重新读取模型清单',
     on: {
       click: () => {
+        if (relaunchBusy) return;
         if (!state.pendingRelaunch) {
           state.pendingRelaunch = true;
           renderSidebarAction();
@@ -1201,10 +1206,16 @@ function renderSidebarAction() {
       },
     },
   }, [
-    icon('power', 13),
-    el('span', { text: pending ? '确认重启 ChatGPT？' : needed ? '重启 ChatGPT（配置待生效）' : '重启 ChatGPT 客户端' }),
+    icon(relaunchBusy ? 'refresh' : 'power', 13),
+    el('span', {
+      text: relaunchBusy
+        ? '正在重启 ChatGPT…'
+        : pending
+          ? '确认重启 ChatGPT？'
+          : needed ? '重启 ChatGPT（配置待生效）' : '重启 ChatGPT 客户端',
+    }),
   ]);
-  const warning = needed
+  const warning = !relaunchBusy && needed
     ? el('div', { class: 'sidebar-relaunch-alert', attrs: { role: 'alert' } }, [
         icon('alert', 14),
         el('span', { text: '配置已修改，需要重启 ChatGPT 客户端生效' }),
@@ -1324,23 +1335,43 @@ function observeCodexWrite(s) {
   if (write.ok) markRelaunchNeeded();
 }
 
+/** 待重启状态同时影响侧栏按钮和设置页提示，两处都要立即重绘。 */
+function renderRelaunchState() {
+  renderChrome();
+  if (state.view === 'settings') renderCurrent(false, { preserveScrollTop: true });
+}
+
 /** 调用主进程重启 ChatGPT，并把结果反馈到全局提示与运行日志。 */
 async function relaunchChatGpt() {
+  if (relaunchBusy) return;
+  const wasNeeded = state.relaunchNeeded;
   state.pendingRelaunch = false;
   window.clearTimeout(relaunchTimer);
-  renderSidebarAction();
+  relaunchBusy = true;
+  // 用户确认后先撤掉红色警示：结束旧进程、等待退出、再唤起客户端需要几秒，
+  // 这段时间按钮应显示“正在重启”，而不是继续停在“配置待生效”。
+  // 同时把已观察到的写入时间推进到现在，防止还在路上的旧状态广播把红色又标回来。
+  state.relaunchNeeded = false;
+  observedWriteAt = Math.max(observedWriteAt, Date.now());
+  renderRelaunchState();
   try {
     const res = await api.relaunchChatGpt();
     if (res && res.ok) {
+      // 重启完成后再收一次时间戳：重启过程中若有新写入，新的 ChatGPT 进程已经会读到它。
       state.relaunchNeeded = false;
-      renderChrome();
-      toast('正在重启 ChatGPT 客户端：关闭后会自动拉起并重新读取模型清单', 'ok');
-      logLocal('info', '已请求重启 ChatGPT 客户端');
+      observedWriteAt = Math.max(observedWriteAt, Date.now());
+      toast('已重启 ChatGPT 客户端：新的模型清单已加载', 'ok');
+      logLocal('info', '已重启 ChatGPT 客户端并加载新的模型清单');
     } else {
+      state.relaunchNeeded = wasNeeded || state.relaunchNeeded;
       toast(`重启失败：${(res && res.error) || '未知错误'}`, 'error');
     }
   } catch (err) {
+    state.relaunchNeeded = wasNeeded || state.relaunchNeeded;
     toastError(err, '重启 ChatGPT 失败');
+  } finally {
+    relaunchBusy = false;
+    renderRelaunchState();
   }
 }
 
