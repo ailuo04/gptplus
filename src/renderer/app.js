@@ -9,6 +9,7 @@ import { renderProviders, openProviderForm, closeProviderForm } from './views/pr
 import { dragRowOffsets, dragTargetIndex, renderModels, reorderModelKeys } from './views/models.js';
 import { renderUsage, usageRows } from './views/usage.js';
 import { renderSettings } from './views/settings.js';
+import { renderHome } from './views/home.js';
 
 // ============ 静态图标（纯字面量，不含任何变量） ============
 const SVG_OPEN =
@@ -320,7 +321,7 @@ function describeError(err, fallback = '操作失败') {
 
 // ============ 应用状态 ============
 const state = {
-  view: 'providers',
+  view: 'home',
   // preload 会在 CSS 首次计算前写入该属性；这里同步沿用，避免首屏先落到深色。
   theme: typeof document !== 'undefined'
     ? (document.documentElement.dataset.themeMode || document.documentElement.dataset.theme || 'dark')
@@ -518,9 +519,12 @@ function handleIncomingLog(entry, rerender = renderCurrent) {
   const identity = logIdentity(normalized);
   if (state.logs.some((current) => logIdentity(current) === identity)) return;
   pushLog(normalized);
-  if (normalized.final === true || normalized.usageRecord === true) mergeUsageRecords([normalized]);
+  const finalRecord = normalized.final === true || normalized.usageRecord === true;
+  if (finalRecord) mergeUsageRecords([normalized]);
   updateUsageBadge();
   if (state.view === 'usage') rerender(false, { preserveScrollTop: true });
+  // 主页也展示最近请求与今日流量：只在请求终结时重绘一次，不跟着中间日志刷新。
+  else if (state.view === 'home' && finalRecord) rerender(false, { preserveScrollTop: true });
 }
 
 function logLocal(level, msg) {
@@ -562,6 +566,8 @@ async function copyText(text, label = '内容') {
 
 // ============ 弹窗宿主 ============
 let currentModal = null;
+// 缩回动画时长；节点必须等动画播完再移除，否则关闭会表现为“瞬间消失”。
+const MODAL_EXIT_MS = 200;
 
 function openModal(node, options = {}) {
   closeModal();
@@ -589,7 +595,7 @@ function closeModal() {
   const { backdrop, onClose, prevFocus } = currentModal;
   currentModal = null;
   backdrop.classList.add('is-closing');
-  window.setTimeout(() => backdrop.remove(), 180);
+  window.setTimeout(() => backdrop.remove(), MODAL_EXIT_MS);
   if (typeof onClose === 'function') {
     try {
       onClose();
@@ -597,6 +603,8 @@ function closeModal() {
       /* 关闭回调异常不影响界面 */
     }
   }
+  // 打开另一个弹窗时旧弹窗还在播放缩回动画，此时不能把焦点抢回旧位置。
+  if (currentModal) return true;
   if (prevFocus && prevFocus.isConnected && typeof prevFocus.focus === 'function') {
     try {
       prevFocus.focus();
@@ -739,6 +747,14 @@ async function tryLoad(loader, label) {
 }
 
 const RELOAD_PLAN = {
+  home: [
+    [loadProviders, '提供商列表'],
+    [loadModels, '模型列表'],
+    [loadGateway, '网关状态'],
+    [loadInject, '注入状态'],
+    [loadUsage, '使用量统计'],
+    [loadStatus, '全局状态'],
+  ],
   providers: [
     [loadProviders, '提供商列表'],
     [loadModels, '模型列表'], // 模型由提供商派生，改完提供商要一起刷新
@@ -746,6 +762,9 @@ const RELOAD_PLAN = {
   ],
   models: [
     [loadModels, '模型列表'],
+    // 删除/启停模型会改掉提供商内部的模型数组，反过来也要刷新提供商快照；
+    // 否则切到提供商页仍显示已删除的模型，编辑表单还会把它重新写回去。
+    [loadProviders, '提供商列表'],
     [loadInject, '注入状态'],
     [loadGateway, '网关状态'],
     [loadStatus, '全局状态'],
@@ -829,6 +848,13 @@ function syncUsageAutoRefresh() {
 
 // ============ 全局 chrome ============
 const VIEW_META = {
+  home: {
+    title: '主页',
+    sub: '提供商、本地网关与 ChatGPT 客户端连成一条线路',
+    render: renderHome,
+    // 使用量由后台加载：历史记录可能有上万条，不能挡住首屏。
+    needs: ['providers', 'status', 'gateway', 'inject', 'models'],
+  },
   providers: {
     title: '提供商',
     sub: '添加你自己的模型接口；保存后模型会进入 ChatGPT 的模型清单',
@@ -873,6 +899,12 @@ function renderChrome() {
   const updateBadge = dom.nav.querySelector('[data-badge="update"]');
   setAnimatedText(providerBadge, s ? String(s.providers) : '–');
   setAnimatedText(modelBadge, s ? String(s.models) : '–');
+  const homeSignal = dom.nav.querySelector('[data-signal="home"]');
+  if (homeSignal) {
+    const live = !!(s && s.providers > 0 && s.gateway && s.gateway.running && s.inject && s.inject.enabled);
+    homeSignal.classList.toggle('is-live', live);
+    homeSignal.classList.toggle('is-pending', !!s && !live && (s.providers > 0 || (s.gateway && s.gateway.enabled)));
+  }
   updateUsageBadge();
   if (gatewayBadge) {
     const running = !!(s && s.gateway && s.gateway.running);
@@ -1335,15 +1367,22 @@ function observeCodexWrite(s) {
   if (write.ok) markRelaunchNeeded();
 }
 
-/** 待重启状态同时影响侧栏按钮和设置页提示，两处都要立即重绘。 */
+/** 待重启状态同时影响侧栏按钮、设置页提示和主页「下一步」黄条，三处都要立即重绘。 */
 function renderRelaunchState() {
   renderChrome();
-  if (state.view === 'settings') renderCurrent(false, { preserveScrollTop: true });
+  // 主页黄条也由 relaunchNeeded 决定：从侧栏重启成功后必须让它消失，
+  // 否则用户会以为配置仍然没生效（设置页同理）。
+  if (state.view === 'settings' || state.view === 'home') {
+    renderCurrent(false, { preserveScrollTop: true });
+  }
 }
 
-/** 调用主进程重启 ChatGPT，并把结果反馈到全局提示与运行日志。 */
+/**
+ * 调用主进程重启 ChatGPT，并把结果反馈到全局提示与运行日志。
+ * @returns {Promise<boolean>} 是否重启成功；视图层的「下一步」按钮据此决定后续文案
+ */
 async function relaunchChatGpt() {
-  if (relaunchBusy) return;
+  if (relaunchBusy) return false;
   const wasNeeded = state.relaunchNeeded;
   state.pendingRelaunch = false;
   window.clearTimeout(relaunchTimer);
@@ -1362,13 +1401,16 @@ async function relaunchChatGpt() {
       observedWriteAt = Math.max(observedWriteAt, Date.now());
       toast('已重启 ChatGPT 客户端：新的模型清单已加载', 'ok');
       logLocal('info', '已重启 ChatGPT 客户端并加载新的模型清单');
+      return true;
     } else {
       state.relaunchNeeded = wasNeeded || state.relaunchNeeded;
       toast(`重启失败：${(res && res.error) || '未知错误'}`, 'error');
+      return false;
     }
   } catch (err) {
     state.relaunchNeeded = wasNeeded || state.relaunchNeeded;
     toastError(err, '重启 ChatGPT 失败');
+    return false;
   } finally {
     relaunchBusy = false;
     renderRelaunchState();
@@ -1664,6 +1706,7 @@ const ctx = {
   renderChrome,
   renderCurrent,
   markRelaunchNeeded,
+  relaunchChatGpt,
   checkForUpdates,
   startUpdateDownload,
   openModal,
@@ -1842,7 +1885,7 @@ async function boot() {
   subscribe();
 
   // 默认页只依赖全局状态和提供商列表，先画出可交互页面。
-  await ensureLoaded('providers');
+  await ensureLoaded('home');
   await Promise.all([
     tryLoad(loadStartup, '开机自启动状态'),
     tryLoad(loadUpdate, '更新状态'),
@@ -1864,7 +1907,7 @@ async function boot() {
   ]).then(() => {
     updateLogBadge();
     renderChrome();
-    if (state.view === 'usage') renderCurrent(true, { preserveScrollTop: true });
+    if (state.view === 'usage' || state.view === 'home') renderCurrent(true, { preserveScrollTop: true });
   });
 }
 

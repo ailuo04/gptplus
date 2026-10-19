@@ -1430,6 +1430,110 @@ test('ipc: 模型开关和排序会持久化并返回最新状态', async () => 
   assert.deepEqual(store.get().modelOrder, [p.id + '::m2', p.id + '::m1']);
 });
 
+test('ipc: 模型可单独删除，同时清理排序与默认模型', async (t) => {
+  const { registerIpc } = require(path.join(CORE, 'ipc.js'));
+  const dir = tmpDir('ipc-model-delete');
+  cleanup(t, dir);
+  const store = createStore({ configPath: path.join(dir, 'config.json') });
+  const p = store.upsertProvider({ id: 'p_aaaaaaaa', name: '渠道 A', models: [{ id: 'm1' }, { id: 'm2' }] });
+  const other = store.upsertProvider({ id: 'p_bbbbbbbb', name: '渠道 B', models: [{ id: 'm3' }] });
+  store.update((draft) => {
+    draft.modelOrder = [p.id + '::m1', other.id + '::m3', p.id + '::m2'];
+    draft.inject.enabled = true;
+    draft.inject.defaultModel = '渠道-A__m1';
+  });
+  const channels = new Map();
+  let applied = [];
+  const ctx = {
+    paths: { CATALOG_PATH: path.join(dir, 'catalog.json') },
+    store,
+    catalog: { slugify: (a, b) => a + '__' + b },
+    codex: { applyInjection: (patch) => { applied.push(patch); return { changed: false }; } },
+    providerClient: {},
+    models: () => [
+      { orderKey: p.id + '::m1', providerId: p.id, modelId: 'm1', slug: '渠道-A__m1', enabled: true },
+      { orderKey: p.id + '::m2', providerId: p.id, modelId: 'm2', slug: '渠道-A__m2', enabled: true },
+      { orderKey: other.id + '::m3', providerId: other.id, modelId: 'm3', slug: '渠道-B__m3', enabled: true },
+    ],
+    status: () => ({ inject: store.get().inject, gateway: { enabled: true, running: true } }),
+    gateway: {
+      getState: () => ({ running: true, port: 1, url: '', host: '127.0.0.1' }),
+      start: async () => ({}),
+      stop: async () => {},
+      on: () => () => {},
+    },
+    log: () => {},
+    syncInjection: () => ({ changed: false }),
+    markWrite: () => {},
+    onLogEvent: () => () => {},
+    emitStatus: () => {},
+  };
+  registerIpc({ ipcMain: { handle: (ch, fn) => channels.set(ch, fn) }, shell: {}, dialog: {}, ctx });
+
+  const status = await channels.get('gptplus:model:delete')({}, { providerId: p.id, modelId: 'm1' });
+  assert.deepEqual(store.getProvider(p.id).models.map((m) => m.id), ['m2'], '只删除目标模型');
+  assert.deepEqual(store.get().modelOrder, [other.id + '::m3', p.id + '::m2'], '排序里不能留下已删除模型的键');
+  assert.equal(store.get().inject.defaultModel, null, '默认模型指向被删模型时应清空，交给注入流程重新选');
+  assert.equal(store.get().inject.enabled, true, '还有其它启用模型时注入保持开启');
+  assert.ok(status && status.inject, '删除后应返回最新状态');
+
+  await assert.rejects(
+    () => channels.get('gptplus:model:delete')({}, { providerId: p.id, modelId: 'not-exist' }),
+    /模型不存在/,
+  );
+  await assert.rejects(
+    () => channels.get('gptplus:model:delete')({}, { providerId: 'p_missing', modelId: 'm2' }),
+    /提供商不存在/,
+  );
+  assert.equal(applied.length, 0, '没有任何扫描时不应写 Codex 配置');
+});
+
+test('ipc: 删除最后一个启用模型时自动还原官方模型而不是卡在空目录', async (t) => {
+  const { registerIpc } = require(path.join(CORE, 'ipc.js'));
+  const dir = tmpDir('ipc-model-delete-last');
+  cleanup(t, dir);
+  const store = createStore({ configPath: path.join(dir, 'config.json') });
+  const p = store.upsertProvider({ id: 'p_aaaaaaaa', name: '渠道 A', models: [{ id: 'only' }] });
+  store.update((draft) => {
+    draft.inject.enabled = true;
+    draft.inject.defaultModel = '渠道-A__only';
+    draft.inject.catalogPath = path.join(dir, 'catalog.json');
+  });
+  const channels = new Map();
+  const applied = [];
+  let markedWrite = 0;
+  const ctx = {
+    paths: { CATALOG_PATH: path.join(dir, 'catalog.json') },
+    store,
+    catalog: {},
+    codex: { applyInjection: (patch) => { applied.push(patch); return { changed: true }; } },
+    providerClient: {},
+    models: () => [
+      { orderKey: p.id + '::only', providerId: p.id, modelId: 'only', slug: '渠道-A__only', enabled: true },
+    ],
+    status: () => ({ inject: store.get().inject, gateway: { enabled: true, running: true } }),
+    gateway: {
+      getState: () => ({ running: true, port: 1, url: '', host: '127.0.0.1' }),
+      start: async () => ({}),
+      stop: async () => {},
+      on: () => () => {},
+    },
+    log: () => {},
+    syncInjection: () => { throw new Error('空目录不应再同步注入'); },
+    markWrite: () => { markedWrite += 1; },
+    onLogEvent: () => () => {},
+    emitStatus: () => {},
+  };
+  registerIpc({ ipcMain: { handle: (ch, fn) => channels.set(ch, fn) }, shell: {}, dialog: {}, ctx });
+
+  await channels.get('gptplus:model:delete')({}, { providerId: p.id, modelId: 'only' });
+  assert.deepEqual(store.getProvider(p.id).models, [], '模型确实被删除');
+  assert.equal(store.get().inject.enabled, false, '没有可注入模型时应关闭注入');
+  assert.equal(store.get().inject.defaultModel, null);
+  assert.deepEqual(applied, [{ enabled: false }], '应把客户端还原成官方模型');
+  assert.equal(markedWrite, 1, '还原写入也要记录到状态');
+});
+
 test('ipc: 主题偏好可持久化并广播最新状态', async (t) => {
   const { registerIpc } = require(path.join(CORE, 'ipc.js'));
   const dir = tmpDir('ipc-theme');

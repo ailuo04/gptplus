@@ -377,7 +377,7 @@ function modelTable(ctx, models, defaultModel) {
       el('span', { text: '状态' }),
       el('span', { text: '推理' }),
       el('span', { text: '默认' }),
-      el('span', { text: '排序' }),
+      el('span', { text: '操作' }),
     ]);
 
     const rows = visible.map((m, index) => {
@@ -419,7 +419,10 @@ function modelTable(ctx, models, defaultModel) {
         ]),
         el('div', { class: 'model-order-actions' }),
       ]);
-      row.lastElementChild.appendChild(dragHandle(ctx, row, visible, index));
+      row.lastElementChild.append(
+        deleteModelButton(ctx, m),
+        dragHandle(ctx, row, visible, index),
+      );
       return row;
     });
 
@@ -478,7 +481,7 @@ function modelTable(ctx, models, defaultModel) {
       rowsBox,
       el('div', {
         class: 'hint',
-        text: 'slug 形如 <渠道名>__<modelId>，网关按它反查上游提供商与真实模型名。按住任意模型行右侧把手拖动即可调序；状态开关和排序会立即保存。',
+        text: 'slug 形如 <渠道名>__<modelId>，网关按它反查上游提供商与真实模型名。按住任意模型行右侧把手拖动即可调序；状态开关、排序和删除会立即保存。',
       }),
     ]),
   ]);
@@ -535,6 +538,124 @@ function dragHandle(ctx, row, models, index) {
       pointerdown: (event) => beginModelDrag(ctx, event, row),
     },
   }, [el('span', { class: 'drag-grip', text: '::' })]);
+}
+
+function deleteModelButton(ctx, model) {
+  const { el, icon } = ctx;
+  return el('button', {
+    class: 'btn btn-icon btn-danger model-delete',
+    type: 'button',
+    disabled: viewState.busy ? true : null,
+    title: '删除该模型',
+    attrs: { 'aria-label': `删除模型 ${model.label || model.modelId}` },
+    on: { click: () => confirmDeleteModel(ctx, model) },
+  }, [icon('trash', 13)]);
+}
+
+/** 删除二次确认：说明会影响哪些地方，避免误删掉正在注入的模型。 */
+function confirmDeleteModel(ctx, model) {
+  const { el, icon, state } = ctx;
+  const inject = state.inject || (state.status && state.status.inject) || {};
+  const isDefault = inject.defaultModel === model.slug;
+  const sameProvider = (state.models || []).filter((item) => item.providerId === model.providerId);
+  const emptiesProvider = sameProvider.length <= 1;
+  const modelKeyOf = (item) => item.orderKey || `${item.providerId}::${item.modelId}`;
+  const lastEnabled = (state.models || []).every(
+    (item) => !item.enabled || modelKeyOf(item) === modelKeyOf(model),
+  );
+  let confirmBtn = null;
+  let busy = false;
+
+  const details = [
+    `「${model.label || model.modelId}」会从提供商「${model.providerName}」的模型列表中移除，其它模型不受影响。`,
+    isDefault ? '它当前是默认模型，删除后默认值会自动落到下一个启用的模型。' : '',
+    lastEnabled && inject.enabled
+      ? '这是最后一个启用模型：删除后没有模型可注入，ChatGPT 会还原成官方模型。'
+      : '',
+    '删除后如果想恢复，需要在提供商页重新添加这个模型 ID。',
+  ].filter(Boolean);
+
+  const run = async () => {
+    if (busy) return;
+    busy = true;
+    viewState.busy = true;
+    confirmBtn.disabled = true;
+    confirmBtn.classList.add('is-busy');
+    confirmBtn.lastElementChild.textContent = '删除中…';
+    try {
+      const wasInjected = !!inject.enabled;
+      const status = await ctx.api.deleteModel({ providerId: model.providerId, modelId: model.modelId });
+      if (status && typeof status === 'object') {
+        ctx.state.status = status;
+        if (status.inject) ctx.state.inject = { ...(ctx.state.inject || {}), ...status.inject };
+      }
+      const injectionDropped = wasInjected && status && status.inject && !status.inject.enabled;
+      ctx.closeModal();
+      // 注入开启时，目录和 Codex 配置都刚被改写（或已被还原），都要重启客户端才生效。
+      if (wasInjected) ctx.markRelaunchNeeded?.();
+      const name = model.label || model.modelId;
+      if (injectionDropped) {
+        ctx.toast(`已删除模型「${name}」，没有剩余启用模型，已还原 ChatGPT 官方模型`, 'warn');
+      } else {
+        ctx.toast(`已删除模型「${name}」`, 'ok');
+      }
+    } catch (err) {
+      ctx.toastError(err, '删除模型失败');
+    } finally {
+      busy = false;
+      viewState.busy = false;
+      if (confirmBtn) {
+        confirmBtn.disabled = false;
+        confirmBtn.classList.remove('is-busy');
+        confirmBtn.lastElementChild.textContent = '删除模型';
+      }
+      await ctx.reload('models', { preserveScrollTop: true });
+    }
+  };
+
+  confirmBtn = el('button', {
+    class: 'btn btn-danger',
+    type: 'button',
+    on: { click: () => void run() },
+  }, [icon('trash', 13), el('span', { text: '删除模型' })]);
+
+  const modal = el('section', {
+    class: 'modal model-delete-modal',
+    attrs: { role: 'dialog', 'aria-modal': 'true', 'aria-label': '删除模型' },
+  }, [
+    el('div', { class: 'modal-head' }, [
+      el('div', { class: 'grow' }, [
+        el('h2', { text: '删除模型' }),
+        el('div', { class: 'modal-sub', text: `${model.providerName || '提供商'} · ${model.modelId}` }),
+      ]),
+      el('button', {
+        class: 'btn btn-icon',
+        type: 'button',
+        title: '关闭',
+        attrs: { 'aria-label': '关闭' },
+        on: { click: () => ctx.closeModal() },
+      }, [icon('x', 15)]),
+    ]),
+    el('div', { class: 'modal-body' }, [
+      el('div', { class: 'note note-warn' }, [
+        icon('alert', 14),
+        el('div', {
+          class: 'grow',
+          text: lastEnabled && inject.enabled ? '这是最后一个启用模型，删除后注入会自动关闭' : '删除后不可恢复',
+        }),
+      ]),
+      el('div', { class: 'model-delete-reasons' }, details.map((text) => el('div', { class: 'hint', text }))),
+    ]),
+    el('div', { class: 'modal-foot' }, [
+      el('span', { class: 'hint', text: emptiesProvider ? '该提供商的模型列表将被清空' : '其它模型和提供商设置不受影响' }),
+      el('span', { class: 'right' }),
+      el('button', { class: 'btn btn-ghost', type: 'button', on: { click: () => ctx.closeModal() } }, [
+        el('span', { text: '取消' }),
+      ]),
+      confirmBtn,
+    ]),
+  ]);
+  ctx.openModal(modal);
 }
 
 /** 计算拖动项插入目标位置后的完整顺序。 */

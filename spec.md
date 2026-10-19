@@ -177,7 +177,7 @@ C:\ailuo_own\gpt++\
 
 例：`梦幻API__gpt-6.1-sol`。渠道名中的空格会规范成 `-`；同名渠道会追加稳定 provider id 以避免冲突。`modelId` 中允许 `.`、`-`、`_`；`__` 为分隔符，解析时按**第一个** `__` 切分。网关仍兼容旧的 `<providerId>__<modelId>` slug。`display_name` 用 `模型label (提供商名)`。
 
-模型整体显示顺序保存在 `modelOrder` 中，元素格式为 `<providerId>::<modelId>`；未记录的新模型自动追加到末尾。目录 `priority`、`context.models()` 和网关 `/v1/models` 均遵循该顺序。
+模型整体显示顺序保存在 `modelOrder` 中，元素格式为 `<providerId>::<modelId>`；未记录的新模型自动追加到末尾。目录 `priority`、`context.models()` 和网关 `/v1/models` 均遵循该顺序。删除模型时必须同时移除它在 `modelOrder` 里的键，否则会留下指向不存在模型的陈旧条目。
 
 > 注意：slug 必须避开官方模型名（如 `gpt-5.1-codex`）。客户端会用「slug 是否等于
 > 已知官方名」来决定请求的 wire 形状；自定义 slug 走经典形状，这是我们要的。
@@ -245,6 +245,9 @@ window.gptplus = {
 
   listModels(): Promise<ModelRef[]>;                    // 全部 provider 的全部模型（渠道名 slug 化，按 modelOrder）
   setModelEnabled(patch: { providerId: string; modelId: string; enabled: boolean }): Promise<Status>;
+  deleteModel(patch: { providerId: string; modelId: string }): Promise<Status>;
+                                                        // 删除单个模型：同步清掉 modelOrder 中的键与失效的默认模型；
+                                                        // 若删掉最后一个启用模型，自动关闭注入并还原官方模型
   moveModel(patch: { providerId: string; modelId: string; direction: 'up'|'down' }): Promise<Status>;
   getGateway(): Promise<{ enabled: boolean; running: boolean; port: number; url: string;
                           modelBase: string; token: string }>;

@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { normalizeModelLimits, normalizeTheme } = require('./store.js');
 const { normalizeBaseUrl } = require('./base-url.js');
+const { slugForProvider } = require('./model-utils.js');
 const { resolveChatGptExe } = require('./chatgpt-install.js');
 const { relaunchChatGpt } = require('./chatgpt-launch.js');
 
@@ -247,6 +248,66 @@ function registerIpc(deps) {
       return afterChange();
     } catch (err) {
       store.save(before);
+      throw err;
+    }
+  });
+
+  handle('gptplus:model:delete', ({ providerId, modelId } = {}) => {
+    const before = store.get();
+    const provider = store.getProvider(providerId);
+    if (!provider) throw new Error('提供商不存在');
+    const target = (provider.models || []).find((item) => item.id === modelId);
+    if (!target) throw new Error('模型不存在');
+
+    const key = providerId + '::' + modelId;
+    const deletedSlug = slugForProvider(provider, modelId, store.providers());
+    const remainingEnabled = ctx.models().filter((model) => model.orderKey !== key && model.enabled);
+
+    store.update((draft) => {
+      const item = (draft.providers || []).find((p) => p.id === providerId);
+      if (!item) throw new Error('提供商不存在');
+      item.models = (item.models || []).filter((model) => model.id !== modelId);
+      draft.modelOrder = (draft.modelOrder || []).filter((orderKey) => orderKey !== key);
+      if (draft.inject.defaultModel === deletedSlug) draft.inject.defaultModel = null;
+    });
+
+    try {
+      // 删掉最后一个启用模型时目录会变空，客户端遇到空目录会静默回退，
+      // 同步注入也必然失败。与其把删除回滚回去，不如像手动关闭注入一样
+      // 还原官方模型，让用户想删的模型真的被删掉。
+      if (before.inject.enabled && remainingEnabled.length === 0) {
+        store.update((draft) => {
+          draft.inject.enabled = false;
+          draft.inject.catalogPath = null;
+          draft.inject.defaultModel = null;
+        });
+        ctx.codex.applyInjection({ enabled: false });
+        ctx.markWrite(true);
+        ctx.log({
+          level: 'warn',
+          msg: `已删除模型「${target.label || modelId}」；没有剩余启用模型，已还原 ChatGPT 官方模型`,
+          providerId,
+          model: modelId,
+        });
+        return publish();
+      }
+      const status = afterChange();
+      ctx.log({
+        level: 'warn',
+        msg: `已删除模型「${target.label || modelId}」: ${key}`,
+        providerId,
+        model: modelId,
+      });
+      return status;
+    } catch (err) {
+      store.save(before);
+      if (before.inject.enabled) {
+        try {
+          ctx.syncInjection({ apply: true });
+        } catch (restoreErr) {
+          ctx.log({ level: 'error', msg: '模型删除已回滚，但注入状态恢复失败: ' + restoreErr.message });
+        }
+      }
       throw err;
     }
   });

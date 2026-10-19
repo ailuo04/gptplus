@@ -104,10 +104,10 @@ app.whenReady().then(async () => {
         await run((t) => { document.documentElement.dataset.theme = t; }, theme);
         for (const [width, height] of [[1440, 900], [940, 620]]) {
           win.setContentSize(width, height);
-          for (const view of ['providers', 'models', 'usage', 'settings']) {
+          for (const view of ['home', 'providers', 'models', 'usage', 'settings']) {
             await run((v) => document.querySelector(`[data-view="${v}"]`).click(), view);
             await wait(650);
-            const expectedTitle = { providers: '\u63d0\u4f9b\u5546', models: '\u6a21\u578b', usage: '\u4f7f\u7528\u91cf', settings: '\u8bbe\u7f6e' }[view];
+            const expectedTitle = { home: '\u4e3b\u9875', providers: '\u63d0\u4f9b\u5546', models: '\u6a21\u578b', usage: '\u4f7f\u7528\u91cf', settings: '\u8bbe\u7f6e' }[view];
             assert.equal(await run(() => document.querySelector('#view-title').textContent), expectedTitle);
             await win.webContents.executeJavaScript('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
             await wait(300);

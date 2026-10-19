@@ -31,7 +31,7 @@ const APP = path.join(RENDERER, 'app.js');
 const HTML = path.join(RENDERER, 'index.html');
 const CSS = path.join(RENDERER, 'styles.css');
 
-const VIEW_FILES = ['providers.js', 'models.js', 'usage.js', 'settings.js'];
+const VIEW_FILES = ['home.js', 'providers.js', 'models.js', 'usage.js', 'settings.js'];
 const JS_FILES = ['app.js', ...VIEW_FILES.map((f) => path.join('views', f))];
 
 function read(file) {
@@ -137,12 +137,13 @@ test('app.js 引用的每个 DOM id 都存在于 index.html', () => {
 test('导航项与 app.js 的视图表一一对应', () => {
   const html = read(HTML);
   const navViews = [...html.matchAll(/data-view="([^"]+)"/g)].map((m) => m[1]).sort();
-  assert.deepEqual(navViews, ['models', 'providers', 'settings', 'usage'], '导航视图应与页面实现一致');
+  assert.deepEqual(navViews, ['home', 'models', 'providers', 'settings', 'usage'], '导航视图应与页面实现一致');
 
   const src = read(APP);
   const metaBlock = src.slice(src.indexOf('const VIEW_META'), src.indexOf('function renderChrome'));
   const metaViews = [...metaBlock.matchAll(/^\s{2}([a-z]+):\s*\{/gm)].map((m) => m[1]).sort();
   assert.deepEqual(metaViews, navViews, 'VIEW_META 的键必须与导航的 data-view 完全一致');
+  assert.match(src, /view: 'home'/, '主页应是默认打开的第一个视图');
 });
 
 test('重启 ChatGPT 是侧栏全局动作，而不是某个页面的局部动作', () => {
@@ -285,6 +286,7 @@ test('app.js 从 views 导入的每个符号都真实存在且被调用', () => 
 
 test('视图渲染函数的签名统一为 (root, ctx, actions)', () => {
   const expected = [
+    ['home.js', 'renderHome'],
     ['providers.js', 'renderProviders'],
     ['models.js', 'renderModels'],
     ['usage.js', 'renderUsage'],
@@ -430,6 +432,15 @@ test('styles.css 里用到的 CSS 变量都有定义', () => {
   assert.deepEqual(missing, [], `styles.css 引用了未定义的变量：${missing.join(', ')}`);
 });
 
+test('禁用的主按钮悬停时不会回落成浅色底配浅色字', () => {
+  const css = read(CSS);
+  // 通用禁用态把背景改成中性面板色，但 .btn-primary 的文字色是 --on-accent（近白），
+  // 两者叠加会让按钮在悬停时变成一块空白。主按钮必须覆盖掉这条回落。
+  assert.match(css, /\.btn\[disabled\]:hover[^{]*\{[^}]*background:\s*var\(--bg-panel-2\)/s, '禁用态悬停应保留中性底色回落');
+  const primaryDisabled = css.match(/\.btn-primary\[disabled\]:hover[^{]*\{([^}]*)\}/s)?.[1] || '';
+  assert.match(primaryDisabled, /background:\s*var\(--accent\)/, '主按钮禁用悬停时背景必须保持主色，避免文字消失');
+});
+
 test('页面切换只使用单一内容区的短淡入，不创建占位层或双层路由图层', () => {
   const css = read(CSS);
   const stageRule = css.match(/\.page-stage\s*\{([^}]*)\}/s)?.[1] || '';
@@ -566,6 +577,7 @@ test('渲染层模块可以在无 DOM 环境下 import（顶层无副作用）',
           assert.equal(typeof mod[name], 'function', `providers.js 缺少导出 ${name}`);
         }
       }
+      if (rel === 'views/home.js') assert.equal(typeof mod.renderHome, 'function');
       if (rel === 'views/models.js') assert.equal(typeof mod.renderModels, 'function');
       if (rel === 'views/settings.js') assert.equal(typeof mod.renderSettings, 'function');
     }
@@ -889,6 +901,24 @@ test('模型换序成功不重建页面，失败时保留滚动位置恢复', ()
   assert.match(finishFn, /applyModelOrderToState\(ctx, nextKeys\)/, '保存成功后应直接同步当前内存顺序');
   assert.match(finishFn, /let saved = false/, '拖动保存流程需要区分保存成功与失败');
   assert.match(finishFn, /saved = true/, '保存成功后应标记为已保存');
+});
+
+test('刷新模型列表时必须同步提供商快照，避免渠道卡片残留已删除的模型', () => {
+  const appSrc = read(APP);
+  const planStart = appSrc.indexOf('const RELOAD_PLAN = {');
+  const planEnd = appSrc.indexOf('\n};', planStart);
+  assert.ok(planStart >= 0 && planEnd > planStart, '应能定位 RELOAD_PLAN');
+  const plan = appSrc.slice(planStart, planEnd);
+  // 数组项本身含 []（[loadModels, '模型列表']），不能用非贪婪到第一个 ] 匹配。
+  const modelsStart = plan.indexOf('models: [');
+  const modelsEnd = plan.indexOf('\n  ],', modelsStart);
+  assert.ok(modelsStart >= 0 && modelsEnd > modelsStart, 'RELOAD_PLAN 应包含 models 条目');
+  const modelsBlock = plan.slice(modelsStart, modelsEnd);
+  assert.match(
+    modelsBlock,
+    /loadProviders/,
+    '模型页的写操作（删除/启停/排序）也会改动提供商内部模型，刷新时必须一并重拉提供商列表',
+  );
 });
 
 test('状态广播不重建当前页面，避免修改配置时整页闪烁', () => {
@@ -1244,6 +1274,13 @@ function makeApi(state, calls) {
       };
     },
     listModels: async () => state.models,
+    deleteModel: async ({ providerId, modelId }) => {
+      calls.push(['deleteModel', { providerId, modelId }]);
+      state.models = state.models.filter(
+        (model) => !(model.providerId === providerId && model.modelId === modelId),
+      );
+      return state.status;
+    },
     getModelLimits: async () => state.modelLimits,
     setModelLimits: async (patch) => {
       calls.push(['setModelLimits', patch]);
@@ -1319,6 +1356,12 @@ function makeCtx(mod, state, log) {
     toastError: (err, fallback) => calls.push(['toastError', fallback]),
     logLocal: (level, msg) => calls.push(['log', level, msg]),
     markRelaunchNeeded: () => { state.relaunchNeeded = true; calls.push(['markRelaunchNeeded']); },
+    // app.js 通过 ctx 暴露全局重启流程；首屏「下一步」按钮复用它，避免复制状态机。
+    relaunchChatGpt: async () => {
+      calls.push(['relaunchChatGpt']);
+      state.relaunchNeeded = false;
+      return true;
+    },
     copyText: async () => true,
     navigate: (view) => calls.push(['navigate', view]),
     reload: async () => {},
@@ -1330,7 +1373,7 @@ function makeCtx(mod, state, log) {
     },
     closeModal: () => true,
     isModalOpen: () => false,
-    openProviderForm: () => {},
+    openProviderForm: (providerId) => calls.push(['openProviderForm', providerId ?? null]),
     closeProviderForm: () => {},
     _calls: calls,
   };
@@ -1536,6 +1579,188 @@ test('三个页面与提供商表单能在 DOM 替身上真实渲染', async () 
 // ============================================================
 // 10. 交互路径：按钮点击真的会走到对应的 IPC
 // ============================================================
+test('主页：三段接线、今日流量与注入开关都来自真实状态', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const homeMod = await import(pathToFileURL(path.join(tmp, 'views', 'home.js')).href);
+    installFakeDom();
+
+    const today = new Date();
+    today.setHours(10, 0, 0, 0);
+    const state = fixtureState({
+      logs: [
+        { at: today.getTime(), providerId: 'p_demo0001', providerName: '梦幻API', model: 'a__m', status: 200, ms: 120, tokens: { input_tokens: 600, output_tokens: 400, total_tokens: 1000 } },
+        { at: today.getTime() - 3600000, providerId: 'p_demo0001', providerName: '梦幻API', model: 'a__m', status: 502, ms: 80 },
+      ],
+      relaunchNeeded: false,
+    });
+    const ctx = makeCtx(appMod, state);
+    const root = new FakeNode('main');
+    const actions = new FakeNode('div');
+    homeMod.renderHome(root, ctx, actions);
+
+    const text = root.allText();
+    assert.match(text, /1 · 提供商/, '首屏必须有提供商节点');
+    assert.match(text, /2 · 本地网关/, '首屏必须有本地网关节点');
+    assert.match(text, /3 · ChatGPT 客户端/, '首屏必须有 ChatGPT 客户端节点');
+    assert.match(text, /2 个/, '提供商节点应显示真实数量');
+    assert.match(text, /运行中 :18120/, '网关节点应显示运行状态与端口');
+    assert.match(text, /127\.0\.0\.1:18120/, '网关节点应显示本地地址');
+    assert.match(text, /已注入 2 个模型/, '客户端节点应显示已注入数量');
+    assert.match(text, /链路畅通/, '三段都通时应给出链路状态');
+    assert.match(text, /1\.00K/, '今日流量应汇总当天 Token');
+    assert.match(text, /成功率/, '今日流量应展示成功率');
+    assert.match(text, /50%/, '今日成功率应包含失败请求');
+    assert.match(text, /梦幻API/, '提供商清单应列出真实提供商');
+    assert.equal(root.find('switch').length, 1, '首屏只应有一个注入总开关');
+    assert.equal(root.find('switch')[0].getAttribute('aria-checked'), 'true', '注入开启时开关应处于开态');
+
+    // 主按钮 = 添加提供商；注入开关走 setInject
+    click(buttonsWithText(actions, '添加提供商')[0]);
+    assert.ok(ctx._calls.some((call) => call[0] === 'openProviderForm'), '顶部主按钮应打开新建提供商表单');
+    click(root.find('switch')[0]);
+    await flush();
+    assert.deepEqual(callsOf(ctx, 'setInject'), [['setInject', { enabled: false }]], '注入开关应调用 setInject');
+
+    // 网关未运行时打开注入应被拦下，并引导到设置页
+    const blockedState = fixtureState({
+      gateway: { enabled: true, running: false, port: 18120, url: '', modelBase: '127.0.0.1:18120', token: '' },
+      inject: { enabled: false, catalogPath: null, defaultModel: null },
+      status: {
+        ...fixtureState().status,
+        gateway: { enabled: true, running: false, port: 18120, url: '', startedAt: null },
+        inject: { enabled: false, catalogPath: null, defaultModel: null },
+      },
+    });
+    const blocked = makeCtx(appMod, blockedState);
+    const blockedRoot = new FakeNode('main');
+    homeMod.renderHome(blockedRoot, blocked, new FakeNode('div'));
+    assert.match(blockedRoot.allText(), /等待接通/, '未全通时应显示等待接通');
+    click(blockedRoot.find('switch')[0]);
+    await flush();
+    assert.equal(callsOf(blocked, 'setInject').length, 0, '网关未运行时不得注入');
+    assert.ok(blocked._calls.some((call) => call[0] === 'navigate' && call[1] === 'settings'), '应把用户带到网关设置');
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('主页「下一步」：配置待生效时给的是重启 ChatGPT，而不是跳模型页', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const homeMod = await import(pathToFileURL(path.join(tmp, 'views', 'home.js')).href);
+    installFakeDom();
+
+    // 三段都通 + 配置待生效：黄条应出现，并且动作是真正的重启。
+    const state = fixtureState({ relaunchNeeded: true });
+    const ctx = makeCtx(appMod, state);
+    const root = new FakeNode('main');
+    homeMod.renderHome(root, ctx, new FakeNode('div'));
+
+    const strip = root.find('home-next');
+    assert.equal(strip.length, 1, '配置待生效时必须显示「下一步」提示条');
+    assert.match(strip[0].allText(), /配置已修改，需要重启 ChatGPT 客户端后生效/, '提示条文案必须说明为什么要重启');
+
+    const action = strip[0].find('home-next-action');
+    assert.equal(action.length, 1, '提示条里应有唯一的操作按钮');
+    assert.match(action[0].textContent, /重启 ChatGPT/, '按钮文案必须是重启 ChatGPT');
+    assert.doesNotMatch(action[0].textContent, /去模型页/, '不能再把用户带去模型页');
+    // 语义色跟着警告走：黄色提示条里的主操作不再使用蓝色 accent。
+    const actionClass = String(action[0].className);
+    assert.match(actionClass, /btn-warning/, '重启动作应使用警告语义按钮');
+    assert.doesNotMatch(actionClass, /btn-accent/, '重启动作不应再是蓝色强调按钮');
+
+    // 第一次点击只进入确认态，绝不立刻杀进程。
+    click(action[0]);
+    await flush();
+    assert.equal(callsOf(ctx, 'relaunchChatGpt').length, 0, '首次点击只能进入确认态，不能立刻重启');
+    assert.match(action[0].textContent, /确认重启/, '首次点击后按钮应变为确认态');
+    assert.equal(action[0].disabled, false, '确认态按钮仍可点击');
+
+    // 第二次点击才真正重启，并且走 app.js 的全局流程（不重复实现 IPC）。
+    click(action[0]);
+    await flush();
+    assert.equal(callsOf(ctx, 'relaunchChatGpt').length, 1, '确认后必须调用全局重启入口');
+    assert.equal(callsOf(ctx, 'navigate').filter((call) => call[1] === 'models').length, 0, '重启动作不应跳转到模型页');
+    assert.equal(state.relaunchNeeded, false, '重启成功后待重启状态应清除');
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('主页「下一步」：重启失败时提示条保留、按钮恢复可点', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const homeMod = await import(pathToFileURL(path.join(tmp, 'views', 'home.js')).href);
+    installFakeDom();
+
+    const state = fixtureState({ relaunchNeeded: true });
+    const ctx = makeCtx(appMod, state);
+    ctx.relaunchChatGpt = async () => {
+      ctx._calls.push(['relaunchChatGpt']);
+      state.relaunchNeeded = true; // 失败：配置仍未生效
+      return false;
+    };
+    const root = new FakeNode('main');
+    homeMod.renderHome(root, ctx, new FakeNode('div'));
+    const action = root.find('home-next-action')[0];
+
+    click(action);
+    await flush();
+    click(action);
+    await flush();
+
+    assert.equal(callsOf(ctx, 'relaunchChatGpt').length, 1, '失败路径也必须只调用一次重启');
+    assert.equal(action.disabled, false, '重启失败后按钮必须恢复可点');
+    assert.match(action.textContent, /重启 ChatGPT/, '重启失败后按钮文案必须回到「重启 ChatGPT」');
+    assert.equal(state.relaunchNeeded, true, '重启失败后配置仍未生效，必须保持待重启状态');
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('侧栏重启成功后主页黄条也要立即消失', () => {
+  const appSrc = read(APP);
+  const start = appSrc.indexOf('function renderRelaunchState()');
+  const end = appSrc.indexOf('\n}', start);
+  assert.ok(start >= 0 && end > start, '应能定位待重启状态重绘函数');
+  const body = appSrc.slice(start, end);
+  // 主页首屏同样展示 relaunchNeeded：只重绘设置页会让黄条一直挂着，
+  // 用户在侧栏重启成功后仍看到「配置已修改」。
+  assert.match(body, /state\.view === 'home'/, '侧栏重启后必须重绘主页，黄条才会消失');
+  assert.match(body, /renderCurrent\(/, '必须触发当前页面重绘');
+});
+
+test('黄条样式：实心琥珀底 + 左侧强调边，双主题各有独立令牌', () => {
+  const cssSrc = read(path.join(ROOT, 'src/renderer/styles.css'));
+  const dark = cssSrc.slice(cssSrc.indexOf(':root {'), cssSrc.indexOf('html[data-theme="light"]'));
+  const lightStart = cssSrc.indexOf('html[data-theme="light"]');
+  const light = cssSrc.slice(lightStart, lightStart + 6000);
+  for (const [label, block] of [['深色', dark], ['浅色', light]]) {
+    for (const token of ['--notice-warn-bg', '--notice-warn-line', '--notice-warn-text', '--notice-warn-edge']) {
+      assert.match(block, new RegExp(`${token}:`), `${label}主题必须定义 ${token}`);
+    }
+  }
+  const strip = cssSrc.slice(cssSrc.indexOf('.home-next {'));
+  assert.match(strip, /background:\s*var\(--notice-warn-bg\)/, '提示条应使用更实的琥珀底色');
+  assert.match(strip, /border:\s*1px solid var\(--notice-warn-line\)/, '提示条应有更明显的描边');
+  assert.match(strip, /box-shadow:\s*inset 3px 0 0 var\(--notice-warn-edge\)/, '提示条应有左侧强调边');
+  assert.match(strip, /\.home-next-text \{[^}]*font-weight:\s*(?:5[5-9]0|6\d0)/, '提示文字必须加粗到能一眼看见');
+  assert.match(strip, /\.home-next \.home-next-action \{[^}]*background:\s*var\(--notice-warn-bg-hover\)/, '重启按钮要有实心琥珀底');
+});
+
 function findNodes(root, predicate) {
   const out = [];
   const walk = (node) => {
@@ -1747,12 +1972,20 @@ test('提供商页：测试连接 / 删除 / 保存 / 从 /models 拉取都能�
     const probeToast = ctx._calls.find((c) => c[0] === 'toast' && String(c[2]).includes('模型测试：1/1 通过'));
     assert.ok(probeToast, '测试完成应给出模型通过数量');
 
-    // --- 删除（两步确认）---
+    // --- 删除（弹窗二次确认）---
     click(byAttr(root, 'title', '删除该提供商')[0]);
-    const afterFirstClick = new FakeNode('main');
-    providersMod.renderProviders(afterFirstClick, ctx, new FakeNode('div'));
-    assert.match(afterFirstClick.allText(), /确认删除「梦幻API」/, '删除需要二次确认');
-    click(buttonsWithText(afterFirstClick, '确认删除')[0]);
+    const deleteModal = ctx._calls.filter((c) => c[0] === 'openModal').pop()[1];
+    assert.ok(deleteModal, '点删除卡片按钮应弹出确认弹窗，而不是在卡片内联展开');
+    assert.match(deleteModal.allText(), /删除提供商/, '弹窗标题应写明删除提供商');
+    assert.match(deleteModal.allText(), /梦幻API/, '弹窗应显示要删除的提供商名');
+    assert.match(deleteModal.allText(), /2 个模型会一起删除/, '弹窗应说明连带删除的模型数量');
+    assert.equal(callsOf(ctx, 'deleteProvider').length, 0, '弹窗出现时还不能真的删除');
+    click(buttonsWithText(deleteModal, '取消')[0]);
+    assert.equal(callsOf(ctx, 'deleteProvider').length, 0, '取消后不应删除');
+
+    click(byAttr(root, 'title', '删除该提供商')[0]);
+    const confirmModal = ctx._calls.filter((c) => c[0] === 'openModal').pop()[1];
+    click(buttonsWithText(confirmModal, '删除提供商')[0]);
     await flush();
     assert.deepEqual(callsOf(ctx, 'deleteProvider'), [['deleteProvider', 'p_demo0001']], '确认后应调用 deleteProvider');
 
@@ -1792,6 +2025,12 @@ test('提供商页：测试连接 / 删除 / 保存 / 从 /models 拉取都能�
     const values = modal.findTag('input').map((n) => n.value);
     assert.ok(values.includes('deepseek-v4'), '拉取到的新模型应填进表单');
     assert.equal(values.filter((v) => v === 'gpt-6.1-sol').length, 1, '已存在的模型不应重复添加');
+    // 拉取成功后的收尾提示同样要用到表单引用（refs.note）：漏传会让成功路径被 catch 成红色报错
+    const pullErrors = formCtx._calls.filter(
+      (c) => (c[0] === 'toast' && c[1] === 'error') || c[0] === 'toastError',
+    );
+    assert.deepEqual(pullErrors, [], '拉取成功后不应再弹出任何错误提示');
+    assert.match(modal.allText(), /已从 \/models 合并 2 个模型/, '成功提示应写进表单顶部');
     providersMod.closeProviderForm();
   } finally {
     delete globalThis.document;
@@ -1874,6 +2113,93 @@ test('模型页：网关没运行时注入开关被拦下，并给出指引', as
     await flush();
     assert.deepEqual(callsOf(ok, 'setInject')[1], ['setInject', { defaultModel: 'p_demo0001__claude-x' }]);
 
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('模型页：任意模型都能从行内删除，且要经过二次确认', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const modelsMod = await import(pathToFileURL(path.join(tmp, 'views', 'models.js')).href);
+    installFakeDom();
+
+    const state = fixtureState();
+    const ctx = makeCtx(appMod, state);
+    const root = new FakeNode('main');
+    modelsMod.renderModels(root, ctx, new FakeNode('div'));
+
+    const deleteButtons = root.find('model-delete');
+    assert.equal(deleteButtons.length, 3, '每个模型行都必须有删除入口，包括已停用的模型');
+    assert.equal(
+      deleteButtons.some((btn) => btn.disabled),
+      false,
+      '正常状态下删除按钮不能被禁用',
+    );
+
+    // 第一次点击只弹确认框，不直接删
+    click(deleteButtons[0]);
+    const modalCall = callsOf(ctx, 'openModal')[0];
+    assert.ok(modalCall, '点击删除应先打开确认弹窗');
+    const modalText = modalCall[1].allText();
+    assert.match(modalText, /删除模型/, '弹窗标题要明确是删除模型');
+    assert.match(modalText, /其它模型和提供商设置不受影响/, '要说明影响范围');
+    assert.equal(callsOf(ctx, 'deleteModel').length, 0, '未确认前不得调用删除 API');
+
+    // 取消不产生任何删除
+    click(buttonsWithText(modalCall[1], '取消')[0]);
+    assert.equal(callsOf(ctx, 'deleteModel').length, 0, '取消后不应删除');
+
+    // 确认后才调用 API
+    click(deleteButtons[1]);
+    const confirmModal = callsOf(ctx, 'openModal')[1][1];
+    click(buttonsWithText(confirmModal, '删除模型')[0]);
+    await flush();
+    assert.deepEqual(
+      callsOf(ctx, 'deleteModel'),
+      [['deleteModel', { providerId: 'p_demo0001', modelId: 'claude-x' }]],
+      '确认后应按 providerId + modelId 精确删除',
+    );
+    assert.ok(
+      ctx._calls.some((c) => c[0] === 'toast' && String(c[2]).includes('已删除模型')),
+      '删除成功要有提示',
+    );
+
+    // 删除默认模型时，弹窗要说明默认值会转移
+    const defaultCtx = makeCtx(appMod, fixtureState());
+    const defaultRoot = new FakeNode('main');
+    modelsMod.renderModels(defaultRoot, defaultCtx, new FakeNode('div'));
+    click(defaultRoot.find('model-delete')[0]);
+    assert.match(
+      callsOf(defaultCtx, 'openModal')[0][1].allText(),
+      /当前是默认模型/,
+      '删除默认模型要提前说明默认值会落到别的模型',
+    );
+
+    // 最后一个启用模型：删除后注入会被关闭，弹窗必须提前说明
+    const onlyOne = fixtureState({
+      models: [
+        { slug: 'p_demo0002__qwen3', providerId: 'p_demo0002', providerName: '本地 Ollama', modelId: 'qwen3', label: 'Qwen3', enabled: true, reasoning: false },
+      ],
+      inject: { enabled: true, catalogPath: 'C:\\Users\\ailuo\\.gptplus\\model-catalog.json', defaultModel: 'p_demo0002__qwen3' },
+      status: {
+        ...fixtureState().status,
+        inject: { enabled: true, catalogPath: 'C:\\Users\\ailuo\\.gptplus\\model-catalog.json', defaultModel: 'p_demo0002__qwen3' },
+      },
+    });
+    const lastCtx = makeCtx(appMod, onlyOne);
+    const lastRoot = new FakeNode('main');
+    modelsMod.renderModels(lastRoot, lastCtx, new FakeNode('div'));
+    click(lastRoot.find('model-delete')[0]);
+    assert.match(
+      callsOf(lastCtx, 'openModal')[0][1].allText(),
+      /最后一个启用模型/,
+      '删除最后一个启用模型必须提示注入会被关闭',
+    );
   } finally {
     delete globalThis.document;
     delete globalThis.window;

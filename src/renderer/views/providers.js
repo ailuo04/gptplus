@@ -6,7 +6,6 @@ const API_LABELS = { openai: 'OpenAI 兼容', responses: 'Responses 透传', ant
 
 // 视图级临时状态（跨重渲染保留）
 const viewState = {
-  pendingDelete: null,
   testing: {},
   probe: {},
   revealed: {},
@@ -192,46 +191,29 @@ function providerCard(ctx, p) {
   ]);
 
   // 底部动作
-  const foot = el('div', { class: 'pcard-foot' });
-  if (viewState.pendingDelete === p.id) {
-    foot.append(
-      el('span', { class: 'probe-bad', text: `确认删除「${p.name}」？它的 ${models.length} 个模型会同时从 ChatGPT 清单里移除。` }),
-      el('span', { class: 'right' }),
-      el('button', {
-        class: 'btn btn-sm btn-ghost',
-        type: 'button',
-        on: { click: () => { viewState.pendingDelete = null; ctx.renderCurrent(true); } },
-      }, [el('span', { text: '取消' })]),
-      el('button', {
-        class: 'btn btn-sm btn-danger',
-        type: 'button',
-        on: { click: () => removeProvider(ctx, p) },
-      }, [icon('trash', 13), el('span', { text: '确认删除' })]),
-    );
-  } else {
-    foot.append(
-      el('button', {
-        class: 'btn btn-sm btn-success' + (viewState.testing[p.id] ? ' is-busy' : ''),
-        type: 'button',
-        disabled: viewState.testing[p.id] ? true : null,
-        title: models.length ? '选择要测试的模型，并逐个检查实际生成请求' : '请求该提供商的 /models 检查接口连通性',
-        on: { click: () => (models.length ? openModelTestDialog(ctx, p) : testProvider(ctx, p)) },
-      }, [icon('activity', 13), el('span', { text: viewState.testing[p.id] ? '测试中…' : '测试连接' })]),
-      el('button', {
-        class: 'btn btn-sm',
-        type: 'button',
-        on: { click: () => openProviderForm(ctx, p.id) },
-      }, [icon('pencil', 13), el('span', { text: '编辑' })]),
-      el('button', {
-        class: 'btn btn-sm btn-danger right',
-        type: 'button',
-        title: '删除该提供商',
-        on: { click: () => { viewState.pendingDelete = p.id; ctx.renderCurrent(true); } },
-      }, [icon('trash', 13)]),
-    );
-    if (probe) {
-      foot.append(probeResult(ctx, p, probe));
-    }
+  const foot = el('div', { class: 'pcard-foot' }, [
+    el('button', {
+      class: 'btn btn-sm btn-success' + (viewState.testing[p.id] ? ' is-busy' : ''),
+      type: 'button',
+      disabled: viewState.testing[p.id] ? true : null,
+      title: models.length ? '选择要测试的模型，并逐个检查实际生成请求' : '请求该提供商的 /models 检查接口连通性',
+      on: { click: () => (models.length ? openModelTestDialog(ctx, p) : testProvider(ctx, p)) },
+    }, [icon('activity', 13), el('span', { text: viewState.testing[p.id] ? '测试中…' : '测试连接' })]),
+    el('button', {
+      class: 'btn btn-sm',
+      type: 'button',
+      on: { click: () => openProviderForm(ctx, p.id) },
+    }, [icon('pencil', 13), el('span', { text: '编辑' })]),
+    el('button', {
+      class: 'btn btn-sm btn-danger right',
+      type: 'button',
+      title: '删除该提供商',
+      attrs: { 'aria-label': `删除提供商 ${p.name}` },
+      on: { click: () => confirmDeleteProvider(ctx, p) },
+    }, [icon('trash', 13)]),
+  ]);
+  if (probe) {
+    foot.append(probeResult(ctx, p, probe));
   }
 
   return el('article', { class: 'card pcard' + (isOn ? '' : ' is-off') }, [
@@ -481,20 +463,98 @@ function openModelTestDialog(ctx, p) {
   ctx.openModal(modal, {});
 }
 
-async function removeProvider(ctx, p) {
-  viewState.pendingDelete = null;
-  try {
-    const list = await ctx.api.deleteProvider(p.id);
-    ctx.state.providers = list;
-    delete viewState.probe[p.id];
-    delete viewState.revealed[p.id];
-    markRelaunchIfInjected(ctx);
-    ctx.toast(`已删除「${p.name}」`, 'ok');
-    await ctx.reload('providers');
-  } catch (err) {
-    ctx.toastError(err, '删除失败');
-    ctx.renderCurrent(true);
-  }
+/** 删除二次确认：说明会连带移除哪些模型，避免误删正在注入的提供商。 */
+function confirmDeleteProvider(ctx, p) {
+  const { el, icon } = ctx;
+  const models = p.models || [];
+  const enabledModels = models.filter((m) => m.enabled !== false);
+  const inject = ctx.state.inject || (ctx.state.status && ctx.state.status.inject) || {};
+  const lastProvider = (ctx.state.providers || []).length <= 1;
+  let confirmBtn = null;
+  let busy = false;
+
+  const details = [
+    `「${p.name}」的 ${models.length} 个模型会一起删除，并从 ChatGPT 清单里移除。`,
+    inject.enabled
+      ? `当前已开启注入：删除后目录会重写，需要重启 ChatGPT 才会生效${lastProvider ? '；这是最后一个提供商，删除后 ChatGPT 会还原成官方模型' : ''}。`
+      : '',
+    lastProvider ? '这是最后一个提供商，删除后界面会回到没有任何提供商的初始状态。' : '',
+    '删除后如果想恢复，需要重新填写 Base URL、API Key 和模型清单。',
+  ].filter(Boolean);
+
+  const run = async () => {
+    if (busy) return;
+    busy = true;
+    confirmBtn.disabled = true;
+    confirmBtn.classList.add('is-busy');
+    confirmBtn.lastElementChild.textContent = '删除中…';
+    try {
+      const list = await ctx.api.deleteProvider(p.id);
+      ctx.state.providers = list;
+      delete viewState.probe[p.id];
+      delete viewState.revealed[p.id];
+      markRelaunchIfInjected(ctx);
+      ctx.closeModal();
+      ctx.toast(`已删除「${p.name}」`, 'ok');
+      await ctx.reload('providers');
+    } catch (err) {
+      ctx.toastError(err, '删除失败');
+      ctx.renderCurrent(true);
+    } finally {
+      busy = false;
+      if (confirmBtn) {
+        confirmBtn.disabled = false;
+        confirmBtn.classList.remove('is-busy');
+        confirmBtn.lastElementChild.textContent = '删除提供商';
+      }
+    }
+  };
+
+  confirmBtn = el('button', {
+    class: 'btn btn-danger',
+    type: 'button',
+    on: { click: () => void run() },
+  }, [icon('trash', 13), el('span', { text: '删除提供商' })]);
+
+  const modal = el('section', {
+    class: 'modal provider-delete-modal',
+    attrs: { role: 'dialog', 'aria-modal': 'true', 'aria-label': '删除提供商' },
+  }, [
+    el('div', { class: 'modal-head' }, [
+      el('div', { class: 'grow' }, [
+        el('h2', { text: '删除提供商' }),
+        el('div', { class: 'modal-sub', text: `${p.name || '(未命名)'} · ${p.baseUrl || '未填写 Base URL'}` }),
+      ]),
+      el('button', {
+        class: 'btn btn-icon',
+        type: 'button',
+        title: '关闭',
+        attrs: { 'aria-label': '关闭' },
+        on: { click: () => ctx.closeModal() },
+      }, [icon('x', 15)]),
+    ]),
+    el('div', { class: 'modal-body' }, [
+      el('div', { class: 'note note-warn' }, [
+        icon('alert', 14),
+        el('div', {
+          class: 'grow',
+          text: enabledModels.length
+            ? `${enabledModels.length} 个启用模型将同时从 ChatGPT 清单移除`
+            : '删除后不可恢复',
+        }),
+      ]),
+      el('div', { class: 'model-delete-reasons' }, details.map((text) => el('div', { class: 'hint', text }))),
+    ]),
+    el('div', { class: 'modal-foot' }, [
+      el('span', { class: 'hint', text: '删除后不可恢复' }),
+      el('span', { class: 'right' }),
+      el('button', { class: 'btn btn-ghost', type: 'button', on: { click: () => ctx.closeModal() } }, [
+        el('span', { text: '取消' }),
+      ]),
+      confirmBtn,
+    ]),
+  ]);
+  ctx.openModal(modal);
 }
 
 // ============ 编辑表单 ============
@@ -769,17 +829,15 @@ export function openProviderForm(ctx, providerId = null) {
 
   const body = el('div', { class: 'modal-body' }, [
     noteBox,
-    el('div', { class: 'field-row' }, [
-      el('div', { class: 'field' }, [
-        el('label', { class: 'label' }, [el('span', { text: '名称' }), el('span', { class: 'req', text: '*' })]),
-        nameInput,
-        refs.nameErr,
-      ]),
-      el('div', { class: 'field' }, [
-        el('label', { class: 'label', text: '接口协议' }),
-        apiSeg,
-        el('div', { class: 'hint', text: 'OpenAI 兼容走 /chat/completions 适配；Responses 透传要求上游原生支持 /v1/responses；Anthropic 走 Messages 适配' }),
-      ]),
+    el('div', { class: 'field' }, [
+      el('label', { class: 'label' }, [el('span', { text: '名称' }), el('span', { class: 'req', text: '*' })]),
+      nameInput,
+      refs.nameErr,
+    ]),
+    el('div', { class: 'field' }, [
+      el('label', { class: 'label', text: '接口协议' }),
+      apiSeg,
+      el('div', { class: 'hint', text: 'OpenAI 兼容走 /chat/completions 适配；Responses 透传要求上游原生支持 /v1/responses；Anthropic 走 Messages 适配' }),
     ]),
     el('div', { class: 'field' }, [
       el('label', { class: 'label' }, [el('span', { text: 'Base URL' }), el('span', { class: 'req', text: '*' })]),
@@ -1077,10 +1135,10 @@ async function pullModels(ctx, draft, refs, saveBtn, afterRowsChange) {
       refs.note('info', `已保存并分配 id ${draft.id}，正在请求 /models …`);
     }
   }
-  await doPull(ctx, draft, afterRowsChange);
+  await doPull(ctx, draft, refs, afterRowsChange);
 }
 
-async function doPull(ctx, draft, afterRowsChange) {
+async function doPull(ctx, draft, refs, afterRowsChange) {
   if (!draft.id) {
     ctx.toast('请先保存提供商，再拉取 /models', 'warn');
     return;

@@ -1,0 +1,289 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900" role="img" aria-labelledby="title desc">
+  <title id="title">gpt++ 模型页视觉概念</title>
+  <desc id="desc">深色仪表舱侧栏、浅色工作区、三节点信号轨道和模型列表的桌面应用高保真设计略图。</desc>
+  <defs>
+    <linearGradient id="railLive" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#6FCDD1"/>
+      <stop offset="0.5" stop-color="#8BDDE0"/>
+      <stop offset="1" stop-color="#E3A75B"/>
+    </linearGradient>
+    <linearGradient id="chipGlow" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.96"/>
+      <stop offset="1" stop-color="#F4F8F7" stop-opacity="0.82"/>
+    </linearGradient>
+    <pattern id="paperGrain" width="64" height="64" patternUnits="userSpaceOnUse">
+      <circle cx="8" cy="14" r="0.7" fill="#60717A" opacity="0.12"/>
+      <circle cx="42" cy="32" r="0.55" fill="#60717A" opacity="0.1"/>
+      <circle cx="22" cy="53" r="0.5" fill="#60717A" opacity="0.08"/>
+    </pattern>
+    <filter id="softShadow" x="-20%" y="-30%" width="140%" height="170%">
+      <feDropShadow dx="0" dy="8" stdDeviation="16" flood-color="#2B4148" flood-opacity="0.10"/>
+    </filter>
+    <filter id="pillShadow" x="-20%" y="-40%" width="140%" height="180%">
+      <feDropShadow dx="0" dy="5" stdDeviation="10" flood-color="#31474E" flood-opacity="0.12"/>
+    </filter>
+    <style>
+      text { font-family: "Segoe UI Variable Text", "Microsoft YaHei UI", "Segoe UI", sans-serif; }
+      .mono { font-family: "Cascadia Mono", Consolas, monospace; }
+      .display { font-family: "Segoe UI Variable Display", "Microsoft YaHei UI", "Segoe UI", sans-serif; }
+      .ui { font-size: 14px; fill: #25363D; }
+      .muted { fill: #708087; }
+      .faint { fill: #98A5A7; }
+      .eyebrow { font-size: 10.5px; font-weight: 700; letter-spacing: 1.2px; }
+    </style>
+  </defs>
+
+  <!-- application shell -->
+  <rect width="1440" height="900" fill="#E9EFED"/>
+  <g>
+    <!-- dark instrument sidebar -->
+    <rect x="0" y="0" width="248" height="900" fill="#172326"/>
+    <rect x="247" y="0" width="1" height="900" fill="#2C3B3F"/>
+    <circle cx="64" cy="57" r="21" fill="#223438"/>
+    <circle cx="64" cy="57" r="15" fill="none" stroke="#72C7C9" stroke-width="1.5" opacity="0.85"/>
+    <path d="M55 57h18M64 48v18" stroke="#B9ECEE" stroke-width="1.3" opacity="0.6"/>
+    <text x="92" y="53" fill="#F3F7F5" font-size="22" font-weight="700">gpt++</text>
+    <text x="93" y="72" fill="#8DA0A3" font-size="10" font-weight="600" letter-spacing="1.5">LOCAL ROUTER</text>
+
+    <text x="30" y="126" fill="#667A7E" font-size="10" font-weight="700" letter-spacing="1.5">WORKSPACE</text>
+    <g transform="translate(22 145)">
+      <rect x="0" y="0" width="204" height="40" rx="7" fill="#223135" stroke="#34474B"/>
+      <rect x="0" y="8" width="3" height="24" rx="1.5" fill="#78CDCF"/>
+      <path d="M23 13h10v14H23zM26 13V9h4v4M26 19h4" fill="none" stroke="#DCE9E7" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="46" y="25" fill="#E3ECEA" font-size="13.5" font-weight="600">提供商</text>
+      <text x="178" y="25" class="mono" fill="#A4B4B6" font-size="12">4</text>
+    </g>
+    <g transform="translate(22 191)">
+      <rect x="0" y="0" width="204" height="40" rx="7" fill="#1C2A2E" stroke="#2A3B3F"/>
+      <rect x="0" y="8" width="3" height="24" rx="1.5" fill="#4C6368"/>
+      <path d="M23 9l5 3v10l-5 3-5-3V12zM18 12l5 3 5-3M23 15v10" fill="none" stroke="#91A5A8" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="46" y="25" fill="#C7D5D4" font-size="13.5">模型</text>
+      <rect x="178" y="12" width="20" height="18" rx="9" fill="#26383C"/>
+      <text x="184" y="25" class="mono" fill="#E0E9E7" font-size="10.5">8</text>
+    </g>
+    <g transform="translate(22 237)">
+      <rect x="0" y="0" width="204" height="40" rx="7" fill="#1B292C"/>
+      <path d="M23 27v-7M29 27V14M35 27V18M41 27V9" fill="none" stroke="#A1B1B3" stroke-width="1.4" stroke-linecap="round"/>
+      <text x="52" y="25" fill="#C7D5D4" font-size="13.5">使用量</text>
+      <text x="178" y="25" class="mono" fill="#A4B4B6" font-size="12">24</text>
+    </g>
+    <g transform="translate(22 283)">
+      <rect x="0" y="0" width="204" height="40" rx="7" fill="#1B292C"/>
+      <circle cx="23" cy="20" r="3" fill="none" stroke="#A1B1B3" stroke-width="1.3"/>
+      <path d="M23 10v3M23 27v3M13 20h3M30 20h3M16 13l2 2M28 25l2 2M30 13l-2 2M18 25l-2 2" stroke="#A1B1B3" stroke-width="1.25" stroke-linecap="round"/>
+      <text x="46" y="25" fill="#C7D5D4" font-size="13.5">设置</text>
+      <text x="178" y="25" class="mono" fill="#D7A557" font-size="11">停</text>
+    </g>
+
+    <!-- connection status in sidebar, quiet -->
+    <line x1="22" y1="660" x2="226" y2="660" stroke="#2B3C40"/>
+    <text x="24" y="682" fill="#728489" font-size="10" font-weight="700" letter-spacing="1.2">LIVE STATE</text>
+    <circle cx="30" cy="706" r="4" fill="#E4AE63"/>
+    <text x="44" y="711" fill="#C9D6D4" font-size="12">网关未运行</text>
+    <text x="202" y="711" class="mono" fill="#84979A" font-size="11">18120</text>
+    <circle cx="30" cy="730" r="4" fill="#78CDCF"/>
+    <text x="44" y="735" fill="#C9D6D4" font-size="12">已注入 8 个模型</text>
+
+    <rect x="22" y="758" width="204" height="78" rx="8" fill="#1C2B2F" stroke="#2E4044"/>
+    <text x="35" y="780" fill="#8CA0A3" font-size="11">上游网络</text>
+    <rect x="153" y="766" width="58" height="20" rx="10" fill="#273B3D" stroke="#3B6665"/>
+    <text x="164" y="780" fill="#8DD5D2" font-size="10.5" font-weight="600">系统代理</text>
+    <rect x="35" y="792" width="83" height="27" rx="5" fill="#263A3C" stroke="#3C6061"/>
+    <text x="60" y="810" fill="#DCEAE8" font-size="11">系统代理</text>
+    <rect x="124" y="792" width="63" height="27" rx="5" fill="#1D2D31" stroke="#2D4145"/>
+    <text x="151" y="810" fill="#83979A" font-size="11">直连</text>
+
+    <rect x="22" y="848" width="204" height="36" rx="7" fill="#233336" stroke="#3D5155"/>
+    <circle cx="42" cy="866" r="8" fill="#2E4144" stroke="#EBB35C"/>
+    <path d="M42 861v5M37 864a6 6 0 1 0 10 0" fill="none" stroke="#EBB35C" stroke-width="1.3" stroke-linecap="round"/>
+    <text x="60" y="870" fill="#E0E9E7" font-size="12">重启 ChatGPT 客户端</text>
+  </g>
+
+  <!-- light workspace -->
+  <rect x="248" y="0" width="1192" height="900" fill="#F4F7F4"/>
+  <rect x="248" y="0" width="1192" height="900" fill="url(#paperGrain)" opacity="0.45"/>
+
+  <!-- very quiet title -->
+  <text x="293" y="58" class="display" fill="#1B2A30" font-size="28" font-weight="700">模型</text>
+  <text x="293" y="82" fill="#738289" font-size="13">管理默认模型和注入到 ChatGPT 的模型清单</text>
+  <g transform="translate(1210 38)">
+    <rect x="0" y="0" width="82" height="34" rx="6" fill="#FFFFFF" stroke="#D7E0DD"/>
+    <path d="M17 17a6 6 0 1 1 2 4M23 12v5h-5" fill="none" stroke="#738289" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="33" y="22" fill="#5B6C73" font-size="12">刷新</text>
+    <rect x="90" y="0" width="109" height="34" rx="6" fill="#FFFFFF" stroke="#D7E0DD"/>
+    <path d="M108 11h13v11h-13zM112 11V8h5v3" fill="none" stroke="#738289" stroke-width="1.2"/>
+    <text x="127" y="22" fill="#5B6C73" font-size="12">打开目录</text>
+  </g>
+
+  <!-- a single signature signal rail -->
+  <g filter="url(#softShadow)">
+    <rect x="292" y="112" width="1112" height="172" rx="12" fill="#FFFFFF" stroke="#D7E1DE"/>
+    <rect x="292" y="112" width="1112" height="4" rx="2" fill="#DCE8E4"/>
+    <path d="M293 114h1110" stroke="#CBE4DE" stroke-width="1"/>
+  </g>
+  <text x="316" y="143" class="eyebrow" fill="#73858A">SIGNAL PATH</text>
+  <text x="416" y="143" fill="#8A999B" font-size="11">从提供商到 ChatGPT 的实时路由</text>
+  <rect x="1293" y="128" width="88" height="22" rx="11" fill="#E9F8F4" stroke="#B8E4D9"/>
+  <circle cx="1305" cy="139" r="3.5" fill="#28B889"/>
+  <text x="1315" y="143" fill="#31866F" font-size="10.5" font-weight="600">运行正常</text>
+
+  <g transform="translate(316 166)">
+    <text x="0" y="0" class="eyebrow" fill="#8A999B">01 / 提供商</text>
+    <circle cx="5" cy="27" r="5" fill="#77CBCF"/>
+    <text x="20" y="34" class="display" fill="#203137" font-size="25" font-weight="700">4</text>
+    <text x="44" y="33" fill="#73838A" font-size="12">个提供商</text>
+    <text x="0" y="59" fill="#8C9B9D" font-size="12">8 个模型 · 全部已启用</text>
+    <rect x="0" y="76" width="140" height="25" rx="5" fill="#F4F8F6" stroke="#DDE8E4"/>
+    <text x="12" y="92" class="mono" fill="#72868A" font-size="10.5">provider registry</text>
+  </g>
+  <g>
+    <path d="M585 204h132" stroke="#CDE6DF" stroke-width="2" stroke-linecap="round"/>
+    <path d="M585 204h72" stroke="url(#railLive)" stroke-width="2.5" stroke-linecap="round"/>
+    <path d="M705 199l10 5-10 5" fill="none" stroke="#73CDD0" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="585" cy="204" r="4" fill="#77CBCF"/>
+  </g>
+  <g transform="translate(744 166)">
+    <text x="0" y="0" class="eyebrow" fill="#8A999B">02 / 本地网关</text>
+    <circle cx="5" cy="27" r="5" fill="#E5AD61"/>
+    <text x="20" y="34" class="display" fill="#203137" font-size="25" font-weight="700">离线</text>
+    <text x="0" y="59" fill="#8C9B9D" font-size="12">127.0.0.1 : 18120</text>
+    <rect x="0" y="76" width="180" height="25" rx="5" fill="#FFF8EC" stroke="#F1DDBA"/>
+    <text x="12" y="92" fill="#A87125" font-size="10.5">需要在设置中启用网关</text>
+  </g>
+  <g>
+    <path d="M1015 204h132" stroke="#CDE6DF" stroke-width="2" stroke-linecap="round"/>
+    <path d="M1015 204h108" stroke="url(#railLive)" stroke-width="2.5" stroke-linecap="round"/>
+    <path d="M1135 199l10 5-10 5" fill="none" stroke="#D6A05D" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="1015" cy="204" r="4" fill="#E5AD61"/>
+  </g>
+  <g transform="translate(1174 166)">
+    <text x="0" y="0" class="eyebrow" fill="#A87636">03 / CHATGPT</text>
+    <circle cx="5" cy="27" r="5" fill="#DCA55C"/>
+    <text x="20" y="34" class="display" fill="#203137" font-size="25" font-weight="700">已注入</text>
+    <text x="0" y="59" fill="#8C9B9D" font-size="12">8 个模型等待客户端读取</text>
+    <rect x="0" y="76" width="54" height="25" rx="12.5" fill="#E2AD63"/>
+    <circle cx="42" cy="88.5" r="8.5" fill="#FFF"/>
+  </g>
+
+  <!-- default model plus right-side quick context -->
+    <rect x="292" y="305" width="740" height="135" rx="9" fill="#FFFFFF" stroke="#D9E3E0"/>
+    <rect x="1045" y="305" width="359" height="135" rx="9" fill="#EEF4F1" stroke="#D7E2DE"/>
+<circle cx="331" cy="371" r="4" fill="#73CDD0"/>
+<text x="344" y="369" fill="#25373D" font-size="12" font-weight="600">GPT-6.1 Sol</text>
+<text x="344" y="384" fill="#7C8C8F" font-size="10.5">梦幻API · 8 个模型已启用</text>
+<path d="M992 371l5 5 5-5" fill="none" stroke="#728488" stroke-width="1.3"/>
+<rect x="316" y="407" width="700" height="1" fill="#EDF2EF"/>
+<text x="316" y="426" class="mono" fill="#869598" font-size="10.5">写入 Codex 配置的 model 键</text>
+    <path d="M676 43l5 5 5-5" fill="none" stroke="#728488" stroke-width="1.3"/>
+    <rect x="0" y="78" width="700" height="1" fill="#EDF2EF"/>
+    <text x="0" y="96" class="mono" fill="#869598" font-size="10.5">写入 Codex 配置的 model 键</text>
+  <g transform="translate(316 329)">
+    <path d="M8 1l4 7-4 7-4-7z" fill="none" stroke="#1C8E78" stroke-width="1.2"/>
+    <text x="20" y="8" fill="#26383E" font-size="13" font-weight="700">默认模型</text>
+    <text x="98" y="8" fill="#879597" font-size="11.5">新建对话时默认选择</text>
+  </g>
+  <g transform="translate(1068 329)">
+    <text x="0" y="6" class="eyebrow" fill="#7D8C8E">ACTIVE ROUTE</text>
+    <circle cx="6" cy="31" r="5" fill="#28B889"/>
+    <text x="20" y="37" fill="#25373D" font-size="16" font-weight="700">8 个模型可路由</text>
+    <text x="0" y="59" fill="#7C8D8E" font-size="11.5">最后写入：刚刚 · 备份保留 10 份</text>
+    <path d="M0 76h293" stroke="#D9E3DF"/>
+  </g>
+
+  <!-- model list area -->
+  <g transform="translate(292 430)">
+    <text x="0" y="12" class="eyebrow" fill="#78888C">MODEL CATALOG</text>
+    <text x="112" y="12" fill="#A1ACAC" font-size="11">8 个模型 · 拖动排序</text>
+    <rect x="909" y="-8" width="203" height="34" rx="6" fill="#FFFFFF" stroke="#D2DDDA"/>
+    <circle cx="927" cy="9" r="4" fill="none" stroke="#89999B" stroke-width="1.2"/>
+    <path d="M930 12l5 5" stroke="#89999B" stroke-width="1.2"/>
+    <text x="942" y="13" fill="#8A999B" font-size="11">搜索显示名、slug 或提供商</text>
+  </g>
+  <g filter="url(#softShadow)">
+    <rect x="292" y="451" width="1112" height="378" rx="9" fill="#FFFFFF" stroke="#D9E3E0"/>
+  </g>
+  <rect x="292" y="451" width="1112" height="42" rx="9" fill="#F2F6F4"/>
+  <path d="M292 493h1112" stroke="#DFE7E4"/>
+  <g class="eyebrow" fill="#829194">
+    <text x="316" y="477">MODEL</text>
+    <text x="545" y="477">PROVIDER</text>
+    <text x="736" y="477">SLUG</text>
+    <text x="1036" y="477">ENABLED</text>
+    <text x="1180" y="477">DEFAULT</text>
+  </g>
+
+  <!-- row 1 -->
+  <g>
+    <rect x="292" y="493" width="1112" height="72" fill="#F7FCF8"/>
+    <rect x="292" y="493" width="3" height="72" fill="#6ECACD"/>
+    <text x="316" y="527" fill="#24363D" font-size="14" font-weight="650">GPT-6.1 Sol</text>
+    <text x="316" y="545" fill="#829194" font-size="10.5">推理 · 1,000K 上下文</text>
+    <text x="545" y="535" fill="#5D6F75" font-size="12">梦幻API</text>
+    <text x="736" y="535" class="mono" fill="#74868A" font-size="11">梦幻API__gpt-6.1-sol</text>
+    <rect x="1036" y="513" width="38" height="21" rx="10.5" fill="#67C5C9"/>
+    <circle cx="1063" cy="523.5" r="7.5" fill="#FFF"/>
+    <rect x="1180" y="512" width="77" height="22" rx="5" fill="#E7F8F2" stroke="#B7E3D7"/>
+    <text x="1198" y="527" fill="#308C74" font-size="11" font-weight="600">当前默认</text>
+    <path d="M1377 523h14M1377 527h14M1377 531h14" stroke="#A2AEAF" stroke-width="1.3" stroke-linecap="round"/>
+  </g>
+  <!-- row 2 -->
+  <g>
+    <rect x="292" y="565" width="1112" height="72" fill="#FFFFFF"/>
+    <text x="316" y="599" fill="#24363D" font-size="14" font-weight="600">Claude Sonnet 4.5</text>
+    <text x="316" y="617" fill="#829194" font-size="10.5">上下文 200K · 支持推理</text>
+    <text x="545" y="607" fill="#5D6F75" font-size="12">梦幻API</text>
+    <text x="736" y="607" class="mono" fill="#74868A" font-size="11">梦幻API__claude-sonnet-4.5</text>
+    <rect x="1036" y="585" width="38" height="21" rx="10.5" fill="#67C5C9"/>
+    <circle cx="1063" cy="595.5" r="7.5" fill="#FFF"/>
+    <rect x="1180" y="584" width="60" height="22" rx="5" fill="#FFFFFF" stroke="#D6E1DE"/>
+    <text x="1192" y="599" fill="#6F8185" font-size="11">设为默认</text>
+    <path d="M1377 595h14M1377 599h14M1377 603h14" stroke="#A2AEAF" stroke-width="1.3" stroke-linecap="round"/>
+  </g>
+  <!-- row 3 -->
+  <g>
+    <rect x="292" y="637" width="1112" height="72" fill="#FFFFFF"/>
+    <text x="316" y="671" fill="#24363D" font-size="14" font-weight="600">DeepSeek V4</text>
+    <text x="316" y="689" fill="#829194" font-size="10.5">推理 · 128K 上下文</text>
+    <text x="545" y="679" fill="#5D6F75" font-size="12">梦幻API</text>
+    <text x="736" y="679" class="mono" fill="#74868A" font-size="11">梦幻API__deepseek-v4</text>
+    <rect x="1036" y="657" width="38" height="21" rx="10.5" fill="#67C5C9"/>
+    <circle cx="1063" cy="667.5" r="7.5" fill="#FFF"/>
+    <rect x="1180" y="656" width="60" height="22" rx="5" fill="#FFFFFF" stroke="#D6E1DE"/>
+    <text x="1192" y="671" fill="#6F8185" font-size="11">设为默认</text>
+    <path d="M1377 667h14M1377 671h14M1377 675h14" stroke="#A2AEAF" stroke-width="1.3" stroke-linecap="round"/>
+  </g>
+  <!-- row 4 -->
+  <g>
+    <rect x="292" y="709" width="1112" height="72" fill="#FFFFFF"/>
+    <text x="316" y="743" fill="#24363D" font-size="14" font-weight="600">Qwen3 Coder 30B</text>
+    <text x="316" y="761" fill="#829194" font-size="10.5">本地 Ollama · 代码</text>
+    <text x="545" y="751" fill="#5D6F75" font-size="12">本地 Ollama</text>
+    <text x="736" y="751" class="mono" fill="#74868A" font-size="11">本地 Ollama__qwen3-coder:30b</text>
+    <rect x="1036" y="729" width="38" height="21" rx="10.5" fill="#67C5C9"/>
+    <circle cx="1063" cy="739.5" r="7.5" fill="#FFF"/>
+    <rect x="1180" y="728" width="60" height="22" rx="5" fill="#FFFFFF" stroke="#D6E1DE"/>
+    <text x="1192" y="743" fill="#6F8185" font-size="11">设为默认</text>
+    <path d="M1377 739h14M1377 743h14M1377 747h14" stroke="#A2AEAF" stroke-width="1.3" stroke-linecap="round"/>
+  </g>
+
+  <!-- bottom quiet metadata -->
+  <line x1="248" y1="855" x2="1440" y2="855" stroke="#D5E0DC"/>
+  <text x="293" y="878" fill="#8A999B" font-size="11">4 个提供商 · 8 个模型 · 已注入</text>
+  <circle cx="856" cy="874" r="4" fill="#E5AD61"/>
+  <text x="868" y="878" fill="#72858A" font-size="11">ChatGPT 等待重启读取</text>
+  <g transform="translate(1111 861)">
+    <rect x="0" y="0" width="28" height="26" rx="5" fill="#FFFFFF" stroke="#D5DFDC"/>
+    <circle cx="14" cy="13" r="4" fill="none" stroke="#839295" stroke-width="1.2"/>
+    <path d="M14 4v3M14 19v3M5 13h3M20 13h3" stroke="#839295" stroke-width="1.1"/>
+    <rect x="36" y="0" width="28" height="26" rx="5" fill="#FFFFFF" stroke="#D5DFDC"/>
+    <circle cx="50" cy="13" r="4" fill="none" stroke="#839295" stroke-width="1.2"/>
+    <path d="M45 7l3 3M52 16l3 3M55 7l-3 3M48 16l-3 3" stroke="#839295" stroke-width="1.1"/>
+    <rect x="72" y="0" width="28" height="26" rx="5" fill="#FFFFFF" stroke="#D5DFDC"/>
+    <path d="M81 9h10v9H81zM85 18v2M87 20h-4" fill="none" stroke="#839295" stroke-width="1.1"/>
+    <text x="122" y="18" class="mono" fill="#89989A" font-size="10.5">v1.1.0</text>
+    <rect x="207" y="0" width="84" height="26" rx="5" fill="#FFFFFF" stroke="#D5DFDC"/>
+    <text x="222" y="18" fill="#718388" font-size="11">运行日志 26</text>
+  </g>
+</svg>
+
+

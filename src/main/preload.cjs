@@ -65,6 +65,7 @@ contextBridge.exposeInMainWorld('gptplus', {
   // 模型与网关
   listModels: () => invoke('gptplus:models:list'),
   setModelEnabled: (patch) => invoke('gptplus:model:enabled:set', patch),
+  deleteModel: (patch) => invoke('gptplus:model:delete', patch),
   moveModel: (patch) => invoke('gptplus:model:move', patch),
   reorderModels: (patch) => invoke('gptplus:model:reorder', patch),
   getModelLimits: () => invoke('gptplus:model-limits:get'),
