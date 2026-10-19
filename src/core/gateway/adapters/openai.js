@@ -103,6 +103,35 @@ function pushAssistantToolCall(messages, call) {
 }
 
 /**
+ * 合并连续的 assistant 消息。
+ *
+ * Responses 的一轮助手输出是 reasoning + message(文本) + function_call 三个独立条目，
+ * 逐条转换会得到两条连续的 assistant 消息（一条纯文本、一条只带 tool_calls）。OpenAI 直连
+ * 能收，但 Anthropic 系上游（含内部再转 Anthropic 的中转）要求一个 assistant 轮只出现一次，
+ * 开启 thinking 时会整轮 400：`The content[].thinking in the thinking mode must be passed
+ * back to the API.`。合并成一条 content + tool_calls 才是 chat 的标准形状。
+ */
+function mergeAssistantTurns(messages) {
+  const out = [];
+  for (const message of messages) {
+    const last = out[out.length - 1];
+    if (!last || last.role !== 'assistant' || message.role !== 'assistant'
+      || Array.isArray(last.content) || Array.isArray(message.content)) {
+      out.push(message);
+      continue;
+    }
+    const text = [last.content, message.content].filter((c) => typeof c === 'string' && c).join('');
+    last.content = text || null;
+    const thinking = [last.reasoning_content, message.reasoning_content].filter((c) => typeof c === 'string' && c).join('\n');
+    if (thinking) last.reasoning_content = thinking;
+    if (Array.isArray(message.tool_calls)) {
+      last.tool_calls = [...(last.tool_calls || []), ...message.tool_calls];
+    }
+  }
+  return out;
+}
+
+/**
  * 追加一条 system 消息：与上一条 system 合并。
  * 真实 codex 流量里 instructions(21k 系统提示词) 后面紧跟 role=developer 的
  * skills/environment 消息，直接发两条 system 会被部分中转嫌弃，合并最稳。
@@ -117,13 +146,42 @@ function pushSystemMessage(messages, text) {
   messages.push({ role: 'system', content: text });
 }
 
+/** reasoning 项里的思考文本（Codex 回传时放在 summary，个别上游放在 content）。 */
+function thinkingText(item) {
+  const parts = [];
+  for (const key of ['summary', 'content']) {
+    if (!Array.isArray(item[key])) continue;
+    for (const part of item[key]) {
+      const text = typeof part === 'string' ? part : part && part.text;
+      if (text) parts.push(text);
+    }
+  }
+  return parts.join('');
+}
+
 /**
  * Responses 的 input（字符串 / item 数组）-> chat messages。
  * 已覆盖：message(input_text/output_text/input_image)、function_call、
- * function_call_output、custom_tool_call(+output)、local_shell_call；reasoning 丢弃。
+ * function_call_output、custom_tool_call(+output)、local_shell_call；
+ * reasoning 的思考文本回挂到其后第一条 assistant 消息上。
+ *
+ * @param {object} body
+ * @param {{ keepThinking?: boolean }} [opts] keepThinking=false 时不回挂 reasoning_content，
+ *        供兼容重试使用：不认这个字段的严格上游会报 Unknown parameter。
  */
-function toMessages(body) {
+function toMessages(body, { keepThinking = true } = {}) {
   const messages = [];
+  let pendingThinking = '';
+  // 上游在 thinking 模式下要求把上一轮的 reasoning_content 原样回传，
+  // 丢了会整轮 400：The `reasoning_content` in the thinking mode must be passed back to the API.
+  const flushThinking = () => {
+    if (!pendingThinking) return;
+    const last = messages[messages.length - 1];
+    if (keepThinking && last && last.role === 'assistant' && typeof last.reasoning_content !== 'string') {
+      last.reasoning_content = pendingThinking;
+    }
+    pendingThinking = '';
+  };
   if (body && typeof body.instructions === 'string' && body.instructions.trim()) {
     pushSystemMessage(messages, body.instructions);
   }
@@ -153,6 +211,7 @@ function toMessages(body) {
         if (content === '' && !Array.isArray(content)) continue;
         if (Array.isArray(content) && content.length === 0) continue;
         messages.push({ role, content });
+        if (role === 'assistant') flushThinking();
         break;
       }
       case 'function_call':
@@ -169,6 +228,7 @@ function toMessages(body) {
           type: 'function',
           function: { name, arguments: args },
         });
+        flushThinking();
         break;
       }
       case 'function_call_output':
@@ -185,15 +245,18 @@ function toMessages(body) {
           type: 'function',
           function: { name: 'local_shell', arguments: JSON.stringify(item.action ?? {}) },
         });
+        flushThinking();
         break;
       }
       case 'reasoning':
+        pendingThinking += thinkingText(item);
+        break;
       default:
-        // reasoning / web_search_call / 其它：chat 上游没有对应结构，丢弃。
+        // web_search_call / 其它：chat 上游没有对应结构，丢弃。
         break;
     }
   }
-  return messages;
+  return mergeAssistantTurns(messages);
 }
 
 /** Responses tools -> chat tools。 */
@@ -266,7 +329,7 @@ function toReasoningEffort(effort) {
  * @returns {{url:string, headers:Record<string,string>, payload:object}}
  */
 function buildRequest({ provider, modelId, body = {}, stream = true, compat = false }) {
-  const payload = { model: modelId, messages: toMessages(body), stream: !!stream };
+  const payload = { model: modelId, messages: toMessages(body, { keepThinking: !compat }), stream: !!stream };
   if (typeof body.prompt_cache_key === 'string' && body.prompt_cache_key.trim() && !compat) {
     // Chat Completions 兼容中转可能支持同名缓存键；兼容重试会主动移除它。
     payload.prompt_cache_key = body.prompt_cache_key.trim();

@@ -1306,6 +1306,110 @@ test('anthropic 适配器：tool_use/tool_result 双向 + 相邻同角色合并'
   assert.deepEqual(withTools.payload.tools[0].cache_control, { type: 'ephemeral' });
 });
 
+test('openai 适配器：一轮助手的文本与工具调用必须合成同一条 assistant 消息', () => {
+  // 真实 Codex 流量是 reasoning -> assistant 文本 -> function_call x2 -> 两个 function_call_output。
+  // 拆成两条连续的 assistant 消息，OpenAI 直连能收，但 Anthropic 系上游要求一个 assistant 轮
+  // 只出现一次；开启 thinking 后会拒：The `content[].thinking` in the thinking mode must be
+  // passed back to the API.
+  const messages = openaiAdapter.toMessages({
+    input: [
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: '列出目录' }] },
+      { type: 'reasoning', summary: [{ type: 'summary_text', text: '先看用户意图' }] },
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '我先列一下。' }] },
+      { type: 'function_call', call_id: 'c1', name: 'exec', arguments: '{"cmd":"ls"}' },
+      { type: 'function_call', call_id: 'c2', name: 'exec', arguments: '{"cmd":"pwd"}' },
+      { type: 'function_call_output', call_id: 'c1', output: 'a' },
+      { type: 'function_call_output', call_id: 'c2', output: '/tmp' },
+    ],
+  });
+  assert.deepEqual(messages.map((m) => m.role), ['user', 'assistant', 'tool', 'tool']);
+  assert.equal(messages[1].content, '我先列一下。');
+  assert.deepEqual(messages[1].tool_calls.map((c) => c.id), ['c1', 'c2']);
+  assert.deepEqual(messages[2], { role: 'tool', tool_call_id: 'c1', content: 'a' });
+
+  // 反序（先工具调用后文本）同样合并，且文本不丢
+  const reversed = openaiAdapter.toMessages({
+    input: [
+      { type: 'function_call', call_id: 'c1', name: 'exec', arguments: '{}' },
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '已执行' }] },
+    ],
+  });
+  assert.equal(reversed.length, 1);
+  assert.equal(reversed[0].content, '已执行');
+  assert.deepEqual(reversed[0].tool_calls.map((c) => c.id), ['c1']);
+
+  // 中间夹了别的角色就不能合并
+  const split = openaiAdapter.toMessages({
+    input: [
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'A' }] },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'B' }] },
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'C' }] },
+    ],
+  });
+  assert.deepEqual(split.map((m) => `${m.role}:${m.content}`), ['assistant:A', 'user:B', 'assistant:C']);
+});
+
+test('openai 适配器：reasoning 项的思考文本要回挂到对应的 assistant 消息', () => {
+  // 这个上游在 thinking 模式下要求把 reasoning_content 原样回传，丢了就 400：
+  // The `reasoning_content` in the thinking mode must be passed back to the API.
+  const withCall = openaiAdapter.toMessages({
+    input: [
+      { type: 'reasoning', summary: [{ type: 'summary_text', text: '先看用户意图' }, { type: 'summary_text', text: '，再列目录' }] },
+      { type: 'function_call', call_id: 'c1', name: 'exec', arguments: '{}' },
+      { type: 'function_call_output', call_id: 'c1', output: 'ok' },
+    ],
+  });
+  assert.equal(withCall[0].reasoning_content, '先看用户意图，再列目录');
+  assert.equal(withCall[0].content, null);
+  assert.deepEqual(withCall[0].tool_calls.map((c) => c.id), ['c1']);
+
+  // 与合并连续 assistant 同时成立：思考挂在合并后的那一条上
+  const withText = openaiAdapter.toMessages({
+    input: [
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'q' }] },
+      { type: 'reasoning', summary: [{ type: 'summary_text', text: '思考A' }] },
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '先说一句' }] },
+      { type: 'function_call', call_id: 'c1', name: 'exec', arguments: '{}' },
+    ],
+  });
+  assert.equal(withText.length, 2);
+  assert.equal(withText[1].content, '先说一句');
+  assert.equal(withText[1].reasoning_content, '思考A');
+  assert.deepEqual(withText[1].tool_calls.map((c) => c.id), ['c1']);
+
+  // 两段思考分别落在两轮上，不串轮
+  const twoTurns = openaiAdapter.toMessages({
+    input: [
+      { type: 'reasoning', summary: [{ type: 'summary_text', text: 'T1' }] },
+      { type: 'function_call', call_id: 'c1', name: 'exec', arguments: '{}' },
+      { type: 'function_call_output', call_id: 'c1', output: 'r1' },
+      { type: 'reasoning', summary: [{ type: 'summary_text', text: 'T2' }] },
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '结论' }] },
+    ],
+  });
+  assert.deepEqual(twoTurns.map((m) => `${m.role}:${m.reasoning_content}`), ['assistant:T1', 'tool:undefined', 'assistant:T2']);
+
+  // 没有后续 assistant 条目的 reasoning：安全丢弃，不影响其它字段
+  const dangling = openaiAdapter.toMessages({
+    input: [
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'q' }] },
+      { type: 'reasoning', summary: [{ type: 'summary_text', text: '孤儿思考' }] },
+    ],
+  });
+  assert.deepEqual(dangling, [{ role: 'user', content: 'q' }]);
+
+  // 兼容重试：不认 reasoning_content 的上游会报 Unknown parameter，重发时要去掉
+  const body = {
+    input: [
+      { type: 'reasoning', summary: [{ type: 'summary_text', text: 'T' }] },
+      { type: 'function_call', call_id: 'c1', name: 'exec', arguments: '{}' },
+    ],
+  };
+  const strict = openaiAdapter.buildRequest({ provider: { baseUrl: 'https://x/v1', apiKey: 'k' }, modelId: 'm', body, stream: false, compat: true });
+  assert.equal(strict.payload.messages[0].reasoning_content, undefined, 'compat 请求不应带 reasoning_content');
+  assert.deepEqual(strict.payload.messages[0].tool_calls.map((c) => c.id), ['c1'], 'compat 仍要保留工具调用');
+});
+
 test('适配器：工具 parameters 必须补齐成合法对象 schema（严格上游会整轮 400）', () => {
   // Codex 内建工具（list_mcp_resources 等）没有必填参数时，serde 把 Option::None
   // 序列化成 "required": null。OpenAI 直连容忍，但严格的 OpenAI 兼容上游按
