@@ -177,3 +177,13 @@ test('较旧版本的更新缓存会在当前版本启动时清理', async (t) =
   assert.equal(await readFile(path.join(cacheDir, 'installer.exe'), 'utf8'), 'current baseline');
   await assert.rejects(readFile(path.join(cacheDir, 'pending')));
 });
+
+test('主进程在启动时立即检查更新，不再延迟', async () => {
+  const { readFile } = require('node:fs/promises');
+  const mainSource = await readFile(path.join(__dirname, '../src/main/main.js'), 'utf8');
+  const start = mainSource.indexOf('if (updater.enabled) {');
+  assert.ok(start >= 0, '主进程应存在启动时的更新检测入口');
+  const block = mainSource.slice(start, mainSource.indexOf('\n  }', start) + 4);
+  assert.match(block, /updater\.checkForUpdates\(\)/, '启动时应调用 checkForUpdates');
+  assert.doesNotMatch(block, /setTimeout/, '启动检测不能再被 setTimeout 推迟');
+});

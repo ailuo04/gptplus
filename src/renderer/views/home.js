@@ -230,7 +230,7 @@ function hero(ctx) {
 
   const nextButton = next
     ? el('button', {
-        class: 'btn btn-sm btn-warning home-next-action',
+        class: `btn btn-sm ${next.blocking ? 'btn-danger' : 'btn-warning'} home-next-action`,
         type: 'button',
         title: next.title || null,
         // 按钮节点先建好再绑事件：run() 需要拿到自身来切换「确认 / 重启中」文案与忙碌态。
@@ -239,7 +239,7 @@ function hero(ctx) {
     : null;
 
   const nextBar = next
-    ? el('div', { class: 'home-next', attrs: { role: 'note' } }, [
+    ? el('div', { class: `home-next${next.blocking ? ' is-blocking' : ''}`, attrs: { role: next.blocking ? 'alert' : 'note' } }, [
         icon('alert', 13),
         el('span', { class: 'home-next-text', text: next.text }),
         nextButton,
@@ -279,6 +279,7 @@ function nextStep(ctx) {
       text: '配置已修改，需要重启 ChatGPT 客户端后生效。',
       action: RELAUNCH_ACTION_TEXT,
       title: RELAUNCH_TITLE,
+      blocking: true,
       run: (button) => restartChatGpt(ctx, button),
     };
   }

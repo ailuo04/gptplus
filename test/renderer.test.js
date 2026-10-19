@@ -1670,10 +1670,12 @@ test('主页「下一步」：配置待生效时给的是重启 ChatGPT，而不
     assert.equal(action.length, 1, '提示条里应有唯一的操作按钮');
     assert.match(action[0].textContent, /重启 ChatGPT/, '按钮文案必须是重启 ChatGPT');
     assert.doesNotMatch(action[0].textContent, /去模型页/, '不能再把用户带去模型页');
-    // 语义色跟着警告走：黄色提示条里的主操作不再使用蓝色 accent。
+    // 「需要重启」是阻断态：整条转红，主操作也切成红色语义按钮。
     const actionClass = String(action[0].className);
-    assert.match(actionClass, /btn-warning/, '重启动作应使用警告语义按钮');
+    assert.match(actionClass, /btn-danger/, '重启动作应使用红色阻断语义按钮');
     assert.doesNotMatch(actionClass, /btn-accent/, '重启动作不应再是蓝色强调按钮');
+    assert.match(String(strip[0].className), /is-blocking/, '待重启提示条必须进入红色阻断态');
+    assert.equal(strip[0].getAttribute('role'), 'alert', '阻断态提示条应以 alert 角色播报');
 
     // 第一次点击只进入确认态，绝不立刻杀进程。
     click(action[0]);
@@ -1743,7 +1745,7 @@ test('侧栏重启成功后主页黄条也要立即消失', () => {
   assert.match(body, /renderCurrent\(/, '必须触发当前页面重绘');
 });
 
-test('黄条样式：实心琥珀底 + 左侧强调边，双主题各有独立令牌', () => {
+test('提示条样式：普通提醒用琥珀，待重启用红色阻断态，双主题各有独立令牌', () => {
   const cssSrc = read(path.join(ROOT, 'src/renderer/styles.css'));
   const dark = cssSrc.slice(cssSrc.indexOf(':root {'), cssSrc.indexOf('html[data-theme="light"]'));
   const lightStart = cssSrc.indexOf('html[data-theme="light"]');
@@ -1752,13 +1754,22 @@ test('黄条样式：实心琥珀底 + 左侧强调边，双主题各有独立�
     for (const token of ['--notice-warn-bg', '--notice-warn-line', '--notice-warn-text', '--notice-warn-edge']) {
       assert.match(block, new RegExp(`${token}:`), `${label}主题必须定义 ${token}`);
     }
+    for (const token of ['--notice-err-bg', '--notice-err-line', '--notice-err-text', '--notice-err-edge',
+      '--notice-err-action-bg', '--notice-err-action-bg-hover', '--notice-err-action-text']) {
+      assert.match(block, new RegExp(`${token}:`), `${label}主题必须定义 ${token}`);
+    }
   }
   const strip = cssSrc.slice(cssSrc.indexOf('.home-next {'));
   assert.match(strip, /background:\s*var\(--notice-warn-bg\)/, '提示条应使用更实的琥珀底色');
   assert.match(strip, /border:\s*1px solid var\(--notice-warn-line\)/, '提示条应有更明显的描边');
   assert.match(strip, /box-shadow:\s*inset 3px 0 0 var\(--notice-warn-edge\)/, '提示条应有左侧强调边');
   assert.match(strip, /\.home-next-text \{[^}]*font-weight:\s*(?:5[5-9]0|6\d0)/, '提示文字必须加粗到能一眼看见');
-  assert.match(strip, /\.home-next \.home-next-action \{[^}]*background:\s*var\(--notice-warn-bg-hover\)/, '重启按钮要有实心琥珀底');
+  assert.match(strip, /\.home-next \.home-next-action \{[^}]*background:\s*var\(--notice-warn-bg-hover\)/, '普通提醒的按钮要有实心琥珀底');
+  // 待重启是阻断态：整条红色，按钮实心红底白字，不能退回到琥珀色。
+  assert.match(strip, /\.home-next\.is-blocking \{[^}]*background:\s*var\(--notice-err-bg\)/, '待重启提示条必须用红色底');
+  assert.match(strip, /\.home-next\.is-blocking \{[^}]*border-color:\s*var\(--notice-err-line\)/, '待重启提示条必须有红色描边');
+  assert.match(strip, /\.home-next\.is-blocking \.home-next-action \{[^}]*background:\s*var\(--notice-err-action-bg\)/, '待重启按钮必须是实心红底');
+  assert.match(strip, /\.home-next\.is-blocking \.home-next-action \{[^}]*color:\s*var\(--notice-err-action-text\)/, '待重启按钮文字必须是白字');
 });
 
 function findNodes(root, predicate) {

@@ -433,7 +433,9 @@ async function boot() {
   createWindow();
   createTray();
   if (updater.enabled) {
-    setTimeout(() => { void updater.checkForUpdates(); }, 8000);
+    // 启动即检测：checkForUpdates 是纯异步网络请求，不会拖慢首屏；
+    // 窗口尚未加载完时渲染层会在 boot 里通过 getUpdateState 补读最新状态。
+    void updater.checkForUpdates();
   }
 
   // 网关启动需要等待端口监听，不应阻塞窗口和首屏；完成后再广播最新状态。

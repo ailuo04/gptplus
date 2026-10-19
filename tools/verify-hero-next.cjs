@@ -84,6 +84,9 @@ const inspectDom = () => {
       ? { ...rect(button), ...styles(button), tag: button.tagName, disabled: button.disabled, text: button.textContent.trim() }
       : null,
     stripText: strip.textContent.replace(/\s+/g, ' ').trim(),
+    isBlocking: strip.classList.contains('is-blocking'),
+    role: strip.getAttribute('role'),
+    buttonClass: button ? button.className : '',
     color: {
       stripBg: getComputedStyle(strip).backgroundColor,
       stripBorder: getComputedStyle(strip).borderTopColor,
@@ -205,28 +208,39 @@ app.whenReady().then(async () => {
         height: info.strip.height + 4,
       };
       const image = await shot('strip-' + theme, crop);
+      // capturePage 的入参是 DIP，但高 DPI 屏幕上返回的位图是物理像素；
+      // 不换算会把取样框按 1.25 倍缩到别的位置，采到的是提示条底色而不是按钮底色。
+      const imageWidth = image.getSize().width;
+      const scale = imageWidth / Math.max(1, Math.round(crop.width));
+      const toPixels = (box) => ({
+        x: box.x * scale, y: box.y * scale, width: box.width * scale, height: box.height * scale,
+      });
       // 取色点必须落在「纯底色」上：用矩形内出现最多的颜色推底色，避免采到字形像素。
-      const bgPixel = modalPixel(image, { x: 6, y: 3, width: info.strip.width - 12, height: info.strip.height - 6 });
+      const bgPixel = modalPixel(image, toPixels({ x: 6, y: 3, width: info.strip.width - 12, height: info.strip.height - 6 }));
       const textContrast = contrast(parseRgb(info.color.text), bgPixel);
       let buttonContrast = null;
       if (info.button) {
-        const buttonPixel = modalPixel(image, {
+        const buttonPixel = modalPixel(image, toPixels({
           x: (info.button.x - crop.x) + 3,
           y: (info.button.y - crop.y) + 2,
           width: info.button.width - 6,
           height: info.button.height - 4,
-        });
+        }));
         buttonContrast = contrast(parseRgb(info.color.buttonText), buttonPixel);
       }
       if (process.env.GPTPLUS_HERO_DEBUG) {
         console.log('[debug]', theme, {
-          text: info.color.text, bgPixel, textContrast: textContrast.toFixed(2),
+          scale, text: info.color.text, bgPixel, textContrast: textContrast.toFixed(2),
           buttonText: info.color.buttonText, buttonContrast: buttonContrast === null ? null : buttonContrast.toFixed(2),
         });
       }
       assert.ok(textContrast >= 4.5, `${theme}: strip text contrast ${textContrast.toFixed(2)} must be >= 4.5`);
       assert.ok(buttonContrast >= 4.5, `${theme}: button text contrast ${buttonContrast.toFixed(2)} must be >= 4.5`);
-      assert.notEqual(info.strip.boxShadow, 'none', theme + ': strip must carry the amber edge shadow');
+      assert.notEqual(info.strip.boxShadow, 'none', theme + ': strip must carry the edge shadow');
+      // 待重启是阻断态：红底 + 红描边 + 红色按钮，不能仍是琥珀色。
+      assert.ok(info.isBlocking, theme + ': relaunch strip must be in blocking state');
+      assert.equal(info.role, 'alert', theme + ': blocking strip must be announced as an alert');
+      assert.match(String(info.buttonClass), /btn-danger/, theme + ': restart action must use the danger variant');
       report.checks.push({
         theme, strip: info.strip, text: info.text, button: info.button,
         colors: info.color, textContrast: Number(textContrast.toFixed(2)), buttonContrast: Number(buttonContrast.toFixed(2)),

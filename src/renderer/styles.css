@@ -120,6 +120,16 @@
   --err-soft: rgba(239, 68, 68, 0.14);
   --err-line: rgba(239, 68, 68, 0.42);
 
+  /* 主页「需要重启」提示条：这是唯一的阻断态，用红色而不是琥珀色；
+     底色比 --err-soft 更实，按钮直接实心红底白字，保证一眼看见。 */
+  --notice-err-bg: rgba(239, 68, 68, 0.22);
+  --notice-err-line: rgba(248, 113, 113, 0.82);
+  --notice-err-text: #fecaca;
+  --notice-err-edge: var(--err);
+  --notice-err-action-bg: #b91c1c;
+  --notice-err-action-bg-hover: #dc2626;
+  --notice-err-action-text: #ffffff;
+
   /* 间距标尺 */
   --sp-1: 4px;
   --sp-2: 8px;
@@ -270,6 +280,14 @@ html[data-theme="light"] {
   --err: #dc2626;
   --err-soft: rgba(220, 38, 38, 0.12);
   --err-line: rgba(220, 38, 38, 0.38);
+  /* 提示条：浅色主题下红底更实、描边更深，正文压到 #991b1b（在混合底色上 >= 5.9:1） */
+  --notice-err-bg: rgba(220, 38, 38, 0.14);
+  --notice-err-line: #dc2626;
+  --notice-err-text: #991b1b;
+  --notice-err-edge: #b91c1c;
+  --notice-err-action-bg: #b91c1c;
+  --notice-err-action-bg-hover: #dc2626;
+  --notice-err-action-text: #ffffff;
   --e-0: inset 0 1px 0 rgba(255, 255, 255, 0.9);
   --e-1: 0 1px 2px rgba(23, 37, 46, 0.06);
   --e-2: inset 0 1px 0 rgba(255, 255, 255, 0.92), 0 4px 12px -2px rgba(23, 37, 46, 0.08), 0 10px 24px -6px rgba(23, 37, 46, 0.06);
@@ -2625,6 +2643,7 @@ html.is-theme-switching .logs {
 /* 下一步提示：只在链路中断时出现，和首屏共用一张卡片，避免再造一块“操作面板”。
    底色/描边/文字都比全局 --warn-soft 更实一档，左侧再加 3px 琥珀实心条，保证一眼能看见；
    色相仍是琥珀警告（不是错误红），行高与内边距保持原样，不把首屏撑高。 */
+/* 普通「下一步」用琥珀：链路还没接通，属于提醒。 */
 .home-next {
   display: flex;
   align-items: center;
@@ -2665,6 +2684,36 @@ html.is-theme-switching .logs {
   opacity: 0.6;
   cursor: default;
   transform: none;
+}
+
+/* 「配置已修改，需要重启」是阻断态：整条转红，按钮做成实心红底白字，
+   在首屏里比琥珀色的提醒更靠前一级，同时沿用同一套几何尺寸不撑高卡片。 */
+.home-next.is-blocking {
+  border-color: var(--notice-err-line);
+  background: var(--notice-err-bg);
+  box-shadow: inset 3px 0 0 var(--notice-err-edge);
+  color: var(--notice-err-text);
+}
+.home-next.is-blocking > .icon { color: var(--notice-err-edge); }
+.home-next.is-blocking .home-next-action {
+  background: var(--notice-err-action-bg);
+  border-color: var(--notice-err-edge);
+  color: var(--notice-err-action-text);
+  box-shadow: var(--e-1);
+}
+.home-next.is-blocking .home-next-action:hover {
+  background: var(--notice-err-action-bg-hover);
+  border-color: var(--notice-err-action-bg-hover);
+  color: var(--notice-err-action-text);
+}
+.home-next.is-blocking .home-next-action[disabled],
+.home-next.is-blocking .home-next-action.is-busy,
+.home-next.is-blocking .home-next-action[disabled]:hover,
+.home-next.is-blocking .home-next-action.is-busy:hover {
+  background: var(--notice-err-action-bg);
+  border-color: var(--notice-err-edge);
+  color: var(--notice-err-action-text);
+  opacity: 0.55;
 }
 .home-hero-meta { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; min-width: 0; color: var(--fg-faint); }
 .home-meta-item { display: inline-flex; align-items: center; gap: 5px; min-width: 0; }
