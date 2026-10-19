@@ -13,7 +13,7 @@
  * 已知差异（非阻塞）：Anthropic 的 system 是顶层参数、消息角色只有 user/assistant，
  * 所以 codex 的 developer/system 消息会被折叠进 system 字段。
  */
-const { joinApiUrl, parseSse } = require('../responses.js');
+const { joinApiUrl, parseSse, toolParameters } = require('../responses.js');
 
 const DEFAULT_MAX_TOKENS = 8192;
 const ANTHROPIC_VERSION = '2023-06-01';
@@ -185,13 +185,13 @@ function toAnthropicTools(tools, { cache = false } = {}) {
       out.push({
         name: tool.name,
         description: tool.description || '',
-        input_schema: tool.parameters || { type: 'object', properties: {} },
+        input_schema: toolParameters(tool.parameters),
       });
     } else if (tool.type === 'function' && tool.function?.name) {
       out.push({
         name: tool.function.name,
         description: tool.function.description || '',
-        input_schema: tool.function.parameters || { type: 'object', properties: {} },
+        input_schema: toolParameters(tool.function.parameters),
       });
     } else if (tool.type === 'custom' && tool.name) {
       out.push({

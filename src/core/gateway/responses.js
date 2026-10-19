@@ -910,6 +910,47 @@ function joinApiUrl(baseUrl, path) {
   return base + (path.startsWith('/') ? path : `/${path}`);
 }
 
+/**
+ * 工具参数 JSON Schema 清洗。
+ *
+ * 1) 递归去掉值为 null 的关键字。Codex 的内建工具（list_mcp_resources 等）没有必填参数时，
+ *    客户端会把 `required` 序列化成 null。
+ * 2) 补齐顶层的 type / properties / required。严格的 OpenAI 兼容上游（例如内部再做
+ *    chat -> anthropic 转换的中转）会把缺失的 properties / required 当成 null 处理，
+ *    再按 JSON Schema 元模式校验就整轮 400：
+ *    `Invalid schema for function 'x': null is not of type "array"`。
+ *    OpenAI 直连对这两种姿势都容忍，所以只有走中转时才暴露。
+ *
+ * 数组元素里的 null（如 enum 的取值）是数据不是关键字，保留不动。
+ */
+function sanitizeToolSchema(schema) {
+  if (Array.isArray(schema)) return schema.map(sanitizeToolSchema);
+  if (!schema || typeof schema !== 'object') return schema;
+  const out = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (value === null) continue;
+    out[key] = sanitizeToolSchema(value);
+  }
+  return out;
+}
+
+/** 工具 parameters -> 合法的对象 schema。 */
+function toolParameters(parameters) {
+  const clean = sanitizeToolSchema(parameters);
+  if (!clean || typeof clean !== 'object' || Array.isArray(clean)) {
+    return { type: 'object', properties: {}, required: [] };
+  }
+  if (clean.type !== 'object') {
+    // 函数入参按契约只能是对象；非对象顶层 schema 上游同样会拒。
+    clean.type = 'object';
+    clean.properties = {};
+  } else if (!clean.properties || typeof clean.properties !== 'object' || Array.isArray(clean.properties)) {
+    clean.properties = {};
+  }
+  if (!Array.isArray(clean.required)) clean.required = [];
+  return clean;
+}
+
 function sendJson(res, status, payload) {
   if (res.headersSent) return;
   const body = JSON.stringify(payload);
@@ -983,5 +1024,6 @@ module.exports = {
   sendJson,
   sendResponsesFailure,
   sseFrame,
+  toolParameters,
   writeSseHeaders,
 };

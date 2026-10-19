@@ -11,7 +11,7 @@
  * 只有纯文本路径是 100% 验证过的；tools/function_call 走的是同一套内部事件，
  * 已按 OpenAI chat 的 tool_calls 分片语义实现（含 name 分片补齐的缓冲）。
  */
-const { joinApiUrl, parseSse } = require('../responses.js');
+const { joinApiUrl, parseSse, toolParameters } = require('../responses.js');
 
 const DEFAULT_MAX_TOKENS = 8192;
 
@@ -203,16 +203,19 @@ function toTools(tools) {
   for (const tool of tools) {
     if (!tool || typeof tool !== 'object') continue;
     if (tool.type === 'function' && tool.function && tool.function.name) {
-      out.push(tool); // 已经是 chat 形状
+      // 已经是 chat 形状，但 parameters 仍要清洗
+      out.push({ ...tool, function: { ...tool.function, parameters: toolParameters(tool.function.parameters) } });
       continue;
     }
     if (tool.type === 'function' && tool.name) {
-      const fn = {
-        name: tool.name,
-        description: tool.description || '',
-        parameters: tool.parameters || { type: 'object', properties: {} },
-      };
-      out.push({ type: 'function', function: fn });
+      out.push({
+        type: 'function',
+        function: {
+          name: tool.name,
+          description: tool.description || '',
+          parameters: toolParameters(tool.parameters),
+        },
+      });
       continue;
     }
     if (tool.type === 'custom' && tool.name) {

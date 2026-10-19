@@ -620,7 +620,7 @@ test('function_call（tools）双向转换 + 流式回写', async () => {
         function: {
           name: 'shell',
           description: 'run a command',
-          parameters: { type: 'object', properties: { command: { type: 'string' } } },
+          parameters: { type: 'object', properties: { command: { type: 'string' } }, required: [] },
         },
       },
     ]);
@@ -1185,7 +1185,7 @@ test('openai 适配器：Responses input -> chat messages 全类型覆盖', () =
   );
 
   assert.deepEqual(toTools([{ type: 'function', name: 'f', parameters: { type: 'object' } }]), [
-    { type: 'function', function: { name: 'f', description: '', parameters: { type: 'object' } } },
+    { type: 'function', function: { name: 'f', description: '', parameters: { type: 'object', properties: {}, required: [] } } },
   ]);
 
   const built = buildRequest({
@@ -1259,7 +1259,7 @@ test('anthropic 适配器：tool_use/tool_result 双向 + 相邻同角色合并'
   }]);
 
   assert.deepEqual(toAnthropicTools([{ type: 'function', name: 'f', parameters: { type: 'object' } }]), [
-    { name: 'f', description: '', input_schema: { type: 'object' } },
+    { name: 'f', description: '', input_schema: { type: 'object', properties: {}, required: [] } },
   ]);
 
   const built = buildRequest({
@@ -1304,6 +1304,64 @@ test('anthropic 适配器：tool_use/tool_result 双向 + 相邻同角色合并'
   });
   assert.equal(withTools.payload.system, 'You are Codex.', '有工具时断点应放到工具列表末尾');
   assert.deepEqual(withTools.payload.tools[0].cache_control, { type: 'ephemeral' });
+});
+
+test('适配器：工具 parameters 必须补齐成合法对象 schema（严格上游会整轮 400）', () => {
+  // Codex 内建工具（list_mcp_resources 等）没有必填参数时，serde 把 Option::None
+  // 序列化成 "required": null。OpenAI 直连容忍，但严格的 OpenAI 兼容上游按
+  // JSON Schema 元模式校验 -> 400 Invalid schema for function 'x':
+  // null is not of type "array"（实测 required 缺失同样会被补成 null 而报同一个错）。
+  const codexTool = {
+    type: 'function',
+    name: 'list_mcp_resources',
+    description: 'Lists resources provided by MCP servers.',
+    parameters: {
+      type: 'object',
+      properties: {
+        server: { type: 'string', description: 'MCP server name.' },
+        cursor: { type: null, description: 'Opaque cursor.' },
+      },
+      required: null,
+      additionalProperties: false,
+    },
+  };
+  const cleaned = {
+    type: 'object',
+    properties: {
+      server: { type: 'string', description: 'MCP server name.' },
+      cursor: { description: 'Opaque cursor.' },
+    },
+    additionalProperties: false,
+    required: [],
+  };
+
+  const [chatTool] = openaiAdapter.toTools([codexTool]);
+  assert.deepEqual(chatTool.function.parameters, cleaned);
+
+  const [anthropicTool] = anthropicAdapter.toAnthropicTools([codexTool]);
+  assert.deepEqual(anthropicTool.input_schema, cleaned);
+
+  // 缺 required / 缺 properties 也要补成数组与对象
+  const [noRequired] = openaiAdapter.toTools([{ type: 'function', name: 'f', parameters: { type: 'object', properties: {} } }]);
+  assert.deepEqual(noRequired.function.parameters, { type: 'object', properties: {}, required: [] });
+  const [noProperties] = openaiAdapter.toTools([{ type: 'function', name: 'f', parameters: { type: 'object', required: [] } }]);
+  assert.deepEqual(noProperties.function.parameters, { type: 'object', properties: {}, required: [] });
+
+  // chat 形状的工具此前是整对象透传，同样要清洗，但其余字段保持原样
+  const [nested] = openaiAdapter.toTools([
+    { type: 'function', function: { name: 'f', parameters: { type: 'object', properties: {}, required: null } }, strict: true },
+  ]);
+  assert.deepEqual(nested, { type: 'function', function: { name: 'f', parameters: { type: 'object', properties: {}, required: [] } }, strict: true });
+
+  // parameters 缺失或为 null：补一个合法的空对象 schema
+  const [bare] = openaiAdapter.toTools([{ type: 'function', name: 'g', description: 'd', parameters: null }]);
+  assert.deepEqual(bare.function.parameters, { type: 'object', properties: {}, required: [] });
+
+  // enum 里的 null 是数据不是关键字，必须保留
+  const [withEnum] = openaiAdapter.toTools([
+    { type: 'function', name: 'h', parameters: { type: 'object', properties: { a: { type: 'string', enum: ['x', null] } } } },
+  ]);
+  assert.deepEqual(withEnum.function.parameters.properties.a.enum, ['x', null]);
 });
 
 test('responses SSE 透传：客户端断开后不再写入或消费上游', async () => {
