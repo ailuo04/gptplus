@@ -1208,6 +1208,7 @@ function installFakeDom() {
     getElementById: () => null,
     querySelector: () => null,
     addEventListener: () => {},
+    removeEventListener: () => {},
     readyState: 'complete',
     documentElement: new FakeNode('html'),
     body: root,
@@ -1217,6 +1218,7 @@ function installFakeDom() {
     setTimeout: () => 0,
     clearTimeout: () => {},
     addEventListener: () => {},
+    removeEventListener: () => {},
     gptplus: null,
   };
   // Node 里 navigator 是只读 getter，只能重新定义
@@ -1310,6 +1312,10 @@ function makeApi(state, calls) {
     },
     openCodexFolder: async () => {
       calls.push(['openCodexFolder']);
+      return { ok: true };
+    },
+    openCodexConfig: async () => {
+      calls.push(['openCodexConfig']);
       return { ok: true };
     },
     relaunchChatGpt: async () => {
@@ -1622,6 +1628,21 @@ test('主页：三段接线、今日流量与注入开关都来自真实状态',
     click(root.find('switch')[0]);
     await flush();
     assert.deepEqual(callsOf(ctx, 'setInject'), [['setInject', { enabled: false }]], '注入开关应调用 setInject');
+
+    // Codex 入口：主按钮默认打开配置文件夹，二级菜单可选打开方式
+    const split = actions.find('codex-split')[0];
+    assert.ok(split, '右上角应有 Codex 配置分体按钮');
+    click(split.find('codex-split-main')[0]);
+    await flush();
+    assert.equal(callsOf(ctx, 'openCodexFolder').length, 1, '主按钮应默认打开配置文件夹');
+    click(split.find('codex-split-caret')[0]);
+    assert.ok(split.classList.contains('is-open'), '点小箭头应展开二级菜单');
+    const codexItems = split.find('codex-split-item');
+    assert.equal(codexItems.length, 2, '二级菜单应有打开文件夹/打开配置文件两个条目');
+    click(codexItems[1]);
+    await flush();
+    assert.equal(callsOf(ctx, 'openCodexConfig').length, 1, '「打开配置文件」条目应调用 openCodexConfig');
+    assert.ok(!split.classList.contains('is-open'), '选择条目后二级菜单应收起');
 
     // 网关未运行时打开注入应被拦下，并引导到设置页
     const blockedState = fixtureState({

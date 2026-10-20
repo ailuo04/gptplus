@@ -1,7 +1,7 @@
 {
   "name": "gptplus",
   "productName": "gpt++",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "description": "为 ChatGPT 桌面客户端管理自定义模型提供商：本地网关 + 模型目录注入",
   "main": "src/main/main.js",
   "private": true,

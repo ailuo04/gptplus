@@ -257,6 +257,7 @@ window.gptplus = {
   getInject(): Promise<{ enabled: boolean; catalogPath: string|null; defaultModel: string|null }>;
   setInject(patch: { enabled?: boolean; defaultModel?: string|null }): Promise<Status>;
   openCodexFolder(): Promise<{ ok: boolean; error?: string }>;
+  openCodexConfig(): Promise<{ ok: boolean; error?: string }>;  // 用系统默认编辑器打开 config.toml
 
   onStatus(cb: (s: Status) => void): () => void;        // 返回取消订阅函数
   onLog(cb: (entry: LogEntry) => void): () => void;

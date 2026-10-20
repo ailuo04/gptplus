@@ -1069,6 +1069,61 @@ html.is-theme-switching .logs {
 .btn-icon.btn-success:hover { background: var(--ok-soft); border-color: var(--ok-line); color: var(--ok); }
 .btn-icon.btn-warning:hover { background: var(--warn-soft); border-color: var(--warn-line); color: var(--warn); }
 .btn-icon.btn-danger:hover { background: var(--err-soft); border-color: var(--err-line); color: var(--err); }
+/* 右上角 Codex 入口：主按钮默认开配置文件夹，右侧小箭头展开二级菜单。
+   整块必须放在 .btn 系列之后：主按钮去右圆角要压过 .btn 的 border-radius。 */
+.codex-split { position: relative; display: inline-flex; align-items: stretch; }
+.codex-split-main { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.codex-split-caret {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-left: 0;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  background: transparent;
+  color: var(--fg-faint);
+  cursor: pointer;
+  transition: background var(--dur-2) var(--ease-out), border-color var(--dur-2) var(--ease-out), color var(--dur-2) var(--ease-out);
+}
+/* 悬停任意一段时整块一起亮，视觉上保持同一个控件。 */
+.codex-split:hover .codex-split-main,
+.codex-split:hover .codex-split-caret { background: var(--bg-hover); border-color: var(--line-strong); color: var(--fg); }
+.codex-split.is-open .codex-split-caret { background: var(--accent-soft); border-color: var(--accent-line); color: var(--accent-hi); }
+.codex-split-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 30;
+  display: none;
+  padding: 3px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+  box-shadow: var(--e-3);
+}
+.codex-split.is-open .codex-split-menu { display: grid; gap: 2px; animation: pop var(--dur-2) var(--ease-out); }
+.codex-split-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  min-height: 28px;
+  padding: 4px 6px;
+  border: 1px solid transparent;
+  border-radius: calc(var(--radius-sm) - 1px);
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease-out), border-color var(--dur-1) var(--ease-out), color var(--dur-1) var(--ease-out);
+}
+.codex-split-item:hover { border-color: var(--accent-line); background: var(--accent-soft); color: var(--accent-hi); }
+.codex-split-item-label { flex: 1 1 auto; font-weight: 600; }
 
 .btn svg, .icon svg { display: block; }
 .icon { display: inline-flex; align-items: center; color: currentColor; transition: transform var(--dur-2) var(--ease-pop), color var(--dur-2) var(--ease-out); }
