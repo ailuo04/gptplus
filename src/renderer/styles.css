@@ -43,6 +43,7 @@
   --row-hover: rgba(255, 255, 255, 0.028);
   --setting-hover: rgba(255, 255, 255, 0.02);
   --modal-backdrop: rgba(5, 7, 10, 0.58);
+  --modal-backdrop-soft: rgba(5, 7, 10, 0.46);
   /* 毛玻璃面板：半透明底色 + 高光描边，靠 backdrop-filter 让背后的内容透出来 */
   --glass: rgba(26, 30, 38, 0.66);
   --glass-strong: rgba(30, 35, 45, 0.6);
@@ -51,6 +52,11 @@
   --glass-line: rgba(255, 255, 255, 0.09);
   --glass-edge: rgba(255, 255, 255, 0.14);
   --glass-shadow: 0 24px 60px -18px rgba(0, 0, 0, 0.85), 0 8px 24px -8px rgba(0, 0, 0, 0.6);
+  /* 更新弹窗专用的「薄玻璃」：更透的底色、更强的背光模糊，顶部一层斜向高光让它浮起来 */
+  --glass-float: rgba(24, 28, 36, 0.56);
+  --glass-float-edge: rgba(255, 255, 255, 0.17);
+  --glass-float-sheen: rgba(255, 255, 255, 0.10);
+  --glass-float-warn: rgba(234, 179, 8, 0.09);
   --surface-deep: #13161c;
   --flow-sep: #4d5766;
   --note-warn-text: #fef3c7;
@@ -218,6 +224,7 @@ html[data-theme="light"] {
   --row-hover: rgba(15, 23, 42, 0.04);
   --setting-hover: rgba(15, 23, 42, 0.03);
   --modal-backdrop: rgba(15, 23, 42, 0.45);
+  --modal-backdrop-soft: rgba(15, 23, 42, 0.28);
   --glass: rgba(255, 255, 255, 0.78);
   --glass-strong: rgba(250, 252, 252, 0.66);
   --glass-inset: rgba(241, 245, 249, 0.55);
@@ -225,6 +232,10 @@ html[data-theme="light"] {
   --glass-line: rgba(15, 23, 42, 0.07);
   --glass-edge: rgba(255, 255, 255, 0.9);
   --glass-shadow: 0 24px 64px -20px rgba(15, 23, 42, 0.32), 0 8px 22px -10px rgba(15, 23, 42, 0.18);
+  --glass-float: rgba(255, 255, 255, 0.58);
+  --glass-float-edge: rgba(255, 255, 255, 0.92);
+  --glass-float-sheen: rgba(255, 255, 255, 0.5);
+  --glass-float-warn: rgba(202, 138, 4, 0.08);
   --surface-deep: #f1f5f9;
   --flow-sep: #94a3b8;
   --note-warn-text: #92400e;
@@ -2209,6 +2220,63 @@ html.is-theme-switching .logs {
   transform-origin: 50% 45%;
   animation: modal-in 340ms var(--ease-spring) both;
 }
+/* 更新确认弹窗内容少：收成一条窄卡，玻璃更薄、背景更透，顶部加一层斜向高光。 */
+.modal-backdrop:has(.modal-update) {
+  background: var(--modal-backdrop-soft);
+  backdrop-filter: blur(22px) saturate(140%);
+  -webkit-backdrop-filter: blur(22px) saturate(140%);
+}
+.modal.modal-update {
+  width: min(384px, 100%);
+  border-radius: 16px;
+  border-color: var(--glass-float-edge);
+  background:
+    linear-gradient(150deg, var(--glass-float-sheen), rgba(255, 255, 255, 0) 44%),
+    var(--glass-float);
+  backdrop-filter: blur(38px) saturate(170%);
+  -webkit-backdrop-filter: blur(38px) saturate(170%);
+  box-shadow: var(--glass-shadow), inset 0 1px 0 rgba(255, 255, 255, 0.28);
+}
+.modal-update .modal-head {
+  padding: 12px 16px 10px;
+  gap: 11px;
+  border-bottom: 0;
+  background: transparent;
+}
+.modal-update-mark {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  border: 1px solid var(--warn-line);
+  background: var(--warn-soft);
+  color: var(--warn);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+.modal-update-heading { min-width: 0; }
+.modal-update .modal-head h2 { font-size: 14px; }
+.modal-update .modal-sub { margin-top: 1px; font-size: 11.5px; line-height: 1.35; }
+.modal-update .modal-body { padding: 9px 16px 0; }
+.modal-update .note {
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 9px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.modal.modal-update .note-warn { background: var(--glass-float-warn); }
+.modal-update .note .icon { margin-top: 1px; }
+.modal-update .note .faint { font-size: 11.5px; }
+.modal-update .modal-foot {
+  justify-content: flex-end;
+  padding: 11px 16px 12px;
+  border-top: 0;
+  background: transparent;
+}
+.modal-update .btn { min-height: 30px; padding: 0 13px; }
 .modal-backdrop.is-closing .modal { animation: modal-out 200ms cubic-bezier(0.4, 0, 1, 1) both; }
 /* 宽度档位写在 .modal 之后，否则会被基础宽度覆盖（同优先级、后者胜出）。 */
 .modal.model-delete-modal { width: min(430px, 100%); }

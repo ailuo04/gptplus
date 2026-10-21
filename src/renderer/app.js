@@ -1312,12 +1312,17 @@ function handleUpdateState(next) {
 /** 更新确认弹窗：暂不更新只关闭弹窗，版本状态会继续留在左侧和设置页。 */
 function openUpdateModal() {
   const update = state.update || {};
-  const title = el('h2', { text: '发现 gpt++ 新版本' });
   const sub = el('div', { class: 'modal-sub', text: `当前 v${update.currentVersion || '—'} · 最新 v${update.version || '—'}` });
   const status = el('div', { class: 'modal-body' });
   const foot = el('div', { class: 'modal-foot' });
-  const modal = el('section', { class: 'modal', attrs: { role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'update-modal-title' } }, [
-    el('header', { class: 'modal-head' }, [el('div', {}, [el('h2', { text: '发现 gpt++ 新版本', attrs: { id: 'update-modal-title' } }), sub])]),
+  const modal = el('section', { class: 'modal modal-update', attrs: { role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'update-modal-title' } }, [
+    el('header', { class: 'modal-head' }, [
+      el('div', { class: 'modal-update-mark' }, [icon('download', 15)]),
+      el('div', { class: 'modal-update-heading' }, [
+        el('h2', { text: '发现 gpt++ 新版本', attrs: { id: 'update-modal-title' } }),
+        sub,
+      ]),
+    ]),
     status,
     foot,
   ]);
@@ -1328,7 +1333,7 @@ function openUpdateModal() {
         icon(current.status === 'downloading' ? 'download' : 'zap', 15),
         el('div', { class: 'grow' }, [
           el('div', { text: current.status === 'downloading' ? `正在下载 v${current.version || ''}` : current.status === 'downloaded' ? '更新已下载，正在准备安装' : `检测到最新版 v${current.version || ''}` }),
-          el('div', { class: 'faint', text: current.status === 'downloading' ? `下载进度 ${Math.round(current.percent || 0)}%，完成后会自动重启安装。` : '现在更新会下载并安装新版本；暂不更新不会影响当前使用。' }),
+          el('div', { class: 'faint', text: current.status === 'downloading' ? `下载进度 ${Math.round(current.percent || 0)}%，完成后会自动重启安装。` : '更新会下载并安装新版本，暂不更新不影响使用。' }),
         ]),
       ]),
     );
