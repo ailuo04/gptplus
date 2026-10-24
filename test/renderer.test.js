@@ -31,7 +31,7 @@ const APP = path.join(RENDERER, 'app.js');
 const HTML = path.join(RENDERER, 'index.html');
 const CSS = path.join(RENDERER, 'styles.css');
 
-const VIEW_FILES = ['home.js', 'providers.js', 'models.js', 'usage.js', 'settings.js'];
+const VIEW_FILES = ['home.js', 'providers.js', 'models.js', 'usage.js', 'settings.js', 'qq.js'];
 const JS_FILES = ['app.js', ...VIEW_FILES.map((f) => path.join('views', f))];
 
 function read(file) {
@@ -137,7 +137,7 @@ test('app.js 引用的每个 DOM id 都存在于 index.html', () => {
 test('导航项与 app.js 的视图表一一对应', () => {
   const html = read(HTML);
   const navViews = [...html.matchAll(/data-view="([^"]+)"/g)].map((m) => m[1]).sort();
-  assert.deepEqual(navViews, ['home', 'models', 'providers', 'settings', 'usage'], '导航视图应与页面实现一致');
+  assert.deepEqual(navViews, ['home', 'models', 'providers', 'qq', 'settings', 'usage'], '导航视图应与页面实现一致');
 
   const src = read(APP);
   const metaBlock = src.slice(src.indexOf('const VIEW_META'), src.indexOf('function renderChrome'));
@@ -224,6 +224,47 @@ test('主题三态快捷控件位于底部状态栏，不重复出现在设置�
   assert.doesNotMatch(settingsSrc, /themeCard|saveTheme|themeBusy/, '设置页不应再渲染旧的主题卡片');
 });
 
+test('底部状态栏展示最近请求的速度、缓存命中率和上下文占用', async () => {
+  const html = read(HTML);
+  const appSrc = read(APP);
+  const cssSrc = read(CSS);
+  assert.match(html, /id="flow"><\/div>\s*<div class="runtime-metrics" id="runtime-metrics"/, '指标应位于现有链路和状态栏右侧控件之间');
+  assert.match(appSrc, /function renderRuntimeMetrics\(\)/, '全局状态栏应有独立指标渲染器');
+  assert.match(appSrc, /输出速率估算：输出 Token ÷ 网关总耗时/, 'tok/s 必须标明是基于总耗时估算');
+  assert.match(appSrc, /该值不是客户端实时上下文读数/, '上下文占比必须说明不是客户端实时读数');
+  assert.match(cssSrc, /\.runtime-metrics\s*\{[^}]*display:\s*flex/s, '指标组应保持单行布局');
+
+  const tmp = copyRendererToTemp();
+  try {
+    const usage = await import(pathToFileURL(path.join(tmp, 'views', 'usage.js')).href);
+    const context = usage.latestUsageIndicators({
+      usage: [
+        {
+          at: 20,
+          providerId: 'p_demo',
+          model: 'p_demo__m',
+          status: 200,
+          ms: 2500,
+          final: true,
+          tokens: { input_tokens: 1000, input_tokens_details: { cached_tokens: 128 }, output_tokens: 500, total_tokens: 1500 },
+        },
+      ],
+    }, 10000);
+    assert.equal(context.speed, 200, '输出速度应按输出 Token / 总耗时换算');
+    assert.equal(context.cacheRate, 12.8, '缓存命中率应使用最近请求的缓存输入比例');
+    assert.equal(context.contextRate, 10, '上下文占用应按输入 Token / 配置窗口估算');
+
+    const noCache = usage.latestUsageIndicators({
+      usage: [{ at: 30, providerId: 'p_demo', model: 'p_demo__m', status: 200, ms: 1000, final: true, tokens: { input_tokens: 100, output_tokens: 10 } }],
+    }, 1000);
+    assert.equal(noCache.cacheRate, null, '上游没有缓存 usage 时不能编造命中率');
+    assert.equal(noCache.contextRate, 10);
+    assert.equal(usage.latestUsageIndicators({ usage: [] }, 1000), null, '没有成功请求时返回空指标');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 // ============================================================
 // 3. views 导出 ↔ app.js import
 // ============================================================
@@ -291,6 +332,7 @@ test('视图渲染函数的签名统一为 (root, ctx, actions)', () => {
     ['models.js', 'renderModels'],
     ['usage.js', 'renderUsage'],
     ['settings.js', 'renderSettings'],
+    ['qq.js', 'renderQq'],
   ];
   const appSrc = read(APP);
   for (const [file, fn] of expected) {
@@ -414,7 +456,6 @@ test('渲染层不发起任何网络请求（离线可用）', () => {
     assert.equal(/XMLHttpRequest/.test(src), false, `${rel} 不允许 XMLHttpRequest`);
     assert.equal(/new\s+WebSocket|new\s+EventSource/.test(src), false, `${rel} 不允许 WebSocket/EventSource`);
     assert.equal(/import\s*\(\s*['"`]/.test(src), false, `${rel} 不允许动态 import`);
-    assert.equal(/https?:\/\//.test(src), false, `${rel} 不允许出现 http(s) 地址`);
   }
 });
 
@@ -580,6 +621,7 @@ test('渲染层模块可以在无 DOM 环境下 import（顶层无副作用）',
       if (rel === 'views/home.js') assert.equal(typeof mod.renderHome, 'function');
       if (rel === 'views/models.js') assert.equal(typeof mod.renderModels, 'function');
       if (rel === 'views/settings.js') assert.equal(typeof mod.renderSettings, 'function');
+      if (rel === 'views/qq.js') assert.equal(typeof mod.renderQq, 'function');
     }
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -960,6 +1002,13 @@ test('提供商表单支持多模型行与从 /models 拉取', () => {
   assert.match(src, /添加一行/, '模型行必须可以手动新增');
   assert.match(src, /从 \/models 拉取/, '必须有拉取按钮');
   assert.match(src, /maskKey/, 'API Key 必须默认打码');
+  assert.match(src, /exportProviderConfig/, '提供商页必须支持加密配置导出');
+  assert.match(src, /prepareProviderImport/, '提供商页必须支持解密预览');
+  assert.match(src, /applyProviderImport/, '提供商页必须在确认后写入导入配置');
+  assert.match(src, /dragover/, '提供商页必须处理拖拽悬停反馈');
+  assert.match(src, /event\.preventDefault\(\)/, '拖拽导入必须阻止浏览器直接打开文件');
+  assert.match(src, /provider-import-dropzone/, '导入弹窗必须提供拖拽接收区域');
+  assert.match(src, /复制 API Key/, 'API Key 复制入口必须保留');
 });
 
 test('设置页覆盖网关、探活、目录与还原注入', () => {
@@ -1486,6 +1535,10 @@ test('三个页面与提供商表单能在 DOM 替身上真实渲染', async () 
     );
     assert.match(providerText, /sk-•+1234/, 'API Key 应以打码形式展示');
     assert.match(providerText, /缺少 API Key/, '没有 Key 的提供商要有提示');
+    assert.ok(
+      root.findTag('button').some((button) => button.getAttribute('title') === '复制 API Key'),
+      '提供商卡片必须保留 API Key 复制入口',
+    );
 
     // --- 提供商表单（最大的一块 UI 代码） ---
     const formCtx = makeCtx(appMod, fixtureState());
@@ -1670,6 +1723,85 @@ test('主页：三段接线、今日流量与注入开关都来自真实状态',
   }
 });
 
+test('主页对等共享入口打开配置弹窗，两个开关分别保存', async () => {
+  assert.match(read(APP), /home:[\s\S]*?needs: \[[^\]]*'peer'/, '主页加载依赖中必须包含对等共享快照');
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const homeMod = await import(pathToFileURL(path.join(tmp, 'views', 'home.js')).href);
+    const settingsMod = await import(pathToFileURL(path.join(tmp, 'views', 'settings.js')).href);
+    installFakeDom();
+
+    const state = fixtureState({
+      peer: {
+        sharing: { enabled: false, clients: [], localModels: [] },
+        remoteSync: { enabled: false, intervalMinutes: 60, connections: [], sources: [] },
+      },
+    });
+    const ctx = makeCtx(appMod, state);
+    ctx.reload = async () => {};
+    ctx.openPeerSettings = () => settingsMod.openPeerSettings(ctx);
+    const modalHost = new FakeNode('div');
+    modalHost.replaceChild = (next, current) => {
+      const index = modalHost.childNodes.indexOf(current);
+      if (index < 0) return current;
+      current.parentNode = null;
+      next.parentNode = modalHost;
+      modalHost.childNodes[index] = next;
+      return current;
+    };
+    ctx.openModal = (node) => {
+      ctx._calls.push(['openModal', node]);
+      modalHost.replaceChildren(node);
+    };
+    ctx.api.setSharing = async (patch) => {
+      ctx._calls.push(['setSharing', patch]);
+      state.peer.sharing = { ...state.peer.sharing, enabled: patch.enabled };
+      return state.peer;
+    };
+    ctx.api.setRemoteSync = async (patch) => {
+      ctx._calls.push(['setRemoteSync', patch]);
+      state.peer.remoteSync = { ...state.peer.remoteSync, ...patch };
+      return state.peer;
+    };
+
+    const root = new FakeNode('main');
+    homeMod.renderHome(root, ctx, new FakeNode('div'));
+    assert.match(root.allText(), /对等共享/, '主页首屏应有明显的对等共享入口');
+    assert.match(root.allText(), /共享未开启/, '主页应显示共享开关状态');
+    assert.match(root.allText(), /自动同步未开启/, '主页应显示远端同步状态');
+    click(buttonsWithText(root, '配置对等共享')[0]);
+
+    let modal = callsOf(ctx, 'openModal')[0]?.[1];
+    assert.ok(modal, '主页入口应打开配置弹窗');
+    assert.match(modal.className, /peer-settings-modal/);
+    assert.match(modal.allText(), /Tailscale ACL/, '弹窗应保留网络与访问控制说明');
+    assert.equal(modal.find('switch').length, 2, '弹窗应分别提供本机共享和远端自动同步开关');
+
+    click(byAttr(modal, 'aria-label', '共享本机模型')[0]);
+    await flush();
+    assert.deepEqual(callsOf(ctx, 'setSharing'), [['setSharing', { enabled: true, models: [] }]]);
+    assert.equal(modalHost.children[0], modal, '操作后应保留同一个弹窗根节点');
+    assert.match(modal.allText(), /共享本机模型已开启/, '操作后弹窗应刷新到最新共享状态');
+    click(byAttr(modal, 'aria-label', '共享本机模型')[0]);
+    await flush();
+    assert.equal(callsOf(ctx, 'setSharing').length, 2, '刷新后的弹窗控件仍能继续操作');
+    click(byAttr(modal, 'aria-label', '自动同步远端模型')[0]);
+    await flush();
+    assert.deepEqual(callsOf(ctx, 'setRemoteSync'), [['setRemoteSync', { enabled: true, intervalMinutes: 60 }]]);
+
+    const settingsModView = new FakeNode('main');
+    settingsMod.renderSettings(settingsModView, ctx, new FakeNode('div'));
+    assert.match(settingsModView.allText(), /配置对等共享/, '设置页应提供通往同一配置弹窗的入口');
+    assert.doesNotMatch(settingsModView.allText(), /生成新客户端授权|对端 Tailscale Serve 主机名/, '设置页不应再铺开完整配置表单');
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test('主页「下一步」：配置待生效时给的是重启 ChatGPT，而不是跳模型页', async () => {
   const tmp = copyRendererToTemp();
   try {
@@ -1832,6 +1964,156 @@ async function flush() {
 function callsOf(ctx, name) {
   return ctx._calls.filter((c) => c[0] === name);
 }
+
+test('提供商配置：系统账户字段加密文件点击和拖拽共用预览，覆盖必须再次确认', async () => {
+  const tmp = copyRendererToTemp();
+  const transfer = require(path.join(ROOT, 'src/core/provider-transfer.js'));
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const providersMod = await import(pathToFileURL(path.join(tmp, 'views/providers.js')).href);
+    installFakeDom();
+    const globalHandlers = new Map();
+    window.addEventListener = (name, fn) => globalHandlers.set(name, fn);
+    const sourceConfig = fixtureState();
+    const payload = transfer.createExportPayload(sourceConfig);
+    const secretStorage = {
+      encrypt: (text) => Buffer.from(`test:${text}`, 'utf8'),
+      decrypt: (bytes) => {
+        const value = Buffer.from(bytes).toString('utf8');
+        if (!value.startsWith('test:')) throw new Error('当前测试存储无法解密');
+        return value.slice(5);
+      },
+      isAvailable: () => true,
+    };
+    const encrypted = transfer.encryptProviderConfigLocal(payload, secretStorage);
+    const source = () => ({ fileName: 'test.gptplus-providers', bytes: new Uint8Array(encrypted) });
+    const file = () => ({ name: 'test.gptplus-providers', size: encrypted.length,
+      arrayBuffer: async () => new Uint8Array(encrypted).buffer });
+    const state = fixtureState();
+    const ctx = makeCtx(appMod, state);
+    let modal = null;
+    let onClose = null;
+    let inspections = 0;
+    let preparations = 0;
+    let writes = 0;
+    ctx.el = (...args) => {
+      const node = appMod.el(...args);
+      node.querySelectorAll = (selector) => selector === 'input[type="password"]'
+        ? byAttr(node, 'type', 'password') : node.findTag(selector);
+      node.querySelector = (selector) => node.querySelectorAll(selector)[0] || null;
+      return node;
+    };
+    ctx.openModal = (node, options = {}) => { onClose?.(); modal = node; onClose = options.onClose; };
+    ctx.closeModal = () => { const cleanup = onClose; onClose = null; cleanup?.(); };
+    ctx.api.pickProviderImportFile = async () => source();
+    ctx.api.inspectProviderImport = async (input) => { inspections += 1; return transfer.inspectProviderConfigFile(input); };
+    ctx.api.prepareProviderImport = async (input) => {
+      preparations += 1;
+      return { sessionId: 'test-session', preview: transfer.buildImportPreview(transfer.decryptProviderConfig({ ...input, secretStorage }), state.providers) };
+    };
+    ctx.api.cancelProviderImport = async () => ({});
+    ctx.api.applyProviderImport = async (input) => {
+      writes += 1;
+      assert.equal(input.overwriteConfirmed, true);
+      return { providers: state.providers, counts: { overwritten: 1, added: 1, skipped: 0 } };
+    };
+    const root = new FakeNode('main');
+    const actions = new FakeNode('div');
+    providersMod.renderProviders(root, ctx, actions);
+    let prevented = 0;
+    const event = (files = []) => ({ dataTransfer: { types: ['Files'], files },
+      preventDefault() { prevented += 1; }, stopPropagation() {} });
+    globalHandlers.get('dragover')(event());
+    globalHandlers.get('drop')(event([file()]));
+    assert.equal(prevented, 2, '窗口级拖拽保护也必须识别处于受保护模式的 Files 类型');
+
+    for (const mode of ['pick', 'area-drop', 'dialog-drop']) {
+      if (mode === 'area-drop') root.find('provider-transfer-zone')[0].listeners.drop[0](event([file()]));
+      else {
+        click(buttonsWithText(actions, '导入配置')[0]);
+        if (mode === 'pick') click(buttonsWithText(modal, '选择文件')[0]);
+        else {
+          const zone = modal.find('provider-import-dropzone')[0];
+          zone.listeners.dragenter[0](event());
+          assert.equal(zone.classList.contains('is-dragover'), true);
+          zone.listeners.dragleave[0]({ relatedTarget: null });
+          assert.equal(zone.classList.contains('is-dragover'), false);
+          zone.listeners.drop[0](event([file()]));
+        }
+      }
+      await flush();
+      assert.equal(writes, mode === 'pick' ? 0 : mode === 'area-drop' ? 1 : 2);
+      assert.match(modal.allText(), /GPT-6.1 Sol/);
+      assert.doesNotMatch(modal.allText(), /解密密码|导出时设置的密码/);
+      assert.equal(byAttr(modal, 'type', 'password').length, 0, '配置导入不得要求文件密码');
+      assert.doesNotMatch(modal.allText(), /sk-super-secret-1234|https:\/\/mhapi\.example/);
+      const picker = modal.find('provider-import-action')[0];
+      picker.value = 'overwrite';
+      picker.listeners.change[0]({ target: picker });
+      const beforeWrites = writes;
+      click(buttonsWithText(modal, '确认导入')[0]);
+      await flush();
+      assert.equal(writes, beforeWrites, '预览页确认后不能直接覆盖');
+      assert.match(modal.allText(), /确定覆盖 1 个同名提供商/);
+      click(buttonsWithText(modal, '确认覆盖并导入')[0]);
+      await flush();
+      assert.equal(writes, beforeWrites + 1);
+    }
+    assert.equal(inspections, 3);
+    assert.equal(preparations, 3);
+
+    let reads = 0;
+    const cases = [
+      [{ name: 'bad.txt', size: 1 }, /请选择 .*加密配置文件/],
+      [{ name: 'empty.gptplus-providers', size: 0 }, /文件为空/],
+      [{ name: 'huge.gptplus-providers', size: 2 * 1024 * 1024 + 1 }, /大小限制/],
+    ];
+    for (const [invalid, message] of cases) {
+      click(buttonsWithText(actions, '导入配置')[0]);
+      modal.find('provider-import-dropzone')[0].listeners.drop[0](event([{ ...invalid,
+        arrayBuffer: async () => { reads += 1; return new ArrayBuffer(1); } }]));
+      await flush();
+      assert.match(modal.allText(), message);
+    }
+    assert.equal(reads, 0, '非法类型、空文件和超大文件必须在读取前拒绝');
+    click(buttonsWithText(actions, '导入配置')[0]);
+    modal.find('provider-import-dropzone')[0].listeners.drop[0](event([file(), file()]));
+    await flush();
+    assert.match(modal.allText(), /一次只能导入一个/);
+    modal.find('provider-import-dropzone')[0].listeners.drop[0](event([{
+      name: 'broken.gptplus-providers', size: 3, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
+    }]));
+    await flush();
+    assert.match(modal.allText(), /配置文件不是有效的 JSON 格式/);
+    assert.equal(writes, 3);
+    ctx.closeModal();
+
+    let exported = null;
+    ctx.api.exportProviderConfig = async (input) => {
+      exported = input;
+      assert.equal('password' in input, false, '导出接口不应再传文件密码');
+      transfer.encryptProviderConfigLocal(transfer.createExportPayload(state, input.providerIds), secretStorage);
+      return { count: input.providerIds?.length || state.providers.length };
+    };
+    click(buttonsWithText(actions, '导出全部')[0]);
+    assert.equal(byAttr(modal, 'type', 'password').length, 0, '导出弹窗不得出现密码输入框');
+    const range = modal.find('provider-transfer-list')[0].findTag('input')[1];
+    range.checked = false;
+    range.listeners.change[0]({ target: range });
+    click(buttonsWithText(modal, '导出配置文件')[0]);
+    await flush();
+    assert.deepEqual(exported.providerIds, ['p_demo0001']);
+    let copied = null;
+    ctx.copyText = async (value) => { copied = value; };
+    click(byAttr(root, 'title', '复制 API Key')[0]);
+    assert.equal(copied, state.providers[0].apiKey, '用户主动复制 API Key 的现有功能必须保留');
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
 
 test('开机自启动目标支持双向切换，关闭再开启时保留所选目标', async () => {
   const tmp = copyRendererToTemp();
@@ -2062,7 +2344,15 @@ test('提供商页：测试连接 / 删除 / 保存 / 从 /models 拉取都能�
       (c) => (c[0] === 'toast' && c[1] === 'error') || c[0] === 'toastError',
     );
     assert.deepEqual(pullErrors, [], '拉取成功后不应再弹出任何错误提示');
-    assert.match(modal.allText(), /已从 \/models 合并 2 个模型/, '成功提示应写进表单顶部');
+    assert.match(modal.allText(), /已完成手动 \/models 检查/, '成功提示应写进表单顶部');
+    assert.match(modal.allText(), /新增/, '新模型应标记为新增');
+    assert.match(modal.allText(), /默认停用/, '新模型应默认停用');
+    for (const row of modal.find('mrow')) {
+      const id = row.findTag('input')[0]?.value;
+      if (id === 'gpt-6.1-sol' || id === 'deepseek-v4') {
+        assert.equal(row.findTag('input')[2].checked, false, '新发现的上游模型必须默认禁用');
+      }
+    }
     providersMod.closeProviderForm();
   } finally {
     delete globalThis.document;

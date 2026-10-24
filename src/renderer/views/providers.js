@@ -3,6 +3,7 @@
 // 安全：所有用户/接口字符串都经 textContent（el 的 text）或 setAttribute 进入 DOM。
 
 const API_LABELS = { openai: 'OpenAI 兼容', responses: 'Responses 透传', anthropic: 'Anthropic' };
+const MAX_IMPORT_FILE_BYTES = 2 * 1024 * 1024;
 
 // 视图级临时状态（跨重渲染保留）
 const viewState = {
@@ -10,7 +11,21 @@ const viewState = {
   probe: {},
   revealed: {},
   toggling: {},
+  selected: {},
 };
+
+let providerDropGuardInstalled = false;
+
+function installProviderDropGuard() {
+  if (providerDropGuardInstalled || typeof window === 'undefined') return;
+  const guard = (event) => {
+    const transfer = event.dataTransfer;
+    if (transfer && (Array.from(transfer.types || []).includes('Files') || transfer.files?.length)) event.preventDefault();
+  };
+  window.addEventListener('dragover', guard);
+  window.addEventListener('drop', guard);
+  providerDropGuardInstalled = true;
+}
 
 /**
  * 渲染提供商页。
@@ -20,7 +35,12 @@ const viewState = {
  */
 export function renderProviders(root, ctx, actions) {
   const { el, icon, state } = ctx;
+  installProviderDropGuard();
   const providers = state.providers || [];
+  const providerIds = new Set(providers.map((provider) => provider.id));
+  for (const id of Object.keys(viewState.selected)) {
+    if (!providerIds.has(id)) delete viewState.selected[id];
+  }
 
   // ---- 标题栏动作 ----
   actions.replaceChildren(
@@ -30,6 +50,16 @@ export function renderProviders(root, ctx, actions) {
       on: { click: () => ctx.reload('providers') },
     }, [icon('refresh', 13), el('span', { text: '刷新' })]),
     el('button', {
+      class: 'btn btn-ghost btn-sm',
+      type: 'button',
+      on: { click: () => openImportDialog(ctx) },
+    }, [icon('folder', 13), el('span', { text: '导入配置' })]),
+    el('button', {
+      class: 'btn btn-ghost btn-sm',
+      type: 'button',
+      on: { click: () => openExportDialog(ctx, null) },
+    }, [icon('download', 13), el('span', { text: '导出全部' })]),
+    el('button', {
       class: 'btn btn-primary',
       type: 'button',
       on: { click: () => openProviderForm(ctx, null) },
@@ -37,7 +67,7 @@ export function renderProviders(root, ctx, actions) {
   );
 
   if (!providers.length) {
-    root.replaceChildren(emptyState(ctx));
+    root.replaceChildren(transferZone(ctx), emptyState(ctx));
     return;
   }
 
@@ -56,10 +86,62 @@ export function renderProviders(root, ctx, actions) {
       class: 'right chip chip-mono ' + (injecting ? 'chip-codex' : ''),
       text: `注入 ${injecting ? '开启' : '关闭'}`,
     }),
+    el('button', {
+      class: 'btn btn-sm btn-accent',
+      type: 'button',
+      disabled: selectedProviderIds().length ? null : true,
+      title: '导出勾选的提供商配置',
+      on: { click: () => openExportDialog(ctx, selectedProviderIds()) },
+    }, [icon('download', 13), el('span', { text: `导出选中（${selectedProviderIds().length}）` })]),
   ]);
 
   const grid = el('div', { class: 'grid' }, providers.map((p) => providerCard(ctx, p)));
-  root.replaceChildren(quota, grid);
+  root.replaceChildren(transferZone(ctx), quota, grid);
+}
+
+function selectedProviderIds() {
+  return Object.entries(viewState.selected)
+    .filter(([, selected]) => selected)
+    .map(([id]) => id);
+}
+
+function transferZone(ctx) {
+  const { el, icon } = ctx;
+  const zone = el('section', {
+    class: 'provider-transfer-zone',
+    attrs: { 'aria-label': '提供商配置导入区' },
+    on: {
+      dragenter: (event) => {
+        event.preventDefault();
+        zone.classList.add('is-dragover');
+      },
+      dragover: (event) => {
+        event.preventDefault();
+        if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+        zone.classList.add('is-dragover');
+      },
+      dragleave: (event) => {
+        if (!event.relatedTarget || !zone.contains?.(event.relatedTarget)) zone.classList.remove('is-dragover');
+      },
+      drop: (event) => {
+        event.preventDefault();
+        zone.classList.remove('is-dragover');
+        void openImportDialog(ctx, event.dataTransfer?.files);
+      },
+    },
+  }, [
+    el('div', { class: 'provider-transfer-zone-icon' }, [icon('box', 17)]),
+    el('div', { class: 'grow' }, [
+      el('div', { class: 'provider-transfer-zone-title', text: '拖入字段加密配置文件即可导入' }),
+      el('div', { class: 'hint', text: '支持点击选择文件；敏感字段只在系统安全存储解密通过后写入本机配置' }),
+    ]),
+    el('button', {
+      class: 'btn btn-sm btn-ghost',
+      type: 'button',
+      on: { click: () => openImportDialog(ctx) },
+    }, [icon('folder', 13), el('span', { text: '选择文件' })]),
+  ]);
+  return zone;
 }
 
 function emptyState(ctx) {
@@ -80,6 +162,11 @@ function emptyState(ctx) {
       el('button', {
         class: 'btn btn-ghost',
         type: 'button',
+        on: { click: () => openImportDialog(ctx) },
+      }, [icon('folder', 13), el('span', { text: '导入字段加密配置' })]),
+      el('button', {
+        class: 'btn btn-ghost',
+        type: 'button',
         on: { click: () => ctx.navigate('settings') },
       }, [icon('server', 13), el('span', { text: '先看网关设置' })]),
     ]),
@@ -94,9 +181,27 @@ function providerCard(ctx, p) {
   const reasoning = models.filter((m) => m.reasoning).length;
   const isOn = p.enabled !== false;
   const probe = viewState.probe[p.id];
+  const selected = !!viewState.selected[p.id];
 
   // 名称 + Base URL
   const head = el('div', { class: 'pcard-top' }, [
+    el('label', {
+      class: 'provider-select',
+      title: '选择该提供商用于导出',
+    }, [
+      el('input', {
+        type: 'checkbox',
+        checked: selected ? true : null,
+        attrs: { 'aria-label': `选择提供商 ${p.name || '未命名'}` },
+        on: {
+          change: (event) => {
+            viewState.selected[p.id] = !!event.target.checked;
+            ctx.renderCurrent(true, { preserveScrollTop: true });
+          },
+        },
+      }),
+      el('span', { class: 'provider-select-mark', 'aria-hidden': 'true' }),
+    ]),
     el('div', { class: 'grow' }, [
       el('div', { class: 'pcard-name ellipsis', text: p.name || '(未命名)' }),
       el('div', { class: 'mono faint ellipsis', title: p.baseUrl || '', text: p.baseUrl || '未填写 Base URL' }),
@@ -223,6 +328,535 @@ function providerCard(ctx, p) {
     modelMini,
     foot,
   ]);
+}
+
+function importErrorText(ctx, err, fallback = '导入失败') {
+  const message = ctx.describeError(err, fallback);
+  return message || fallback;
+}
+
+function fileBytes(file) {
+  if (!file) return Promise.reject(new Error('没有选择文件'));
+  const declaredSize = Number(file.size);
+  if (Number.isFinite(declaredSize)) {
+    if (declaredSize === 0) return Promise.reject(new Error('字段加密配置文件为空'));
+    if (declaredSize > MAX_IMPORT_FILE_BYTES) return Promise.reject(new Error('字段加密配置文件超过大小限制'));
+  }
+  if (typeof file.arrayBuffer === 'function') {
+    return file.arrayBuffer().then((buffer) => {
+      const bytes = new Uint8Array(buffer);
+      if (bytes.length === 0) throw new Error('字段加密配置文件为空');
+      if (bytes.length > MAX_IMPORT_FILE_BYTES) throw new Error('字段加密配置文件超过大小限制');
+      return bytes;
+    });
+  }
+  if (typeof FileReader === 'function') {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error('读取配置文件失败'));
+      reader.onload = () => {
+        const bytes = new Uint8Array(reader.result);
+        if (bytes.length === 0) {
+          reject(new Error('字段加密配置文件为空'));
+          return;
+        }
+        if (bytes.length > MAX_IMPORT_FILE_BYTES) {
+          reject(new Error('字段加密配置文件超过大小限制'));
+          return;
+        }
+        resolve(bytes);
+      };
+      reader.readAsArrayBuffer(file);
+    });
+  }
+  return Promise.reject(new Error('当前环境无法读取配置文件'));
+}
+
+function importSourceFromFile(file) {
+  if (!String(file?.name || '').toLowerCase().endsWith('.gptplus-providers')) {
+    return Promise.reject(new Error('请选择 .gptplus-providers 字段加密配置文件'));
+  }
+  return fileBytes(file).then((bytes) => ({
+    fileName: String(file.name || ''),
+    bytes,
+  }));
+}
+
+function openExportDialog(ctx, initialIds = null) {
+  const { el, icon } = ctx;
+  const providers = Array.isArray(ctx.state.providers) ? ctx.state.providers : [];
+  const available = new Set(providers.map((provider) => provider.id));
+  const selected = new Set(
+    initialIds === null
+      ? providers.map((provider) => provider.id)
+      : (Array.isArray(initialIds) ? initialIds : []).filter((id) => available.has(id)),
+  );
+  let busy = false;
+
+  const noteBox = el('div');
+  const selectionSummary = el('span', { class: 'faint' });
+  const providerList = el('div', { class: 'provider-transfer-list' });
+  const exportBtn = el('button', { class: 'btn btn-primary', type: 'button' }, [
+    icon('download', 13),
+    el('span', { text: '导出配置文件' }),
+  ]);
+
+  function setNote(kind, text) {
+    if (!text) {
+      noteBox.replaceChildren();
+      return;
+    }
+    noteBox.replaceChildren(el('div', { class: `note note-${kind}` }, [
+      icon(kind === 'ok' ? 'check' : kind === 'warn' ? 'alert' : 'info', 14),
+      el('div', { class: 'grow', text }),
+    ]));
+  }
+
+  function updateControls() {
+    selectionSummary.textContent = `已选择 ${selected.size}/${providers.length} 个提供商`;
+    exportBtn.disabled = busy || (!providers.length ? false : selected.size === 0);
+    if (busy) exportBtn.classList.add('is-busy');
+    else exportBtn.classList.remove('is-busy');
+  }
+
+  for (const provider of providers) {
+    const checkbox = el('input', {
+      type: 'checkbox',
+      checked: selected.has(provider.id) ? true : null,
+      attrs: { 'aria-label': `导出提供商 ${provider.name || '未命名'}` },
+      on: {
+        change: (event) => {
+          if (event.target.checked) selected.add(provider.id);
+          else selected.delete(provider.id);
+          updateControls();
+        },
+      },
+    });
+    providerList.appendChild(el('label', { class: 'provider-transfer-row' }, [
+      checkbox,
+      el('span', { class: 'provider-transfer-row-main' }, [
+        el('span', { class: 'provider-transfer-row-name', text: provider.name || '未命名提供商' }),
+        el('span', { class: 'provider-transfer-row-meta', text: `${(provider.models || []).length} 个模型 · ${provider.enabled === false ? '已停用' : '已启用'}` }),
+      ]),
+    ]));
+  }
+
+  const body = el('div', { class: 'modal-body' }, [
+    noteBox,
+    el('div', { class: 'provider-transfer-section' }, [
+      el('div', { class: 'modal-sect-head' }, [
+        el('span', { class: 'modal-sect-title', text: '导出范围' }),
+        selectionSummary,
+        el('span', { class: 'right' }),
+        el('button', {
+          class: 'btn btn-sm btn-ghost',
+          type: 'button',
+          on: { click: () => { for (const provider of providers) selected.add(provider.id); for (const input of providerList.querySelectorAll('input')) input.checked = true; updateControls(); } },
+        }, [el('span', { text: '全选' })]),
+        el('button', {
+          class: 'btn btn-sm btn-ghost',
+          type: 'button',
+          on: { click: () => { selected.clear(); for (const input of providerList.querySelectorAll('input')) input.checked = false; updateControls(); } },
+        }, [el('span', { text: '清空' })]),
+      ]),
+      providerList,
+    ]),
+    el('div', { class: 'note note-warn' }, [
+      icon('alert', 14),
+      el('div', { class: 'grow', text: '文件本身保持可读取的 JSON；API Key、Base URL、请求头等敏感字段由当前系统账户加密后写入文件。只能在同一台电脑的同一 Windows 用户账户下导入。' }),
+    ]),
+  ]);
+
+  async function runExport() {
+    if (busy) return;
+    if (!providers.length && initialIds !== null) {
+      setNote('warn', '没有选中的提供商');
+      return;
+    }
+    if (providers.length && selected.size === 0) {
+      setNote('warn', '请至少选择一个提供商');
+      return;
+    }
+    busy = true;
+    exportBtn.disabled = true;
+    exportBtn.classList.add('is-busy');
+    exportBtn.lastElementChild.textContent = '导出中…';
+    try {
+      const providerIds = selected.size === providers.length ? null : [...selected];
+      const result = await ctx.api.exportProviderConfig({
+        providerIds,
+      });
+      if (result && result.canceled) return;
+      ctx.closeModal();
+      ctx.toast(`已导出 ${result?.count || 0} 个提供商的配置`, 'ok');
+      ctx.logLocal('info', `提供商配置已导出（${result?.count || 0} 个）`);
+    } catch (err) {
+      setNote('warn', importErrorText(ctx, err, '导出失败'));
+      ctx.toastError(err, '导出失败');
+    } finally {
+      busy = false;
+      exportBtn.disabled = false;
+      exportBtn.classList.remove('is-busy');
+      exportBtn.lastElementChild.textContent = '导出配置文件';
+      updateControls();
+    }
+  }
+
+  exportBtn.addEventListener('click', () => void runExport());
+  const modal = el('section', {
+    class: 'modal provider-transfer-modal',
+    attrs: { role: 'dialog', 'aria-modal': 'true', 'aria-label': '导出提供商配置' },
+  }, [
+    el('div', { class: 'modal-head' }, [
+      el('div', { class: 'grow' }, [
+        el('h2', { text: '导出提供商配置' }),
+        el('div', { class: 'modal-sub', text: '敏感字段加密后写入文件，不额外设置文件密码' }),
+      ]),
+      el('button', { class: 'btn btn-icon', type: 'button', title: '关闭', attrs: { 'aria-label': '关闭' }, on: { click: () => ctx.closeModal() } }, [icon('x', 15)]),
+    ]),
+    body,
+    el('div', { class: 'modal-foot' }, [
+      el('span', { class: 'hint', text: '取消导出不会修改现有配置' }),
+      el('span', { class: 'right' }),
+      el('button', { class: 'btn btn-ghost', type: 'button', disabled: busy ? true : null, on: { click: () => ctx.closeModal() } }, [el('span', { text: '取消' })]),
+      exportBtn,
+    ]),
+  ]);
+  modal.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault();
+      void runExport();
+    }
+  });
+  updateControls();
+  ctx.openModal(modal);
+}
+
+async function openImportDialog(ctx, initialFiles = null) {
+  const { el, icon } = ctx;
+  const state = {
+    phase: 'choose',
+    source: null,
+    sessionId: null,
+    preview: null,
+    decisions: new Map(),
+    error: '',
+    busy: false,
+    applied: false,
+    closed: false,
+  };
+  const body = el('div', { class: 'modal-body' });
+  const foot = el('div', { class: 'modal-foot' });
+  const title = el('h2', { text: '导入提供商配置' });
+  const subtitle = el('div', { class: 'modal-sub', text: '文件会先校验和解密，确认后才会写入现有配置' });
+  const modal = el('section', {
+    class: 'modal provider-transfer-modal',
+    attrs: { role: 'dialog', 'aria-modal': 'true', 'aria-label': '导入提供商配置' },
+  }, [
+    el('div', { class: 'modal-head' }, [
+      el('div', { class: 'grow' }, [title, subtitle]),
+      el('button', { class: 'btn btn-icon', type: 'button', title: '关闭', attrs: { 'aria-label': '关闭' }, on: { click: () => ctx.closeModal() } }, [icon('x', 15)]),
+    ]),
+    body,
+    foot,
+  ]);
+
+  function cleanup() {
+    state.closed = true;
+    if (state.sessionId && !state.applied) void ctx.api.cancelProviderImport(state.sessionId).catch(() => {});
+    if (state.source && state.source.bytes && typeof state.source.bytes.fill === 'function') state.source.bytes.fill(0);
+    state.source = null;
+    state.preview = null;
+    state.sessionId = null;
+  }
+
+  function setError(message) {
+    state.error = String(message || '');
+  }
+
+  function errorBox() {
+    return state.error
+      ? el('div', { class: 'note note-err' }, [icon('alert', 14), el('div', { class: 'grow', text: state.error })])
+      : null;
+  }
+
+  function attachDrop(zone) {
+    zone.addEventListener('dragenter', (event) => {
+      event.preventDefault();
+      zone.classList.add('is-dragover');
+    });
+    zone.addEventListener('dragover', (event) => {
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+      zone.classList.add('is-dragover');
+    });
+    zone.addEventListener('dragleave', (event) => {
+      if (!event.relatedTarget || !zone.contains?.(event.relatedTarget)) zone.classList.remove('is-dragover');
+    });
+    zone.addEventListener('drop', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      zone.classList.remove('is-dragover');
+      void acceptFiles(event.dataTransfer?.files);
+    });
+  }
+
+  async function acceptSource(source) {
+    if (state.busy) return;
+    if (!source || !source.fileName || !source.bytes) {
+      setError('没有读取到配置文件');
+      render();
+      return;
+    }
+    state.busy = true;
+    state.error = '';
+    state.source = source;
+    state.phase = 'checking';
+    render();
+    try {
+      await ctx.api.inspectProviderImport(source);
+      if (state.closed) return;
+      setError('');
+      state.busy = false;
+      await prepare();
+    } catch (err) {
+      state.phase = 'choose';
+      setError(importErrorText(ctx, err, '文件校验失败'));
+      render();
+    } finally {
+      state.busy = false;
+      render();
+    }
+  }
+
+  async function acceptFiles(files) {
+    if (state.busy || state.closed) return;
+    const list = files ? Array.from(files) : [];
+    if (list.length !== 1) {
+      setError(list.length > 1 ? '一次只能导入一个字段加密配置文件' : '请拖入一个字段加密配置文件');
+      render();
+      return;
+    }
+    try {
+      const source = await importSourceFromFile(list[0]);
+      if (!state.closed) await acceptSource(source);
+    } catch (err) {
+      setError(importErrorText(ctx, err, '读取配置文件失败'));
+      render();
+    }
+  }
+
+  async function chooseFile() {
+    if (state.busy) return;
+    state.busy = true;
+    setError('');
+    render();
+    try {
+      const result = await ctx.api.pickProviderImportFile();
+      if (state.closed || !result || result.canceled) return;
+      state.busy = false;
+      await acceptSource(result);
+    } catch (err) {
+      setError(importErrorText(ctx, err, '选择配置文件失败'));
+      render();
+    } finally {
+      state.busy = false;
+      render();
+    }
+  }
+
+  async function prepare() {
+    if (state.busy) return;
+    state.busy = true;
+    setError('');
+    render();
+    try {
+      const result = await ctx.api.prepareProviderImport({ ...state.source });
+      if (state.closed) {
+        await ctx.api.cancelProviderImport(result.sessionId);
+        return;
+      }
+      if (state.sessionId) await ctx.api.cancelProviderImport(state.sessionId);
+      state.sessionId = result.sessionId;
+      state.preview = result.preview;
+      state.decisions = new Map((result.preview?.providers || []).map((provider) => [provider.sourceId, 'add']));
+      state.phase = 'preview';
+      render();
+    } catch (err) {
+      state.phase = 'choose';
+      setError(importErrorText(ctx, err, '解密失败'));
+      render();
+    } finally {
+      state.busy = false;
+      render();
+    }
+  }
+
+  function decisionPicker(provider) {
+    const picker = el('select', {
+      class: 'select provider-import-action',
+      value: state.decisions.get(provider.sourceId) || 'add',
+      attrs: { 'aria-label': `处理${provider.name || '提供商'}的同名配置` },
+      on: {
+        change: (event) => {
+          state.decisions.set(provider.sourceId, String(event.target.value));
+          render();
+        },
+      },
+    }, [
+      el('option', { value: 'add', text: provider.duplicate ? '新增为不同名称' : '新增' }),
+      provider.duplicate && !provider.duplicate.multiple
+        ? el('option', { value: 'overwrite', text: '覆盖同名配置' })
+        : null,
+      provider.duplicate && !provider.duplicate.multiple
+        ? el('option', { value: 'skip', text: '跳过' })
+        : null,
+      provider.duplicate && provider.duplicate.multiple
+        ? el('option', { value: 'skip', text: '跳过（存在多个同名目标）' })
+        : null,
+    ]);
+    return picker;
+  }
+
+  async function applyNow() {
+    if (state.busy || state.closed) return;
+    if ([...state.decisions.values()].includes('overwrite') && state.phase !== 'confirm') {
+      state.phase = 'confirm';
+      render();
+      return;
+    }
+    state.busy = true;
+    setError('');
+    render();
+    try {
+      const result = await ctx.api.applyProviderImport({
+        sessionId: state.sessionId,
+        decisions: [...state.decisions].map(([sourceId, action]) => ({ sourceId, action })),
+        overwriteConfirmed: state.phase === 'confirm',
+      });
+      ctx.state.providers = Array.isArray(result?.providers) ? result.providers : ctx.state.providers;
+      if (result?.status) {
+        ctx.state.status = result.status;
+        if (result.status.inject) ctx.state.inject = { ...(ctx.state.inject || {}), ...result.status.inject };
+      }
+      state.applied = true;
+      markRelaunchIfInjected(ctx);
+      ctx.closeModal();
+      const counts = result?.counts || {};
+      ctx.toast(`已导入配置：新增 ${counts.added || 0} 个，覆盖 ${counts.overwritten || 0} 个，跳过 ${counts.skipped || 0} 个`, 'ok');
+      ctx.logLocal('info', `提供商配置已导入（新增 ${counts.added || 0}，覆盖 ${counts.overwritten || 0}，跳过 ${counts.skipped || 0}）`);
+      await ctx.reload('providers');
+    } catch (err) {
+      setError(importErrorText(ctx, err, '导入失败，现有配置未修改'));
+      ctx.toastError(err, '导入失败，现有配置未修改');
+    } finally {
+      state.busy = false;
+      render();
+    }
+  }
+
+  function renderChoose() {
+    const zone = el('div', { class: 'provider-import-dropzone' }, [
+      el('div', { class: 'provider-import-dropzone-icon' }, [icon('box', 22)]),
+      el('div', { class: 'provider-import-dropzone-title', text: '将字段加密配置文件拖到这里' }),
+      el('div', { class: 'hint', text: '只允许单个 .gptplus-providers 文件' }),
+      el('button', { class: 'btn btn-primary btn-sm', type: 'button', disabled: state.busy ? true : null, on: { click: () => void chooseFile() } }, [icon('folder', 13), el('span', { text: '选择文件' })]),
+    ]);
+    attachDrop(zone);
+    return [errorBox(), zone];
+  }
+
+  function renderChecking() {
+    return [errorBox(), el('div', { class: 'provider-import-progress' }, [
+      el('div', { class: 'provider-import-progress-spinner' }),
+      el('div', { class: 'provider-import-progress-title', text: '正在检查文件…' }),
+      el('div', { class: 'hint', text: '校验扩展名、大小和加密格式' }),
+    ])];
+  }
+
+  function renderPreview() {
+    const preview = state.preview || { providers: [] };
+    const rows = (preview.providers || []).map((provider) => el('div', { class: 'provider-import-preview-row' }, [
+      el('div', { class: 'provider-import-preview-main' }, [
+        el('div', { class: 'provider-import-preview-name', text: provider.name || '未命名提供商' }),
+        el('div', { class: 'provider-import-preview-meta', text: `${provider.models.length} 个模型 · ${provider.api} · ${provider.enabled ? '已启用' : '已停用'} · API Key ${provider.hasApiKey ? '已配置' : '未配置'}` }),
+        el('div', { class: 'provider-import-models', text: provider.models.map((model) => model.label || model.id).join('、') || '无模型' }),
+      ]),
+      decisionPicker(provider),
+    ]));
+    const overwriteCount = [...state.decisions.values()].filter((action) => action === 'overwrite').length;
+    return [errorBox(), el('div', { class: 'note note-info' }, [
+      icon('info', 14),
+      el('div', { class: 'grow', text: '以下内容来自已认证的密文，仅展示名称、模型和状态；Base URL、API Key、请求头不会显示在预览中。' }),
+    ]), el('div', { class: 'provider-import-preview-list' }, rows.length ? rows : [el('div', { class: 'provider-import-empty', text: '文件中没有提供商配置' })]),
+      overwriteCount ? el('div', { class: 'note note-warn' }, [icon('alert', 14), el('div', { class: 'grow', text: `当前有 ${overwriteCount} 个提供商将覆盖同名配置，下一步会再次确认。` })]) : null,
+    ];
+  }
+
+  function renderConfirm() {
+    const overwriteCount = [...state.decisions.values()].filter((action) => action === 'overwrite').length;
+    return [errorBox(), el('div', { class: 'note note-warn' }, [
+      icon('alert', 16),
+      el('div', { class: 'grow' }, [
+        el('div', { text: `确定覆盖 ${overwriteCount} 个同名提供商吗？` }),
+        el('div', { class: 'hint', text: '覆盖会替换 Base URL、API Key、模型列表和自定义请求头；其它提供商保持不变。' }),
+      ]),
+    ])];
+  }
+
+  function renderFoot() {
+    foot.replaceChildren();
+    if (state.phase === 'choose' || state.phase === 'checking') {
+      foot.append(
+        el('span', { class: 'hint', text: '拖拽和点击选择使用同一套文件校验流程' }),
+        el('span', { class: 'right' }),
+        el('button', { class: 'btn btn-ghost', type: 'button', on: { click: () => ctx.closeModal() } }, [el('span', { text: '取消' })]),
+      );
+      return;
+    }
+    if (state.phase === 'confirm') {
+      foot.append(
+        el('button', { class: 'btn btn-ghost', type: 'button', disabled: state.busy ? true : null, on: { click: () => { state.phase = 'preview'; render(); } } }, [el('span', { text: '返回修改' })]),
+        el('span', { class: 'right' }),
+        el('button', { class: 'btn btn-ghost', type: 'button', on: { click: () => ctx.closeModal() } }, [el('span', { text: '取消' })]),
+        el('button', { class: 'btn btn-warning', type: 'button', disabled: state.busy ? true : null, on: { click: () => void applyNow() } }, [icon('check', 13), el('span', { text: state.busy ? '写入中…' : '确认覆盖并导入' })]),
+      );
+      return;
+    }
+    const overwriteCount = [...state.decisions.values()].filter((action) => action === 'overwrite').length;
+    foot.append(
+      el('button', { class: 'btn btn-ghost', type: 'button', disabled: state.busy ? true : null, on: { click: () => { state.phase = 'choose'; state.error = ''; render(); } } }, [el('span', { text: '重新选择' })]),
+      el('span', { class: 'right' }),
+      el('button', { class: 'btn btn-ghost', type: 'button', on: { click: () => ctx.closeModal() } }, [el('span', { text: '取消' })]),
+      el('button', { class: 'btn btn-primary', type: 'button', disabled: state.busy ? true : null, on: { click: () => { if (overwriteCount) { state.phase = 'confirm'; render(); } else void applyNow(); } } }, [icon('check', 13), el('span', { text: state.busy ? '导入中…' : '确认导入' })]),
+    );
+  }
+
+  function render() {
+    if (state.closed) return;
+    body.replaceChildren(...(
+      state.phase === 'choose' ? renderChoose()
+        : state.phase === 'checking' ? renderChecking()
+          : state.phase === 'preview' ? renderPreview()
+            : renderConfirm()
+    ).filter(Boolean));
+    renderFoot();
+  }
+
+  modal.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault();
+      if (state.phase === 'preview') {
+        const overwriteCount = [...state.decisions.values()].filter((action) => action === 'overwrite').length;
+        if (overwriteCount) { state.phase = 'confirm'; render(); }
+        else void applyNow();
+      } else if (state.phase === 'confirm') void applyNow();
+    }
+  });
+
+  ctx.openModal(modal, { onClose: cleanup });
+  render();
+  if (initialFiles) await acceptFiles(initialFiles);
 }
 
 function probeResult(ctx, p, probe) {
@@ -768,7 +1402,10 @@ export function openProviderForm(ctx, providerId = null) {
       on: { change: (e) => { model.reasoning = e.target.checked; } },
     });
     return el('div', { class: 'mrow' }, [
-      idInput,
+      el('div', { class: 'mrow-id-cell' }, [idInput,
+        model.isNew ? el('span', { class: 'chip chip-warn', text: '新增' }) : null,
+        model.detected === false ? el('span', { class: 'chip chip-err', text: '未检测到' }) : null,
+      ]),
       labelInput,
       el('label', { class: 'check', title: '取消勾选后该模型不会出现在 ChatGPT 里' }, [onCheck]),
       el('label', { class: 'check', title: '勾选后目录条目会带上推理档位' }, [reasonCheck]),
@@ -848,7 +1485,7 @@ export function openProviderForm(ctx, providerId = null) {
     el('div', { class: 'field' }, [
       el('label', { class: 'label', text: 'API Key' }),
       el('div', { class: 'input-group' }, [keyInput, keyToggle]),
-      el('div', { class: 'hint', text: '仅保存在本机 ~/.gptplus/config.json；网关用明文 Bearer 转发，界面里默认打码' }),
+      el('div', { class: 'hint', text: '仅保存在本机配置；Base URL、API Key 和请求头由系统安全存储加密，界面里默认打码' }),
     ]),
     el('div', { class: 'modal-sect' }, [
       el('div', { class: 'modal-sect-head' }, [
@@ -1046,6 +1683,9 @@ async function saveDraft(ctx, draft, refs, saveBtn, opts = {}) {
       label: String(m.label || '').trim() || id,
       enabled: m.enabled !== false,
       reasoning: !!m.reasoning,
+      ...(m.isNew === true ? { isNew: true } : {}),
+      ...(m.detected === false ? { detected: false } : {}),
+      ...(Number.isFinite(Number(m.missingSince)) ? { missingSince: Number(m.missingSince) } : {}),
     });
   }
   draft.models = cleanedModels;
@@ -1154,6 +1794,12 @@ async function doPull(ctx, draft, refs, afterRowsChange) {
     }
     const remote = Array.isArray(res.models) ? res.models : [];
     const byId = new Map(draft.models.map((m) => [m.id, m]));
+    const missingAt = Date.now();
+    for (const model of draft.models) {
+      model.detected = false;
+      model.isNew = false;
+      if (!model.missingSince) model.missingSince = missingAt;
+    }
     let added = 0;
     let kept = 0;
     for (const item of remote) {
@@ -1162,23 +1808,28 @@ async function doPull(ctx, draft, refs, afterRowsChange) {
       const exist = byId.get(id);
       if (exist) {
         kept += 1;
-        const label = String((item && item.label) || id).trim();
-        if (label && label !== id) exist.label = label;
+        exist.detected = true;
+        exist.isNew = false;
+        exist.missingSince = null;
       } else {
         draft.models.push({
           id,
           label: String((item && item.label) || id).trim() || id,
-          enabled: true,
-          reasoning: true,
+          enabled: false,
+          reasoning: item?.reasoning === true || item?.capabilities?.reasoning === true,
+          detected: true,
+          isNew: true,
+          missingSince: null,
         });
         added += 1;
       }
     }
     afterRowsChange();
-    const msg = `拉取到 ${remote.length} 个模型：新增 ${added} 个，已存在 ${kept} 个（原有启用/推理设置已保留）`;
+    const missing = draft.models.filter((model) => model.detected === false).length;
+    const msg = `检查到 ${remote.length} 个模型：新增 ${added} 个（默认停用），已存在 ${kept} 个，未检测到 ${missing} 个`;
     ctx.toast(msg, 'ok');
     ctx.logLocal('info', msg);
-    if (refs.note) refs.note('ok', `已从 /models 合并 ${remote.length} 个模型，记得点「保存修改」把结果写进配置。`);
+    if (refs.note) refs.note('ok', '已完成手动 /models 检查：新增模型默认停用，未检测到的模型保留原启用状态；点「保存修改」写入结果。');
   } catch (err) {
     ctx.toastError(err, '拉取 /models 失败');
   } finally {

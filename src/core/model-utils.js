@@ -27,6 +27,7 @@ function modelKey(providerId, modelId) {
 }
 
 function slugPrefix(provider, providers = []) {
+  if (provider && provider.remote === true) return normalizeSlugPart(provider.id, 'remote');
   const base = normalizeSlugPart(provider && (provider.name || provider.id), provider && provider.id);
   const duplicate = providers.some((candidate) =>
     candidate && candidate.id !== provider.id &&

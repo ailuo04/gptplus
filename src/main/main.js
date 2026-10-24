@@ -39,6 +39,8 @@ const {
   ipcMain,
   shell,
   dialog,
+  safeStorage,
+  clipboard,
   Menu,
   Tray,
   nativeImage,
@@ -394,9 +396,18 @@ function broadcast(channel, payload) {
 
 async function boot() {
   const { createContext } = require('../core/context.js');
+  const secretStorage = {
+    isAvailable: () => safeStorage.isEncryptionAvailable()
+      && !(process.platform === 'linux' && safeStorage.getSelectedStorageBackend?.() === 'basic_text'),
+    encrypt: (text) => safeStorage.encryptString(text),
+    decrypt: (bytes) => safeStorage.decryptString(bytes),
+  };
   ctx = await createContext({
     onStatus: (s) => broadcast('gptplus:status', s),
+    onQqInstall: (s) => broadcast('gptplus:qqbot:install', s),
+    onQqLaunch: (s) => broadcast('gptplus:qqbot:launch', s),
     appVersion: app.getVersion(),
+    secretStorage,
   });
 
   // 更新只在收到用户明确操作后下载；启动检测本身只广播可用版本。
@@ -422,6 +433,8 @@ async function boot() {
     ipcMain,
     shell,
     dialog,
+    clipboard,
+    secretStorage,
     ctx,
     updater,
     startup: { get: readStartupSettings, set: writeStartupSettings },
@@ -447,6 +460,8 @@ async function boot() {
         at: Date.now(), level: 'error', msg: '网关自动启动失败: ' + err.message,
       });
     } finally {
+      // QQ 助手开启且配置了启动命令时，后台拉起 NapCat（离线才拉，不阻塞启动）。
+      void ctx.qqBot.maybeAutoLaunch();
       ctx.emitStatus?.();
       refreshTrayMenu();
     }
@@ -470,6 +485,12 @@ app.whenReady().then(async () => {
   app.on('activate', () => {
     showWindow();
   });
+}).catch((err) => {
+  dialog.showErrorBox('无法启动 gpt++', err?.code === 'SECURE_STORAGE_ERROR'
+    ? err.message
+    : '无法安全加载本机配置，请检查配置文件和系统安全存储后重试');
+  process.exitCode = 1;
+  app.quit();
 });
 
 app.on('window-all-closed', () => {
@@ -483,6 +504,8 @@ app.on('before-quit', () => {
     tray = null;
   }
   try {
+    ctx?.remoteSync?.stop?.();
+    ctx?.taskCenter?.stop?.();
     ctx?.gateway?.stopSync?.();
   } catch {
     /* 退出阶段尽力而为 */
@@ -490,7 +513,14 @@ app.on('before-quit', () => {
 });
 
 process.on('uncaughtException', (err) => {
+  const cfg = ctx?.store?.get?.() || {};
+  const peerSecrets = (cfg.remoteSync?.connections || []).map((connection) => ({
+    baseUrl: connection.baseUrl, apiKey: connection.authToken, headers: {},
+  }));
+  const diagnostic = require('../core/redact.js').redactDiagnostic(
+    err && err.stack ? err.stack : String(err), [...(cfg.providers || []), ...peerSecrets],
+  );
   broadcast('gptplus:log', {
-    at: Date.now(), level: 'error', msg: '未捕获异常: ' + (err && err.stack ? err.stack : String(err)),
+    at: Date.now(), level: 'error', msg: '未捕获异常: ' + diagnostic,
   });
 });

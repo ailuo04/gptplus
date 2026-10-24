@@ -7,6 +7,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
+const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 const { EventEmitter } = require('node:events');
 
@@ -21,6 +22,8 @@ const { createProviderClient } = require(path.join(CORE, 'provider-client.js'));
 const { createLogStore, LOG_RING_SIZE } = require(path.join(CORE, 'log-store.js'));
 const { createUsageStore } = require(path.join(CORE, 'usage-store.js'));
 const { launchChatGpt } = require(path.join(CORE, 'chatgpt-launch.js'));
+const providerTransfer = require(path.join(CORE, 'provider-transfer.js'));
+const peerSharing = require(path.join(CORE, 'peer-sharing.js'));
 
 function countMatches(text, re) {
   return (text.match(re) || []).length;
@@ -56,10 +59,29 @@ function cleanup(t, dir) {
   });
 }
 
+function createTestSecretStorage() {
+  const key = crypto.randomBytes(32);
+  return {
+    isAvailable: () => true,
+    encrypt(text) {
+      const iv = crypto.randomBytes(12);
+      const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+      const ciphertext = Buffer.concat([cipher.update(String(text), 'utf8'), cipher.final()]);
+      return Buffer.concat([iv, cipher.getAuthTag(), ciphertext]);
+    },
+    decrypt(bytes) {
+      const raw = Buffer.from(bytes);
+      const decipher = crypto.createDecipheriv('aes-256-gcm', key, raw.subarray(0, 12));
+      decipher.setAuthTag(raw.subarray(12, 28));
+      return Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]).toString('utf8');
+    },
+  };
+}
+
 // ---------------------------------------------------------------- 0. 模块可加载
 
 test('core 模块都是纯 Node CommonJS（不依赖 electron）', () => {
-  const files = ['paths.js', 'store.js', 'catalog.js', 'codex-config.js', 'provider-client.js', 'log-store.js', 'usage-store.js', 'chatgpt-launch.js'];
+  const files = ['paths.js', 'store.js', 'catalog.js', 'codex-config.js', 'provider-client.js', 'provider-transfer.js', 'log-store.js', 'usage-store.js', 'chatgpt-launch.js'];
   const stripComments = (src) =>
     src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1');
   for (const f of files) {
@@ -216,6 +238,264 @@ test('store: 默认值 / provider CRUD / 深拷贝隔离', (t) => {
   assert.notEqual(token, store.newGatewayToken());
 });
 
+test('store: 提供商敏感字段使用系统安全存储落盘，并迁移旧版明文配置', (t) => {
+  const dir = tmpDir('store-secure-secrets');
+  cleanup(t, dir);
+  const configPath = path.join(dir, 'config.json');
+  const legacy = {
+    version: 1,
+    providers: [{
+      id: 'p_legacy01',
+      name: '旧配置',
+      baseUrl: 'https://legacy.example/v1',
+      apiKey: 'sk-legacy-secret',
+      api: 'openai',
+      headers: { 'X-Private': 'legacy-header' },
+      enabled: true,
+      models: [{ id: 'legacy-model' }],
+    }],
+  };
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(configPath, JSON.stringify(legacy), 'utf8');
+
+  const secretStorage = createTestSecretStorage();
+  const store = createStore({ configPath, secretStorage });
+  assert.equal(store.getProvider('p_legacy01').baseUrl, legacy.providers[0].baseUrl);
+  assert.equal(store.getProvider('p_legacy01').apiKey, legacy.providers[0].apiKey);
+  assert.deepEqual(store.getProvider('p_legacy01').headers, legacy.providers[0].headers);
+
+  const disk = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  const diskProvider = disk.providers[0];
+  assert.equal('baseUrl' in diskProvider, false);
+  assert.equal('apiKey' in diskProvider, false);
+  assert.equal('headers' in diskProvider, false);
+  assert.equal(typeof diskProvider.secret?.ciphertext, 'string');
+  const diskText = fs.readFileSync(configPath, 'utf8');
+  assert.equal(diskText.includes(legacy.providers[0].apiKey), false);
+  assert.equal(diskText.includes(legacy.providers[0].baseUrl), false);
+  assert.equal(diskText.includes('legacy-header'), false);
+
+  const reloaded = createStore({ configPath, secretStorage });
+  assert.deepEqual(reloaded.getProvider('p_legacy01'), store.getProvider('p_legacy01'));
+  assert.throws(
+    () => createStore({ configPath }),
+    (err) => err && err.code === 'SECURE_STORAGE_ERROR',
+    '加密配置不能在没有安全存储适配器时静默按空凭据加载',
+  );
+  const beforeCorruption = fs.readFileSync(configPath);
+  assert.throws(() => createStore({ configPath, secretStorage: createTestSecretStorage() }), /无法解密/);
+  assert.deepEqual(fs.readFileSync(configPath), beforeCorruption, '安全存储解密失败不能覆盖原文件');
+  const brokenPath = path.join(dir, 'broken-secure.json');
+  fs.writeFileSync(brokenPath, '{bad config');
+  assert.throws(() => createStore({ configPath: brokenPath, secretStorage }), /原文件未修改/);
+  assert.equal(fs.readFileSync(brokenPath, 'utf8'), '{bad config');
+  assert.throws(
+    () => createStore({
+      configPath: path.join(dir, 'unavailable.json'),
+      secretStorage: { isAvailable: () => false, encrypt: () => Buffer.alloc(1), decrypt: () => '' },
+    }),
+    (err) => err && err.code === 'SECURE_STORAGE_ERROR',
+  );
+});
+
+test('peer sharing: switches default off, peer URL/token use safeStorage and migrate old clear fields', (t) => {
+  const dir = tmpDir('peer-store');
+  cleanup(t, dir);
+  const configPath = path.join(dir, 'config.json');
+  const secretStorage = createTestSecretStorage();
+  const store = createStore({ configPath, secretStorage });
+  assert.equal(store.get().sharing.enabled, false);
+  assert.equal(store.get().remoteSync.enabled, false);
+  assert.equal(store.get().remoteSync.intervalMinutes, 60);
+  store.update((draft) => {
+    draft.remoteSync.connections.push({ id: 'conn_a', name: 'A', baseUrl: 'https://tailnet.example', authToken: 'peer-private-token' });
+  });
+  const disk = fs.readFileSync(configPath, 'utf8');
+  assert.equal(disk.includes('peer-private-token'), false);
+  assert.equal(disk.includes('https://tailnet.example'), false);
+  assert.deepEqual(createStore({ configPath, secretStorage }).get().remoteSync.connections[0], {
+    id: 'conn_a', name: 'A', baseUrl: 'https://tailnet.example', authToken: 'peer-private-token',
+    sourceId: null, enabled: true, lastAttemptAt: null, lastSuccessAt: null, lastError: '',
+  });
+
+  const legacyPath = path.join(dir, 'legacy-peer.json');
+  fs.writeFileSync(legacyPath, JSON.stringify({ version: 1, remoteSync: { connections: [
+    { id: 'legacy_conn', name: 'legacy', baseUrl: 'https://legacy-tailnet.example', authToken: 'legacy-token' },
+  ] } }));
+  createStore({ configPath: legacyPath, secretStorage });
+  const migrated = fs.readFileSync(legacyPath, 'utf8');
+  assert.equal(migrated.includes('legacy-token'), false);
+  assert.equal(migrated.includes('https://legacy-tailnet.example'), false);
+});
+
+test('peer IPC: generated client token never returns to renderer; pasted connection secret is encrypted and cleared', async (t) => {
+  const { registerIpc } = require(path.join(CORE, 'ipc.js'));
+  const dir = tmpDir('peer-ipc');
+  cleanup(t, dir);
+  const secretStorage = createTestSecretStorage();
+  const store = createStore({ configPath: path.join(dir, 'config.json'), secretStorage });
+  const handlers = new Map();
+  const logs = [];
+  const statusEvents = [];
+  let clipboardText = 'peer-secret-from-other-device';
+  const clipboard = {
+    writeText(value) { clipboardText = value; },
+    readText() { return clipboardText; },
+    clear() { clipboardText = ''; },
+  };
+  const ctx = {
+    paths: {}, store, providerClient: {}, models: () => [],
+    peerState: () => ({
+      sharing: { clients: store.get().sharing.clients.map(({ id, name }) => ({ id, name })) },
+      remoteSync: {
+        enabled: store.get().remoteSync.enabled,
+        intervalMinutes: store.get().remoteSync.intervalMinutes,
+        connections: store.get().remoteSync.connections.map(({ id, name }) => ({ id, name })),
+      },
+    }),
+    remoteSync: { configure() {}, syncConnection: async () => ({ ok: true }) },
+    status: () => ({ ok: true }), gateway: { getState: () => ({ running: false }) },
+    log: (entry) => logs.push(entry), syncInjection: () => ({}),
+    onLogEvent: () => () => {},
+  };
+  registerIpc({ ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) }, shell: {}, dialog: {}, clipboard, onStatus: (status) => statusEvents.push(status), ctx });
+
+  const granted = await handlers.get('gptplus:sharing:client:add')({}, { name: 'B computer' });
+  assert.equal(granted.token, undefined, 'raw token must never be returned over IPC');
+  assert.equal(granted.copied, true);
+  assert.match(clipboardText, /^[A-Za-z0-9_-]{40,}$/);
+  const diskAfterGrant = fs.readFileSync(store.configPath, 'utf8');
+  assert.equal(diskAfterGrant.includes(clipboardText), false);
+  assert.equal(store.get().sharing.clients[0].tokenHash, peerSharing.hashPeerToken(clipboardText));
+  assert.equal(statusEvents.at(-1).peer.sharing.clients.length, 1, '共享客户端变化必须广播完整 peer 快照');
+
+  const tokenForReceiver = 'peer-secret-from-other-device';
+  clipboardText = tokenForReceiver;
+  await handlers.get('gptplus:remote:connection:save')({}, { name: 'A computer', baseUrl: 'https://tailnet-host.example' });
+  assert.equal(clipboardText, '', 'receiver token is cleared from the OS clipboard after reading');
+  const disk = fs.readFileSync(store.configPath, 'utf8');
+  assert.equal(disk.includes(tokenForReceiver), false);
+  assert.equal(disk.includes('https://tailnet-host.example'), false);
+  assert.ok(logs.every((entry) => !String(entry.msg).includes(tokenForReceiver)));
+  assert.equal(store.get().remoteSync.connections[0].authToken, tokenForReceiver);
+  assert.equal(statusEvents.at(-1).peer.remoteSync.connections.length, 1, '远端连接变化必须广播完整 peer 快照');
+
+  await handlers.get('gptplus:remote:sync:set')({}, { enabled: true, intervalMinutes: 75 });
+  assert.equal(statusEvents.at(-1).peer.remoteSync.enabled, true, '自动同步设置必须广播最新 peer 状态');
+  assert.equal(statusEvents.at(-1).peer.remoteSync.intervalMinutes, 75);
+});
+
+test('peer sync: new/default-off, complete disappearance/recovery preserves local preference; failures preserve models', async (t) => {
+  const dir = tmpDir('peer-sync');
+  cleanup(t, dir);
+  const secretStorage = createTestSecretStorage();
+  const store = createStore({ configPath: path.join(dir, 'config.json'), secretStorage });
+  store.update((draft) => {
+    draft.remoteSync.connections.push({ id: 'conn_peer', name: 'peer', baseUrl: 'https://peer.example', authToken: 'peer-token' });
+  });
+  const provider = { id: 'p_source01', name: 'source-provider', enabled: true,
+    models: [{ id: 'model-a', label: 'Original label', enabled: true, reasoning: true }] };
+  const config = store.get();
+  config.sharing.sourceId = 'source-id';
+  config.sharing.name = 'Source';
+  config.sharing.models = [{ providerId: provider.id, modelId: 'model-a' }];
+  const completeManifest = peerSharing.createPeerManifest(config, [provider], 100);
+  let currentBody = completeManifest;
+  let requestCount = 0;
+  const manager = peerSharing.createRemoteSync({
+    store,
+    timeoutMs: 250,
+    fetchImpl: async (_url, options) => {
+      requestCount += 1;
+      assert.equal(options.headers.Authorization, 'Bearer peer-token');
+      return { ok: true, status: 200, text: async () => JSON.stringify(currentBody) };
+    },
+  });
+  manager.start();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(requestCount, 0, 'automatic polling is disabled by default');
+  const first = await manager.syncConnection('conn_peer');
+  assert.equal(first.ok, true, 'manual sync remains available while auto sync is off');
+  const source = store.get().remoteSync.sources[0];
+  assert.equal(source.models[0].enabled, false);
+  assert.equal(source.models[0].isNew, true);
+
+  store.update((draft) => {
+    const model = draft.remoteSync.sources[0].models[0];
+    model.enabled = true;
+    model.label = 'My local name';
+    model.customLabel = 'My local name';
+  });
+  currentBody = { ...completeManifest, source: { ...completeManifest.source, revision: 'revision-without-model' }, models: [] };
+  assert.equal((await manager.syncConnection('conn_peer')).ok, true);
+  let cached = store.get().remoteSync.sources[0].models[0];
+  assert.equal(cached.detected, false);
+  assert.equal(cached.enabled, true);
+  assert.equal(cached.label, 'My local name');
+
+  const beforeFailure = cached;
+  currentBody = { ...completeManifest, complete: false };
+  const invalid = await manager.syncConnection('conn_peer');
+  assert.equal(invalid.ok, false);
+  assert.deepEqual(store.get().remoteSync.sources[0].models[0], beforeFailure,
+    'incomplete response must not mutate missing/detected/model preference fields');
+
+  currentBody = { ...completeManifest, source: { ...completeManifest.source, revision: 'revision-restored' } };
+  assert.equal((await manager.syncConnection('conn_peer')).ok, true);
+  cached = store.get().remoteSync.sources[0].models[0];
+  assert.equal(cached.detected, true);
+  assert.equal(cached.enabled, true);
+  assert.equal(cached.label, 'My local name');
+  assert.equal(cached.isNew, false);
+  manager.stop();
+});
+
+test('catalog: remote models are opt-in and equal model IDs from separate sources remain isolated', (t) => {
+  const dir = tmpDir('peer-catalog');
+  cleanup(t, dir);
+  const store = createStore({ configPath: path.join(dir, 'config.json') });
+  store.upsertProvider({ id: 'p_local01', name: 'Local', models: [{ id: 'same-model', enabled: true }] });
+  store.update((draft) => {
+    draft.remoteSync.connections.push({ id: 'conn_a', name: 'A' }, { id: 'conn_b', name: 'B' });
+    draft.remoteSync.sources.push(
+      { id: 'source-a', name: 'A', connectionId: 'conn_a', models: [{ providerId: 'origin', modelId: 'same-model', label: 'Same', enabled: true }] },
+      { id: 'source-b', name: 'B', connectionId: 'conn_b', models: [{ providerId: 'origin', modelId: 'same-model', label: 'Same', enabled: false }] },
+    );
+  });
+  const catalog = createCatalog({ store, paths: { CATALOG_PATH: path.join(dir, 'catalog.json'), CODEX_HOME: dir } });
+  let entries = catalog.buildEntries();
+  assert.equal(entries.length, 2, 'disabled remote model must stay out of the client catalog');
+  assert.ok(entries.some((item) => item.slug.startsWith(peerSharing.remoteProviderId('source-a') + '__')));
+  assert.equal(entries.some((item) => item.slug.startsWith(peerSharing.remoteProviderId('source-b') + '__')), false);
+  store.update((draft) => { draft.remoteSync.sources.find((source) => source.id === 'source-b').models[0].enabled = true; });
+  entries = catalog.buildEntries();
+  const remoteSlugs = entries.map((item) => item.slug).filter((slug) => slug.includes('origin::same-model'));
+  assert.equal(remoteSlugs.length, 2);
+  assert.notEqual(remoteSlugs[0], remoteSlugs[1], 'identical model IDs from two peers must have distinct stable slugs');
+  const manifest = peerSharing.createPeerManifest({ sharing: { sourceId: 'local', models: [{ providerId: 'p_local01', modelId: 'same-model' }] } }, [
+    ...store.providers(), ...peerSharing.createRemoteProviders(store.get()),
+  ]);
+  assert.deepEqual(manifest.models.map((item) => item.id), ['p_local01::same-model'], 'remote models cannot be re-shared');
+});
+
+test('provider-client: malformed upstream model items fail as incomplete instead of replacing a local list', async (t) => {
+  const dir = tmpDir('models-incomplete');
+  cleanup(t, dir);
+  const store = createStore({ configPath: path.join(dir, 'config.json') });
+  const provider = store.upsertProvider({ name: 'test', baseUrl: 'https://provider.example/v1', models: [{ id: 'kept-model' }] });
+  let requested = 0;
+  const client = createProviderClient({ store, fetchImpl: async () => {
+    requested += 1;
+    return { ok: true, status: 200, text: async () => JSON.stringify({ data: [{ id: 'new-model' }, { display_name: 'missing id' }] }) };
+  } });
+  const result = await client.fetchRemoteModels(provider.id);
+  assert.equal(requested, 1);
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.models, []);
+  assert.match(result.error, /无效条目/);
+  assert.deepEqual(store.getProvider(provider.id).models.map((model) => model.id), ['kept-model']);
+});
+
 test('startup: 启动目标只允许 gptplus 或 both，并能持久化', (t) => {
   const dir = tmpDir('store-startup');
   cleanup(t, dir);
@@ -315,6 +595,319 @@ test('store: 半损坏字段被规整，重复 id 重新生成', (t) => {
   assert.equal(cfg.providers[1].models.length, 1);
   assert.equal(cfg.providers[1].models[0].label, '42');
   assert.notEqual(cfg.providers[1].id, cfg.providers[2].id);
+});
+
+function transferConfig() {
+  return {
+    version: 1,
+    inject: { enabled: true, defaultModel: '梦幻API__gpt-6.1-sol' },
+    modelOrder: ['p_demo0001::gpt-6.1-sol', 'p_demo0001::claude-x'],
+    providers: [
+      {
+        id: 'p_demo0001',
+        name: '梦幻API',
+        baseUrl: 'https://mhapi.example/v1',
+        apiKey: 'sk-transfer-secret-1',
+        api: 'openai',
+        headers: { 'X-Transfer': 'secret-header' },
+        enabled: true,
+        models: [
+          { id: 'gpt-6.1-sol', label: 'GPT-6.1 Sol', enabled: true, reasoning: true },
+          { id: 'claude-x', label: 'Claude X', enabled: false, reasoning: false },
+        ],
+      },
+      {
+        id: 'p_demo0002',
+        name: '本地 Ollama',
+        baseUrl: 'http://127.0.0.1:11434/v1',
+        apiKey: '',
+        api: 'responses',
+        headers: {},
+        enabled: false,
+        models: [{ id: 'qwen3', label: 'Qwen3', enabled: true, reasoning: false }],
+      },
+    ],
+  };
+}
+
+test('provider-transfer: 系统安全存储逐字段加密，导出不要求密码且可往返', () => {
+  const config = transferConfig();
+  const payload = providerTransfer.createExportPayload(config);
+  const secretStorage = createTestSecretStorage();
+  const first = providerTransfer.encryptProviderConfigLocal(payload, secretStorage);
+  const second = providerTransfer.encryptProviderConfigLocal(payload, secretStorage);
+  const text = first.toString('utf8');
+  const envelope = JSON.parse(text);
+
+  assert.equal(text.includes('sk-transfer-secret-1'), false, 'API Key 不应出现在导出文件中');
+  assert.equal(text.includes('https://mhapi.example/v1'), false, 'Base URL 不应出现在导出文件中');
+  assert.equal(text.includes('secret-header'), false, '自定义请求头值也不应出现在导出文件中');
+  assert.equal(envelope.version, providerTransfer.FILE_VERSION);
+  assert.equal(envelope.encryption, 'electron-safeStorage');
+  assert.equal(envelope.providers[0].name, payload.providers[0].name, '非敏感字段保留可读');
+  assert.notDeepEqual(first, second, '每次加密应生成不同密文');
+  const inspected = providerTransfer.inspectProviderConfigFile({ fileName: 'backup.gptplus-providers', bytes: first });
+  assert.equal(inspected.requiresPassword, false);
+  assert.equal(inspected.portable, false);
+
+  const decoded = providerTransfer.decryptProviderConfig({
+    fileName: 'backup.gptplus-providers',
+    bytes: first,
+    secretStorage,
+  });
+  assert.deepEqual(decoded.providers, payload.providers);
+  assert.deepEqual(decoded.modelOrder, payload.modelOrder);
+  assert.deepEqual(decoded.defaultModelRef, { providerId: 'p_demo0001', modelId: 'gpt-6.1-sol' });
+  assert.equal(decoded.injectEnabled, true);
+});
+
+test('provider-transfer: 其它系统账户、篡改密文、错误扩展名和不支持版本都会被拒绝', () => {
+  const payload = providerTransfer.createExportPayload(transferConfig());
+  const secretStorage = createTestSecretStorage();
+  const encrypted = providerTransfer.encryptProviderConfigLocal(payload, secretStorage);
+
+  assert.throws(
+    () => providerTransfer.decryptProviderConfig({ fileName: 'backup.gptplus-providers', bytes: encrypted, secretStorage: createTestSecretStorage() }),
+    (err) => err && err.code === 'DECRYPT_FAILED',
+  );
+
+  const tamperedEnvelope = JSON.parse(encrypted.toString('utf8'));
+  const ciphertext = Buffer.from(tamperedEnvelope.providers[0].secrets.apiKey, 'base64url');
+  ciphertext[0] ^= 1;
+  tamperedEnvelope.providers[0].secrets.apiKey = ciphertext.toString('base64url');
+  const tampered = Buffer.from(JSON.stringify(tamperedEnvelope), 'utf8');
+  assert.throws(
+    () => providerTransfer.decryptProviderConfig({ fileName: 'backup.gptplus-providers', bytes: tampered, secretStorage }),
+    (err) => err && err.code === 'DECRYPT_FAILED',
+  );
+
+  assert.throws(
+    () => providerTransfer.inspectProviderConfigFile({ fileName: 'providers.json', bytes: encrypted }),
+    (err) => err && err.code === 'INVALID_FILE_TYPE',
+  );
+  assert.throws(
+    () => providerTransfer.inspectProviderConfigFile({ fileName: 'providers.gptplus-providers', bytes: Buffer.alloc(0) }),
+    (err) => err && err.code === 'EMPTY_FILE',
+  );
+
+  for (const version of [2, 99]) {
+    const unsupported = { ...tamperedEnvelope, version };
+    assert.throws(
+      () => providerTransfer.inspectProviderConfigFile({ fileName: 'providers.gptplus-providers', bytes: Buffer.from(JSON.stringify(unsupported)) }),
+      (err) => err && err.code === 'UNSUPPORTED_VERSION',
+    );
+  }
+});
+
+test('provider-transfer: 空配置、选中导出和必填字段校验', () => {
+  const secretStorage = createTestSecretStorage();
+  const emptyPayload = providerTransfer.createExportPayload({ providers: [], modelOrder: [], inject: { enabled: false } });
+  const emptyFile = providerTransfer.encryptProviderConfigLocal(emptyPayload, secretStorage);
+  const emptyDecoded = providerTransfer.decryptProviderConfig({
+    fileName: 'empty.gptplus-providers',
+    bytes: emptyFile,
+    secretStorage,
+  });
+  assert.deepEqual(emptyDecoded.providers, []);
+
+  const selected = providerTransfer.createExportPayload(transferConfig(), ['p_demo0002']);
+  assert.deepEqual(selected.providers.map((provider) => provider.id), ['p_demo0002']);
+  assert.equal(selected.defaultModelRef, null, '未选中默认模型所属提供商时不应导出失效引用');
+  assert.equal(selected.injectEnabled, null, '部分导出不能修改目标环境的全局开关');
+
+  assert.throws(
+    () => providerTransfer.encryptProviderConfigLocal({
+      format: providerTransfer.FILE_FORMAT,
+      version: providerTransfer.PAYLOAD_VERSION,
+      providers: [{ id: 'p_bad', name: '坏配置', baseUrl: '', apiKey: 'x', api: 'openai', headers: {}, models: [{ id: 'm' }] }],
+      modelOrder: [],
+      defaultModelRef: null,
+    }, secretStorage),
+    (err) => err && err.code === 'INVALID_CONFIG',
+  );
+});
+
+test('provider-transfer: 可选字段使用现有默认值，必填字段缺失时拒绝且不回显配置', () => {
+  const config = transferConfig();
+  const provider = { ...config.providers[0] };
+  delete provider.api;
+  delete provider.headers;
+  delete provider.enabled;
+  provider.models = ['minimal-model'];
+  const payload = providerTransfer.createExportPayload({ providers: [provider] });
+  assert.equal(payload.providers[0].api, 'openai');
+  assert.deepEqual(payload.providers[0].headers, {});
+  assert.equal(payload.providers[0].models[0].label, 'minimal-model');
+  assert.equal(payload.providers[0].enabled, true);
+  for (const field of ['baseUrl', 'apiKey', 'models']) {
+    const invalid = { ...provider };
+    delete invalid[field];
+    assert.throws(() => providerTransfer.createExportPayload({ providers: [invalid] }), (err) => {
+      assert.equal(err.code, 'INVALID_CONFIG');
+      assert.equal(err.message.includes(provider.apiKey), false);
+      assert.equal(err.message.includes(provider.baseUrl), false);
+      return true;
+    });
+  }
+  assert.throws(() => providerTransfer.createExportPayload({ providers: [{ ...provider, apiKey: '' }] }), /缺少 API Key/);
+  assert.throws(() => providerTransfer.createExportPayload({ providers: [{ ...provider, models: [] }] }), /缺少模型/);
+  assert.throws(() => providerTransfer.createExportPayload({ providers: [{ ...provider, baseUrl: 'not a valid URL' }] }), /Base URL 无效/);
+});
+
+test('provider-transfer: 密文篡改会拒绝，跨提供商模型顺序保持一致', () => {
+  const config = transferConfig();
+  config.modelOrder = ['p_demo0001::claude-x', 'p_demo0002::qwen3', 'p_demo0001::gpt-6.1-sol'];
+  const payload = providerTransfer.createExportPayload(config);
+  const secretStorage = createTestSecretStorage();
+  const bytes = providerTransfer.encryptProviderConfigLocal(payload, secretStorage);
+  const tampered = JSON.parse(bytes);
+  const ciphertext = Buffer.from(tampered.providers[0].secrets.baseUrl, 'base64url');
+  ciphertext[0] ^= 1;
+  tampered.providers[0].secrets.baseUrl = ciphertext.toString('base64url');
+  assert.throws(() => providerTransfer.decryptProviderConfig({
+    fileName: 'test.gptplus-providers', bytes: Buffer.from(JSON.stringify(tampered)), secretStorage,
+  }), (err) => err.code === 'DECRYPT_FAILED');
+  for (const version of [0, 2]) {
+    const envelope = { ...JSON.parse(bytes), version };
+    assert.throws(() => providerTransfer.inspectProviderConfigFile({
+      fileName: 'test.gptplus-providers', bytes: Buffer.from(JSON.stringify(envelope)),
+    }), (err) => err.code === 'UNSUPPORTED_VERSION');
+  }
+  const plan = providerTransfer.createImportPlan({
+    currentConfig: {}, payload, decisions: payload.providers.map((item) => ({ sourceId: item.id, action: 'add' })),
+  });
+  assert.deepEqual(plan.config.modelOrder, config.modelOrder);
+});
+
+test('provider-transfer: 无可用系统安全存储时拒绝导出和导入', () => {
+  const payload = providerTransfer.createExportPayload(transferConfig());
+  const unavailable = { isAvailable: () => false, encrypt: () => Buffer.from('x'), decrypt: () => 'x' };
+  assert.throws(() => providerTransfer.encryptProviderConfigLocal(payload, unavailable), (err) => err.code === 'SECURE_STORAGE_UNAVAILABLE');
+  const encrypted = providerTransfer.encryptProviderConfigLocal(payload, createTestSecretStorage());
+  assert.throws(() => providerTransfer.decryptProviderConfig({
+    fileName: 'backup.gptplus-providers', bytes: encrypted, secretStorage: unavailable,
+  }), (err) => err.code === 'SECURE_STORAGE_UNAVAILABLE');
+});
+
+test('store: 导入事务在同步成功后才落盘，嵌套更新及写入失败不会污染原配置', (t) => {
+  const dir = tmpDir('store-import-transaction');
+  cleanup(t, dir);
+  const configPath = path.join(dir, 'config.json');
+  const secretStorage = createTestSecretStorage();
+  const store = createStore({ configPath, secretStorage });
+  store.save(transferConfig());
+  const before = store.get();
+  const diskBefore = fs.readFileSync(configPath);
+  assert.throws(() => store.transaction({ ...before, theme: 'light' }, () => {
+    store.update((draft) => { draft.inject.enabled = false; });
+    assert.deepEqual(fs.readFileSync(configPath), diskBefore, '事务内的嵌套更新不得提前落盘');
+    throw new Error('sync failed');
+  }), /sync failed/);
+  assert.deepEqual(store.get(), before);
+  assert.deepEqual(fs.readFileSync(configPath), diskBefore);
+  secretStorage.encrypt = () => { throw new Error('sensitive diagnostic'); };
+  assert.throws(() => store.transaction({ ...before, theme: 'light' }, () => ({})), /系统安全存储加密失败/);
+  assert.deepEqual(store.get(), before);
+  assert.deepEqual(fs.readFileSync(configPath), diskBefore);
+});
+
+test('provider-client: 上游异常和错误正文回显的凭据会被脱敏', async (t) => {
+  const dir = tmpDir('provider-errors-redacted');
+  cleanup(t, dir);
+  const store = createStore({ configPath: path.join(dir, 'config.json') });
+  const provider = store.upsertProvider(transferConfig().providers[0]);
+  const echoed = `${provider.apiKey} ${provider.baseUrl} secret-header`;
+  const client = createProviderClient({ store, fetchImpl: async () => { throw new Error(echoed); } });
+  const results = [await client.testProvider(provider.id), await client.fetchRemoteModels(provider.id),
+    await client.testProviderModels(provider.id, [provider.models[0].id])];
+  const bodyClient = createProviderClient({ store, fetchImpl: async () => ({
+    ok: false, status: 401, statusText: echoed, text: async () => JSON.stringify({ error: { message: echoed } }),
+  }) });
+  results.push(await bodyClient.testProviderModels(provider.id, [provider.models[0].id]));
+  const output = JSON.stringify(results);
+  for (const secret of [provider.apiKey, provider.baseUrl, 'secret-header']) assert.equal(output.includes(secret), false);
+  assert.match(output, /REDACTED/);
+});
+
+test('provider-transfer: 同名提供商支持新增改名、覆盖、跳过，空导入保持原配置', () => {
+  const { normalizeConfig } = require(path.join(CORE, 'store.js'));
+  const current = normalizeConfig(transferConfig());
+  const duplicateNames = transferConfig();
+  duplicateNames.providers[1].name = duplicateNames.providers[0].name;
+  const duplicatePayload = providerTransfer.createExportPayload(duplicateNames);
+  const duplicatePlan = providerTransfer.createImportPlan({
+    currentConfig: {}, payload: duplicatePayload,
+    decisions: duplicatePayload.providers.map((provider) => ({ sourceId: provider.id, action: 'add' })),
+  });
+  assert.equal(duplicatePlan.config.providers.length, 2, '现有项目支持的同名提供商也必须能够导出和新增导入');
+  assert.notEqual(duplicatePlan.config.providers[0].name, duplicatePlan.config.providers[1].name);
+  const source = providerTransfer.createExportPayload({
+    ...transferConfig(),
+    providers: [transferConfig().providers[0]],
+    inject: { enabled: false, defaultModel: null },
+  });
+  const preview = providerTransfer.buildImportPreview(source, current.providers);
+  assert.equal(preview.providers[0].duplicate.id, 'p_demo0001');
+  assert.equal(preview.providers[0].hasApiKey, true);
+  assert.equal('baseUrl' in preview.providers[0], false, '预览不得暴露 Base URL');
+
+  const added = providerTransfer.createImportPlan({
+    currentConfig: current,
+    payload: source,
+    decisions: [{ sourceId: 'p_demo0001', action: 'add' }],
+  });
+  assert.equal(added.counts.added, 1);
+  assert.equal(added.config.providers.length, 3);
+  assert.equal(added.config.providers[2].name, '梦幻API（导入）');
+  assert.notEqual(added.config.providers[2].id, 'p_demo0001');
+
+  const overwritten = providerTransfer.createImportPlan({
+    currentConfig: current,
+    payload: source,
+    decisions: [{ sourceId: 'p_demo0001', action: 'overwrite' }],
+  });
+  assert.equal(overwritten.counts.overwritten, 1);
+  assert.equal(overwritten.config.providers.length, 2);
+  assert.equal(overwritten.config.providers[0].id, 'p_demo0001');
+  assert.equal(overwritten.config.providers[0].apiKey, 'sk-transfer-secret-1');
+
+  const skipped = providerTransfer.createImportPlan({
+    currentConfig: current,
+    payload: source,
+    decisions: [{ sourceId: 'p_demo0001', action: 'skip' }],
+  });
+  assert.deepEqual(skipped.config, current);
+
+  const empty = providerTransfer.createImportPlan({
+    currentConfig: current,
+    payload: emptyProviderPayload(),
+    decisions: [],
+  });
+  assert.deepEqual(empty.config, current);
+  assert.deepEqual(empty.counts, { added: 0, overwritten: 0, skipped: 0 });
+});
+
+function emptyProviderPayload() {
+  return {
+    format: providerTransfer.FILE_FORMAT,
+    version: providerTransfer.PAYLOAD_VERSION,
+    providers: [],
+    modelOrder: [],
+    defaultModelRef: null,
+    injectEnabled: false,
+  };
+}
+
+test('store: save 持久化失败时恢复内存快照', (t) => {
+  const dir = tmpDir('store-save-rollback');
+  cleanup(t, dir);
+  const configPath = path.join(dir, 'config.json');
+  const store = createStore({ configPath });
+  const before = store.get();
+  fs.rmSync(configPath, { force: true });
+  fs.mkdirSync(configPath);
+  assert.throws(() => store.save({ ...before, theme: 'light' }));
+  assert.deepEqual(store.get(), before);
 });
 
 // ---------------------------------------------------------------- 3. catalog
@@ -1363,6 +1956,160 @@ test('ipc: 提供商保存或删除导致注入同步失败时必须回滚配置
 
   await assert.rejects(() => channels.get('gptplus:provider:delete')({}, provider.id), /没有可注入的模型/);
   assert.deepEqual(store.getProvider(provider.id), provider, '失败的删除不得移除提供商');
+});
+
+test('ipc: 提供商配置导出、文件选择、解密预览和原子导入使用同一套密文', async (t) => {
+  const { registerIpc } = require(path.join(CORE, 'ipc.js'));
+  const dir = tmpDir('ipc-provider-transfer');
+  cleanup(t, dir);
+  const output = path.join(dir, 'providers.gptplus-providers');
+  const secretStorage = createTestSecretStorage();
+  const store = createStore({ configPath: path.join(dir, 'config.json'), secretStorage });
+  const provider = store.upsertProvider({
+    id: 'p_aaaaaaaa',
+    name: '导出渠道',
+    baseUrl: 'https://secret.example/v1',
+    apiKey: 'sk-ipc-transfer-secret',
+    api: 'openai',
+    headers: { 'X-Private': 'private-header' },
+    models: [{ id: 'm1', label: 'Model 1' }],
+  });
+  const channels = new Map();
+  const logs = [];
+  const ctx = {
+    paths: { APP_DIR: dir, CONFIG_PATH: path.join(dir, 'config.json') },
+    store,
+    providerClient: {},
+    models: () => [],
+    status: () => ({ providers: store.providers().length, inject: store.get().inject }),
+    gateway: { getState: () => ({ running: false }) },
+    log: (entry) => logs.push(entry),
+    syncInjection: () => ({ changed: false }),
+    onLogEvent: () => () => {},
+  };
+  const dialog = {
+    showSaveDialog: async () => ({ canceled: false, filePath: output }),
+    showOpenDialog: async () => ({ canceled: false, filePaths: [output] }),
+  };
+  registerIpc({ ipcMain: { handle: (channel, fn) => channels.set(channel, fn) }, shell: {}, dialog, secretStorage, ctx });
+
+  const exported = await channels.get('gptplus:provider:export')({}, { providerIds: null });
+  assert.equal(exported.canceled, false);
+  const raw = fs.readFileSync(output, 'utf8');
+  assert.equal(raw.includes(provider.apiKey), false);
+  assert.equal(raw.includes(provider.baseUrl), false);
+  assert.equal(raw.includes('private-header'), false);
+  assert.equal(logs.some((entry) => entry.msg?.includes(provider.apiKey) || entry.msg?.includes(provider.baseUrl)), false);
+
+  const picked = await channels.get('gptplus:provider:import:pick')({});
+  const inspected = await channels.get('gptplus:provider:import:inspect')({}, picked);
+  assert.equal(inspected.cipher, 'electron-safeStorage');
+  assert.equal(inspected.requiresPassword, false);
+  const prepared = await channels.get('gptplus:provider:import:prepare')({}, picked);
+  assert.equal(prepared.preview.providers[0].name, provider.name);
+  assert.equal('baseUrl' in prepared.preview.providers[0], false);
+  assert.equal('apiKey' in prepared.preview.providers[0], false);
+
+  const applied = await channels.get('gptplus:provider:import:apply')({}, {
+    sessionId: prepared.sessionId,
+    decisions: [{ sourceId: provider.id, action: 'add' }],
+  });
+  assert.equal(applied.counts.added, 1);
+  assert.equal(store.providers().length, 2);
+  assert.equal(store.providers()[1].name, '导出渠道（导入）');
+  const disk = fs.readFileSync(store.configPath, 'utf8');
+  assert.equal(disk.includes(provider.apiKey) || disk.includes(provider.baseUrl), false, '导入后凭据也只能加密落盘');
+  const client = createProviderClient({ store, fetchImpl: async (url, options) => {
+    assert.equal(url, `${provider.baseUrl}/models`);
+    assert.equal(options.headers.Authorization, `Bearer ${provider.apiKey}`);
+    assert.equal(options.headers['X-Private'], 'private-header');
+    return { ok: true, status: 200, text: async () => '{"data":[{"id":"m1"}]}' };
+  } });
+  assert.equal((await client.testProvider(store.providers()[1].id)).ok, true, '导入成功后调用继续使用原 URL 和认证头');
+
+  const previewAgain = await channels.get('gptplus:provider:import:prepare')({}, picked);
+  const decisions = [{ sourceId: provider.id, action: 'overwrite' }];
+  const beforeOverwrite = store.get();
+  await assert.rejects(() => channels.get('gptplus:provider:import:apply')({}, {
+    sessionId: previewAgain.sessionId, decisions,
+  }), /请再次确认覆盖/);
+  assert.deepEqual(store.get(), beforeOverwrite);
+  const overwrite = await channels.get('gptplus:provider:import:apply')({}, {
+    sessionId: previewAgain.sessionId, decisions, overwriteConfirmed: true,
+  });
+  assert.equal(overwrite.counts.overwritten, 1);
+
+  const beforeCanceled = fs.readFileSync(output);
+  dialog.showSaveDialog = async () => ({ canceled: true });
+  assert.equal((await channels.get('gptplus:provider:export')({})).canceled, true);
+  assert.deepEqual(fs.readFileSync(output), beforeCanceled);
+  assert.equal(fs.readdirSync(dir).some((name) => name.includes('.tmp-')), false);
+});
+
+test('ipc: 提供商导入同步失败时回滚全部配置且不泄露敏感字段', async (t) => {
+  const { registerIpc } = require(path.join(CORE, 'ipc.js'));
+  const dir = tmpDir('ipc-provider-import-rollback');
+  cleanup(t, dir);
+  const secretStorage = createTestSecretStorage();
+  const store = createStore({ configPath: path.join(dir, 'config.json') });
+  const existing = store.upsertProvider({
+    id: 'p_existing01',
+    name: '现有渠道',
+    baseUrl: 'https://existing.example/v1',
+    apiKey: 'sk-existing-secret',
+    models: [{ id: 'existing-model' }],
+  });
+  store.update((draft) => {
+    draft.inject.enabled = true;
+    draft.inject.defaultModel = 'p_existing01__existing-model';
+  });
+  const before = store.get();
+  const diskBefore = fs.readFileSync(store.configPath);
+  const sourcePayload = providerTransfer.createExportPayload({
+    providers: [{
+      id: 'p_import01',
+      name: '待导入渠道',
+      baseUrl: 'https://import.example/v1',
+      apiKey: 'sk-import-secret',
+      api: 'openai',
+      headers: { 'X-Import-Private': 'import-header' },
+      enabled: true,
+      models: [{ id: 'import-model' }],
+    }],
+    modelOrder: [],
+    inject: { enabled: true, defaultModel: 'p_import01__import-model' },
+  });
+  const encrypted = providerTransfer.encryptProviderConfigLocal(sourcePayload, secretStorage);
+  const channels = new Map();
+  const logs = [];
+  const ctx = {
+    paths: {},
+    store,
+    providerClient: {},
+    models: () => [],
+    status: () => ({ providers: store.providers().length, inject: store.get().inject }),
+    gateway: { getState: () => ({ running: true }) },
+    log: (entry) => logs.push(entry),
+    syncInjection: () => { throw new Error('注入同步失败'); },
+    onLogEvent: () => () => {},
+  };
+  registerIpc({ ipcMain: { handle: (channel, fn) => channels.set(channel, fn) }, shell: {}, dialog: {}, secretStorage, ctx });
+
+  const prepared = await channels.get('gptplus:provider:import:prepare')({}, {
+    fileName: 'providers.gptplus-providers',
+    bytes: encrypted,
+  });
+  await assert.rejects(
+    () => channels.get('gptplus:provider:import:apply')({}, {
+      sessionId: prepared.sessionId,
+      decisions: [{ sourceId: 'p_import01', action: 'add' }],
+    }),
+    /导入失败，提供商配置已回滚/,
+  );
+  assert.deepEqual(store.get(), before, '导入同步失败后应恢复导入前的完整配置');
+  assert.deepEqual(fs.readFileSync(store.configPath), diskBefore, '同步失败时原文件应逐字节不变');
+  assert.equal(store.getProvider(existing.id).apiKey, 'sk-existing-secret');
+  assert.equal(logs.some((entry) => String(entry.msg || '').includes('sk-') || String(entry.msg || '').includes('https://')), false);
 });
 
 test('context: 注入同步时默认模型失效会回退到首个仍启用的模型', (t) => {

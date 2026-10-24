@@ -26,6 +26,7 @@ export function renderSettings(root, ctx, actions) {
   const modelLimits = state.modelLimits || (state.status && state.status.modelLimits) || { contextWindow: 1_000_000, autoCompactTokenLimit: null };
   const codex = (state.status && state.status.codex) || {};
   const paths = (state.status && state.status.paths) || {};
+  const peer = state.peer || { sharing: { enabled: false, clients: [], localModels: [] }, remoteSync: { enabled: false, intervalMinutes: 60, connections: [], sources: [] } };
 
   actions.replaceChildren(
     el('button', {
@@ -45,9 +46,229 @@ export function renderSettings(root, ctx, actions) {
     updateCard(ctx),
     modelLimitsCard(ctx, { modelLimits, inject }),
     gatewayCard(ctx, { gateway, codex }),
+    peerSummaryCard(ctx, peer),
     injectCard(ctx, { inject, codex }),
     aboutCard(ctx, { gateway, codex, inject, paths }),
   );
+}
+
+function peerSummaryCard(ctx, peer) {
+  const { el, icon } = ctx;
+  const sharing = peer.sharing || {};
+  const remote = peer.remoteSync || {};
+  const connections = Array.isArray(remote.connections) ? remote.connections : [];
+  const sourceCount = Array.isArray(remote.sources) ? remote.sources.length : 0;
+  const activeConnections = connections.filter((connection) => connection.enabled !== false).length;
+  return el('section', { class: 'card peer-summary-card' }, [
+    el('header', { class: 'card-head' }, [
+      icon('plug', 14),
+      el('span', { class: 'card-title', text: '对等共享' }),
+      el('span', { class: 'card-desc', text: '双向发布本机模型或连接另一台 gpt++' }),
+    ]),
+    el('div', { class: 'card-body peer-summary-body' }, [
+      el('div', { class: 'peer-summary-status' }, [
+        el('span', { class: 'chip ' + (sharing.enabled ? 'chip-ok' : ''), text: '共享' + (sharing.enabled ? '已开启' : '未开启') }),
+        el('span', { class: 'chip ' + (remote.enabled ? 'chip-ok' : ''), text: '自动同步' + (remote.enabled ? '已开启' : '未开启') }),
+        el('span', { class: 'hint', text: activeConnections + ' 个启用连接 · ' + sourceCount + ' 个远端来源' }),
+      ]),
+      el('button', {
+        class: 'btn btn-sm btn-accent',
+        type: 'button',
+        on: { click: () => ctx.openPeerSettings() },
+      }, [icon('plug', 13), el('span', { text: '配置对等共享' })]),
+    ]),
+  ]);
+}
+
+export function openPeerSettings(ctx) {
+  const peer = ctx.state.peer || {
+    sharing: { enabled: false, clients: [], localModels: [] },
+    remoteSync: { enabled: false, intervalMinutes: 60, connections: [], sources: [] },
+  };
+  const gateway = ctx.state.gateway || (ctx.state.status && ctx.state.status.gateway) || {};
+  const modalState = { root: null };
+  modalState.root = peerCard(ctx, peer, gateway, true, modalState);
+  modalState.body = modalState.root.children[1];
+  ctx.openModal(modalState.root);
+}
+
+// ============ 对等共享与远端同步 ============
+function peerCard(ctx, peer, gateway, modal = false, modalState = null) {
+  const { el, icon } = ctx;
+  const sharing = peer.sharing || {};
+  const remote = peer.remoteSync || {};
+  const localModels = Array.isArray(sharing.localModels) ? sharing.localModels : [];
+  const clients = Array.isArray(sharing.clients) ? sharing.clients : [];
+  const connections = Array.isArray(remote.connections) ? remote.connections : [];
+  const sourceModels = (remote.sources || []).flatMap((source) => (source.models || []).map((model) => ({ ...model, sourceName: source.name })));
+  const hiddenModels = sourceModels.filter((model) => model.hidden);
+  const selected = new Set(localModels.filter((model) => model.selected).map((model) => model.providerId + '::' + model.modelId));
+
+  async function refresh() {
+    if (!modal) {
+      await ctx.reload('settings', { preserveScrollTop: true });
+    }
+    if (modal && modalState?.root) {
+      // 只更新内容区，保留弹窗、标题栏和关闭按钮，避免重播入场动画。
+      const next = peerCard(ctx, ctx.state.peer || peer, ctx.state.gateway || gateway, true, modalState);
+      const nextBody = next.children && next.children[1];
+      if (nextBody && modalState.body) modalState.body.replaceChildren(...Array.from(nextBody.childNodes || []));
+    }
+  }
+  async function saveSharing(enabled) {
+    try {
+      const result = await ctx.api.setSharing({ enabled, models: [...selected].map((key) => {
+        const at = key.indexOf('::');
+        return { providerId: key.slice(0, at), modelId: key.slice(at + 2) };
+      }) });
+      ctx.state.peer = result;
+      ctx.toast(enabled ? '已开启本机模型共享' : '已关闭本机模型共享', enabled ? 'ok' : 'warn');
+      await refresh();
+    } catch (err) { ctx.toastError(err, enabled ? '开启共享失败' : '关闭共享失败'); }
+  }
+  async function addClient() {
+    try {
+      const result = await ctx.api.addSharingClient({ name: '新客户端' });
+      ctx.state.peer = result.state;
+      ctx.toast('授权令牌已生成并复制到剪贴板，只显示这一次', 'ok');
+      await refresh();
+    } catch (err) { ctx.toastError(err, '生成共享授权失败'); }
+  }
+  async function revokeClient(id) {
+    try { ctx.state.peer = await ctx.api.revokeSharingClient(id); ctx.toast('已撤销该共享客户端', 'warn'); await refresh(); }
+    catch (err) { ctx.toastError(err, '撤销授权失败'); }
+  }
+  async function saveSync(enabled, interval) {
+    try { ctx.state.peer = await ctx.api.setRemoteSync({ enabled, intervalMinutes: interval }); ctx.toast(enabled ? '已开启远端模型自动同步' : '已关闭自动同步，仍可手动同步', 'ok'); await refresh(); }
+    catch (err) { ctx.toastError(err, '保存同步设置失败'); }
+  }
+  async function syncNow(id) {
+    try {
+      const result = await ctx.api.syncRemoteNow(id);
+      ctx.state.peer = result.state;
+      if (result.result?.ok) ctx.toast('远端模型清单已同步', 'ok');
+      else ctx.toast('同步失败：' + (result.result?.error || '未知错误'), 'error');
+      await refresh();
+    } catch (err) { ctx.toastError(err, '立即同步失败'); }
+  }
+  async function revokeAllClients() {
+    if (!clients.length) return;
+    try {
+      for (const client of [...clients]) {
+        await ctx.api.revokeSharingClient(client.id);
+      }
+      ctx.state.peer = await ctx.api.getPeerState();
+      ctx.toast('已清除全部已授权客户端', 'warn');
+      await refresh();
+    } catch (err) { ctx.toastError(err, '清除授权失败'); }
+  }
+  async function saveConnection(nameInput, urlInput, tokenInput) {
+    const authToken = String(tokenInput.value || '').trim();
+    if (!authToken) { ctx.toast('请输入对端授权令牌', 'warn'); return; }
+    try {
+      const result = await ctx.api.saveRemoteConnection({ name: nameInput.value, baseUrl: urlInput.value, authToken });
+      ctx.state.peer = result;
+      tokenInput.value = '';
+      ctx.toast('远端连接已保存', 'ok');
+      await refresh();
+    } catch (err) { ctx.toastError(err, '保存远端连接失败'); }
+  }
+
+  const sharingRows = [
+    el('div', { class: 'setting' }, [
+      el('div', { class: 'setting-main' }, [
+        el('div', { class: 'setting-title' }, [el('span', { text: '共享本机模型' }), el('span', { class: 'chip ' + (sharing.enabled ? 'chip-ok' : ''), text: sharing.enabled ? '已开启' : '默认关闭' })]),
+        el('div', { class: 'setting-desc', text: '只发布你明确选择的本机模型清单；不会发送 Base URL、API Key 或请求头。' }),
+      ]),
+      el('div', { class: 'setting-ctl' }, [el('button', { class: 'switch', type: 'button', role: 'switch', attrs: { 'aria-checked': sharing.enabled ? 'true' : 'false', 'aria-label': '共享本机模型' }, on: { click: () => void saveSharing(!sharing.enabled) } })]),
+    ]),
+    el('div', { class: 'peer-local-models' }, localModels.length ? localModels.map((model) => {
+      const key = model.providerId + '::' + model.modelId;
+      const checkbox = el('input', { class: 'peer-model-checkbox', type: 'checkbox', checked: selected.has(key) ? true : null, disabled: !model.enabled ? true : null, on: { change: (event) => { if (event.target.checked) selected.add(key); else selected.delete(key); } } });
+      return el('label', { class: 'peer-model-option' }, [
+        checkbox,
+        el('span', { class: 'peer-model-option-main' }, [
+          el('span', { class: 'peer-model-label', text: model.label }),
+          el('span', { class: 'peer-model-provider' }, [el('span', { class: 'peer-model-provider-dot' }), el('span', { text: model.providerName })]),
+        ]),
+        !model.enabled ? el('span', { class: 'chip chip-warn', text: '本机已停用' }) : null,
+      ]);
+    }) : [el('div', { class: 'hint', text: '还没有可共享的本机模型，请先添加并启用提供商和模型。' })]),
+    el('div', { class: 'toolbar peer-subtoolbar' }, [el('span', { class: 'hint', text: sharing.enabled ? '清单只含已启用且勾选的本机模型。' : '共享开关与远端自动同步互不依赖。' }), el('span', { class: 'right' }), el('button', { class: 'btn btn-sm btn-ghost', type: 'button', on: { click: () => void saveSharing(!!sharing.enabled) } }, [icon('check', 12), el('span', { text: '保存共享模型' })])]),
+    el('div', { class: 'peer-client-list' }, [
+      el('div', { class: 'toolbar peer-subtoolbar' }, [
+        el('div', { class: 'setting-title', text: '已授权客户端' }),
+        el('span', { class: 'right' }),
+        clients.length ? el('button', { class: 'btn btn-sm btn-danger', type: 'button', on: { click: () => void revokeAllClients() } }, [icon('trash', 12), el('span', { text: '清除全部' })]) : null,
+      ]),
+      clients.length ? clients.map((client) => el('div', { class: 'peer-client-row' }, [el('span', { class: 'grow' }, [el('span', { text: client.name }), el('span', { class: 'faint mono', text: ' · ' + client.id })]), el('button', { class: 'btn btn-sm btn-danger', type: 'button', on: { click: () => void revokeClient(client.id) } }, [icon('trash', 12), el('span', { text: '撤销' })])])) : el('div', { class: 'hint', text: '尚未授权其它电脑。' }),
+      el('button', { class: 'btn btn-sm btn-ghost', type: 'button', on: { click: () => void addClient() } }, [icon('plus', 12), el('span', { text: '生成新客户端授权' })]),
+    ]),
+  ];
+
+  const syncInterval = el('input', { class: 'input mono', type: 'number', value: String(remote.intervalMinutes || 60), attrs: { min: '5', max: '1440', step: '1', 'aria-label': '远端同步间隔（分钟）', style: 'width:100px' } });
+  const connectionName = el('input', { class: 'input', placeholder: '连接名称', attrs: { 'aria-label': '连接名称' } });
+  const connectionUrl = el('input', { class: 'input mono', placeholder: '对端 Tailscale Serve 主机名或地址', attrs: { 'aria-label': '对端地址', spellcheck: 'false' } });
+  const connectionToken = el('input', { class: 'input mono', type: 'password', placeholder: '对端授权令牌', attrs: { 'aria-label': '授权令牌', autocomplete: 'off', spellcheck: 'false' } });
+  const connectionRows = connections.length ? connections.map((connection) => el('div', { class: 'peer-connection-row' }, [
+    el('div', { class: 'grow' }, [el('div', { class: 'setting-title' }, [el('span', { text: connection.name }), el('span', { class: 'chip ' + (connection.lastError ? 'chip-err' : connection.lastSuccessAt ? 'chip-ok' : ''), text: connection.lastError ? '同步失败' : connection.lastSuccessAt ? '已同步' : '未同步' })]), el('div', { class: 'hint', text: connection.lastSuccessAt ? '上次同步：' + ctx.fmt.dateTime(connection.lastSuccessAt) : '尚未成功同步' }), connection.lastError ? el('div', { class: 'hint-error', text: connection.lastError }) : null]),
+    el('button', { class: 'switch switch-table', type: 'button', role: 'switch', attrs: { 'aria-checked': connection.enabled === false ? 'false' : 'true', 'aria-label': '启用远端连接' }, on: { click: async () => { await ctx.api.setRemoteConnectionEnabled({ id: connection.id, enabled: connection.enabled === false }); await refresh(); } } }),
+    el('button', { class: 'btn btn-icon', type: 'button', title: '立即同步', attrs: { 'aria-label': '立即同步' }, on: { click: () => void syncNow(connection.id) } }, [icon('refresh', 13)]),
+    el('button', { class: 'btn btn-icon btn-danger', type: 'button', title: '删除连接', attrs: { 'aria-label': '删除连接' }, on: { click: async () => { await ctx.api.deleteRemoteConnection(connection.id); await refresh(); } } }, [icon('trash', 13)]),
+  ])) : [el('div', { class: 'hint', text: '还没有远端连接。' })];
+  const syncRows = [
+    el('div', { class: 'setting' }, [el('div', { class: 'setting-main' }, [el('div', { class: 'setting-title' }, [el('span', { text: '自动同步远端模型' }), el('span', { class: 'chip ' + (remote.enabled ? 'chip-ok' : ''), text: remote.enabled ? '已开启' : '默认关闭' })]), el('div', { class: 'setting-desc', text: '后台只读取已连接对端的模型清单，不会访问任何上游提供商的 /models。关闭后仍可手动立即同步。' })]), el('div', { class: 'setting-ctl' }, [el('button', { class: 'switch', type: 'button', role: 'switch', attrs: { 'aria-checked': remote.enabled ? 'true' : 'false', 'aria-label': '自动同步远端模型' }, on: { click: () => void saveSync(!remote.enabled, Number(syncInterval.value) || 60) } })])]),
+    el('div', { class: 'setting' }, [el('div', { class: 'setting-main' }, [el('div', { class: 'setting-title', text: '同步间隔' }), el('div', { class: 'setting-desc', text: '允许 5-1440 分钟；第一次同步始终由你点击「立即同步」触发。' })]), el('div', { class: 'setting-ctl' }, [syncInterval, el('button', { class: 'btn btn-sm btn-primary', type: 'button', on: { click: () => void saveSync(remote.enabled, Number(syncInterval.value)) } }, [icon('check', 12), el('span', { text: '保存' })])])]),
+    el('div', { class: 'peer-connection-list' }, [el('div', { class: 'setting-title', text: '远端连接' }), ...connectionRows]),
+    el('div', { class: 'hint', text: '授权令牌由对端「生成新客户端授权」后，通过可信渠道获取，直接粘贴到下方输入框。' }),
+    el('div', { class: 'toolbar peer-connection-add' }, [connectionName, connectionUrl, connectionToken, el('button', { class: 'btn btn-sm btn-ghost', type: 'button', on: { click: () => void saveConnection(connectionName, connectionUrl, connectionToken) } }, [icon('plus', 12), el('span', { text: '保存连接' })])]),
+    sourceModels.length ? el('div', { class: 'hint', text: '已缓存 ' + sourceModels.length + ' 个远端模型；同步失败或对端离线时仍保留本机显示和启用决定。' }) : null,
+    hiddenModels.length ? el('div', { class: 'peer-hidden-list' }, [
+      el('div', { class: 'setting-title', text: '本机已隐藏的远端模型' }),
+      ...hiddenModels.map((model) => el('div', { class: 'peer-client-row' }, [
+        el('span', { class: 'grow', text: model.customLabel || model.label + ' · ' + model.sourceName }),
+        el('button', { class: 'btn btn-sm btn-ghost', type: 'button', on: { click: async () => {
+          try { await ctx.api.restoreRemoteModel({ providerId: model.gatewayProviderId, modelId: model.id }); ctx.toast('已恢复显示，模型仍保持停用', 'ok'); await refresh(); }
+          catch (err) { ctx.toastError(err, '恢复远端模型失败'); }
+        } } }, [icon('refresh', 12), el('span', { text: '恢复显示' })]),
+      ])),
+    ]) : null,
+  ];
+  const serveCommand = 'tailscale serve --bg ' + String(gateway.port || 18120);
+  const serveOffCommand = 'tailscale serve off';
+
+  const body = [
+    el('div', { class: 'peer-section-title', text: '共享本机模型' }),
+    ...sharingRows,
+    el('div', { class: 'peer-section-title', text: '远端模型同步' }),
+    ...syncRows,
+    el('div', { class: 'note note-info' }, [
+      icon('info', 14),
+      el('div', { class: 'grow' }, [
+        el('div', { text: '网络前提：本地 HTTP 网关仍只监听回环地址。请先在 tailnet 启用 HTTPS 证书，再用 PowerShell 手动执行 Serve 命令，将本机网关端口发布到 tailnet；把 Serve 显示的 HTTPS 设备地址填到另一端。' }),
+        el('div', { class: 'toolbar peer-serve-command' }, [
+          el('code', { class: 'mono', text: serveCommand }),
+          el('button', { class: 'btn btn-icon', type: 'button', title: '复制 Serve 命令', attrs: { 'aria-label': '复制 Serve 命令' }, on: { click: () => ctx.copyText(serveCommand, ' Tailscale Serve 命令') } }, [icon('copy', 13)]),
+        ]),
+        el('div', { class: 'hint', text: '停止 Serve：' + serveOffCommand + '。Serve 仅向 tailnet 提供服务；仍须自行配置 Tailscale ACL。不要使用 Funnel。gpt++ 不会安装、登录或自动重配置 Tailscale。授权令牌请通过可信渠道交接。' }),
+      ]),
+    ]),
+  ];
+  const header = modal
+    ? el('header', { class: 'modal-head' }, [
+        icon('plug', 15),
+        el('div', { class: 'grow' }, [
+          el('h2', { text: '对等共享网关' }),
+          el('div', { class: 'modal-sub', text: '共享本机模型或连接另一台 gpt++，两者可以同时开启' }),
+        ]),
+        el('button', { class: 'btn btn-icon', type: 'button', title: '关闭', attrs: { 'aria-label': '关闭' }, on: { click: () => ctx.closeModal() } }, [icon('x', 15)]),
+      ])
+    : el('header', { class: 'card-head' }, [icon('plug', 14), el('span', { class: 'card-title', text: '对等共享网关' }), el('span', { class: 'card-desc', text: '共享本机模型或连接另一台 gpt++，两者可以同时开启' })]);
+  const root = el('section', {
+    class: modal ? 'modal peer-settings-modal' : 'card peer-card',
+    attrs: modal ? { role: 'dialog', 'aria-modal': 'true', 'aria-label': '对等共享网关配置' } : {},
+  }, [header, el('div', { class: modal ? 'modal-body peer-settings-body' : 'card-body' }, body)]);
+  return root;
 }
 
 // ============ 软件更新 ==========

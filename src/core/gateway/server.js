@@ -6,10 +6,13 @@
  *   GET  /healthz          -> { ok:true, providers:<n>, models:<n> }
  *   GET  /v1/models        -> { object:'list', data:[{id:<slug>, object:'model', owned_by:<providerName>}] }
  *   POST /v1/responses     -> Responses 契约（流式 SSE / 非流式 JSON）
+ *   POST /onebot/event     -> QQ 远程助手的事件上报（转发给 deps.onebot，见下）
  *   OPTIONS *              -> 204（方便浏览器里调试）
  *
  * 认证：store.gateway.token（或 start() 传入的 token）非空时，要求
  *       `Authorization: Bearer <token>`，不匹配返回 401。
+ *       /onebot/event 例外：NapCat 上报不带网关令牌，改由 qq-bot 校验
+ *       可选的 eventToken（Bearer / access_token）。
  *
  * 设计：server.js 只做「HTTP + 认证 + 路由 + 日志 + 生命周期」；
  *       Responses 事件契约在 responses.js，上游协议在 adapters/*。
@@ -18,7 +21,12 @@
  * 签名（spec 第 8 节末）：
  *   createGateway({ store, paths, log }) => { start, stop, stopSync, getState,
  *                                             autoStart, probe, on }
- *   额外可选依赖（不进契约，测试/调试用）：deps.fetch —— 替换 globalThis.fetch。
+ *   额外可选依赖（不进契约，测试/调试用）：deps.fetch —— 替换 globalThis.fetch；
+ *   deps.taskObserver —— 任务中心（QQ 远程助手）的观察接口：
+ *       turnRequest({body,slug}) -> {turnKey}|null
+ *       requestStarted({turnKey,requestId,abort}) / requestFinished({requestId})
+ *       turnResponse({body,slug,ok,status,hasToolCalls,text})
+ *   deps.onebot.handleEvent(req,res,body) —— /onebot/event 的处理器。
  *   `paths` 为签名兼容而接收，网关不直接落盘（日志走 log 回调与内存环形缓冲）。
  */
 const http = require('node:http');
@@ -26,12 +34,15 @@ const crypto = require('node:crypto');
 
 const { createRouter } = require('./router.js');
 const { createSystemProxyFetch } = require('../system-proxy.js');
+const { redactDiagnostic } = require('../redact.js');
+const { createPeerManifest, hashPeerToken, safeEqual: safePeerEqual, peerEndpoint } = require('../peer-sharing.js');
 const { createOpenAIAdapter } = require('./adapters/openai.js');
 const { createAnthropicAdapter } = require('./adapters/anthropic.js');
 const { createResponsesAdapter } = require('./adapters/responses.js');
 const {
   ResponsesStream,
   buildResponseObject,
+  countLoopToolItems,
   estimateUsage,
   extractErrorMessage,
   extractResponseText,
@@ -83,7 +94,9 @@ function describeListenError(err, port) {
  * @param {{ store:any, paths?:any, log?:(e:any)=>void, fetch?:typeof fetch }} deps
  */
 function createGateway(deps = {}) {
-  const { store, log: externalLog } = deps;
+  const { store, log: externalLog, taskObserver = null, onebot = null } = deps;
+  const requestTimeoutMs = Number.isFinite(Number(deps.requestTimeoutMs)) && Number(deps.requestTimeoutMs) > 0
+    ? Number(deps.requestTimeoutMs) : REQUEST_TIMEOUT_MS;
   // deps.fetch 是契约外的测试注入点：null/undefined 表示用全局 fetch，
   // 显式传了别的类型说明调用方写错了，直接报错而不是静默忽略。
   const doFetch = deps.fetch == null ? globalThis.fetch : deps.fetch;
@@ -133,11 +146,15 @@ function createGateway(deps = {}) {
   }
 
   function logEntry(entry) {
-    const full = { at: Date.now(), level: 'info', ...entry };
+    const cfg = configSnapshot();
+    const peerSecrets = (cfg.remoteSync?.connections || []).map((connection) => ({
+      baseUrl: connection.baseUrl, apiKey: connection.authToken, headers: {},
+    }));
+    const full = redactDiagnostic({ at: Date.now(), level: 'info', ...entry }, [...(cfg.providers || []), ...peerSecrets]);
     ring.push(full);
     if (ring.length > RING_SIZE) ring.splice(0, ring.length - RING_SIZE);
     try {
-      if (typeof externalLog === 'function') externalLog(entry);
+      if (typeof externalLog === 'function') externalLog(full);
     } catch {
       /* 回调异常不影响网关 */
     }
@@ -356,6 +373,19 @@ function createGateway(deps = {}) {
     return safeEqual(match[1].trim(), token);
   }
 
+  function authorizedPeer(req) {
+    const header = req.headers.authorization || req.headers.Authorization || '';
+    const match = /^Bearer\s+(.+)$/i.exec(String(header).trim());
+    if (!match) return false;
+    const digest = hashPeerToken(match[1].trim());
+    const clients = configSnapshot().sharing?.clients || [];
+    return clients.some((client) => safePeerEqual(client.tokenHash, digest));
+  }
+
+  function sendPeerError(res, status, code, message) {
+    sendJson(res, status, { error: { code, message } });
+  }
+
   async function handleRequest(req, res) {
     const url = new URL(req.url || '/', 'http://127.0.0.1');
     const path = url.pathname.replace(/\/+$/, '') || '/';
@@ -368,6 +398,48 @@ function createGateway(deps = {}) {
         'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
       });
       res.end();
+      return;
+    }
+
+    if (path === '/onebot/event' && method === 'POST') {
+      if (!onebot || typeof onebot.handleEvent !== 'function') {
+        sendError(res, 404, `not found: ${method} ${path}`, 'invalid_request_error');
+        return;
+      }
+      let eventBody;
+      try {
+        eventBody = await readJsonBody(req, 1024 * 1024);
+      } catch (err) {
+        sendJson(res, err.statusCode || 400, { error: { message: err.message } });
+        return;
+      }
+      try {
+        await onebot.handleEvent(req, res, eventBody);
+      } catch (err) {
+        logEntry({ level: 'error', msg: `处理 OneBot 事件失败: ${err && err.message}` });
+        if (!res.writableEnded && !res.headersSent) sendJson(res, 500, { error: { message: '事件处理失败' } });
+      }
+      return;
+    }
+
+    if (path === '/peer/v1/models' || path === '/peer/v1/responses') {
+      if (!authorizedPeer(req)) {
+        sendPeerError(res, 401, 'UNAUTHORIZED', '无效的对等端授权');
+        return;
+      }
+      if (!configSnapshot().sharing?.enabled) {
+        sendPeerError(res, 403, 'SHARING_DISABLED', '共享端当前未开启');
+        return;
+      }
+      if (path === '/peer/v1/models' && method === 'GET') {
+        sendJson(res, 200, createPeerManifest(configSnapshot(), router.localProviders()));
+        return;
+      }
+      if (path === '/peer/v1/responses' && method === 'POST') {
+        await handleResponses(req, res, { peerRequest: true });
+        return;
+      }
+      sendPeerError(res, 405, 'INVALID_REQUEST', '不支持的对等端请求方法');
       return;
     }
 
@@ -407,6 +479,20 @@ function createGateway(deps = {}) {
   }
 
   async function callUpstream(adapter, { provider, modelId, body, stream, compat }, signal) {
+    if (provider.remote) {
+      const connection = provider.remoteConnection;
+      if (!connection || !connection.baseUrl || !connection.authToken) {
+        throw Object.assign(new Error('远端来源没有可用连接，请重新连接该共享端'), { upstreamStatus: 503 });
+      }
+      const upstream = await doFetch(peerEndpoint(connection.baseUrl, 'responses'), {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + connection.authToken, 'Content-Type': 'application/json',
+          Accept: stream ? 'text/event-stream' : 'application/json' },
+        body: JSON.stringify({ ...body, model: modelId }),
+        signal,
+      });
+      return { built: { passthrough: true }, upstream };
+    }
     const built = adapter.buildRequest({ provider, modelId, body, stream, compat });
     const upstream = await doFetch(built.url, {
       method: 'POST',
@@ -422,7 +508,7 @@ function createGateway(deps = {}) {
     return status === 400 || status === 422 || (status >= 500 && status <= 599);
   }
 
-  async function handleResponses(req, res) {
+  async function handleResponses(req, res, { peerRequest = false } = {}) {
     const started = Date.now();
     state.requests += 1;
 
@@ -435,16 +521,18 @@ function createGateway(deps = {}) {
       return;
     }
 
-    const slug = body && body.model != null ? String(body.model) : '';
-    const route = router.resolve(slug);
+    const requestedModel = body && body.model != null ? String(body.model) : '';
+    const route = peerRequest ? router.resolveLocalModelId(requestedModel) : router.resolve(requestedModel);
+    const slug = peerRequest && route.ok ? route.slug : requestedModel;
     if (!route.ok) {
-      logEntry({ level: 'warn', msg: route.reason, status: 404, model: slug });
-      sendError(res, 404, route.reason, 'invalid_request_error');
+      if (peerRequest) sendPeerError(res, 404, 'MODEL_NOT_FOUND', '共享端未发布该模型');
+      else sendError(res, 404, route.reason, 'invalid_request_error');
+      logEntry({ level: 'warn', msg: peerRequest ? '对等端请求了未发布模型' : route.reason, status: 404, model: slug });
       return;
     }
 
     const provider = route.provider;
-    const adapter =
+    const adapter = provider.remote ? { passthrough: true } :
       provider.api === 'anthropic'
         ? adapters.anthropic
         : provider.api === 'responses'
@@ -452,7 +540,7 @@ function createGateway(deps = {}) {
           : adapters.openai;
     const wantStream = body.stream !== false;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error('上游响应超时')), REQUEST_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(new Error('上游响应超时')), requestTimeoutMs);
     if (typeof timer.unref === 'function') timer.unref();
     let clientGone = false;
     const onClose = () => {
@@ -472,6 +560,27 @@ function createGateway(deps = {}) {
     };
     logEntry({ level: 'info', msg: `开始请求 ${slug}`, ...baseLog, status: 0 });
 
+    // 任务观察（QQ 远程助手）：peer 请求是别的 gpt++ 实例的流量，不跟踪；
+    // QQ 手机问答自带 X-Gptplus-Qq-Chat 标记，也不算 Codex 任务（否则每轮聊天都会触发假任务通知）。
+    const qqChat = String(req.headers['x-gptplus-qq-chat'] || '') === '1';
+    let turnInfo = null;
+    if (!peerRequest && !qqChat && taskObserver && typeof taskObserver.turnRequest === 'function') {
+      try {
+        turnInfo = taskObserver.turnRequest({ body, slug }) || null;
+      } catch {
+        turnInfo = null;
+      }
+      if (turnInfo && typeof taskObserver.requestStarted === 'function') {
+        taskObserver.requestStarted({
+          turnKey: turnInfo.turnKey,
+          requestId: baseLog.requestId,
+          abort: () => controller.abort(new Error('QQ 远程停止任务')),
+        });
+      }
+    }
+    let sawToolCall = false;
+    const observed = { hasToolCalls: false, text: '' };
+
     let finalLogged = false;
     let pipe = null;
     let stream = null;
@@ -480,13 +589,28 @@ function createGateway(deps = {}) {
     const logFinal = (entry = {}) => {
       if (finalLogged) return null;
       finalLogged = true;
-      return logEntry({
+      const final = logEntry({
         level: 'info',
         ...baseLog,
         ...entry,
         final: true,
         ms: entry.ms ?? Date.now() - started,
       });
+      if (!peerRequest && !qqChat && taskObserver && typeof taskObserver.turnResponse === 'function') {
+        try {
+          taskObserver.turnResponse({
+            body,
+            slug,
+            ok: final.status === 200,
+            status: final.status,
+            hasToolCalls: observed.hasToolCalls,
+            text: observed.text,
+          });
+        } catch {
+          /* 观察失败不影响网关 */
+        }
+      }
+      return final;
     };
 
     // 客户端提前断开时，尽量保留上游已经返回的 usage 和缓存字段。
@@ -589,6 +713,8 @@ function createGateway(deps = {}) {
         }
         if (adapter.passthrough) {
           // 原生 Responses 响应：原样回给客户端，网关只记日志
+          observed.hasToolCalls = countLoopToolItems(json.output) > 0;
+          observed.text = extractResponseText(json.output);
           const entry = logFinal({
             level: 'info',
             msg: `完成 ${slug} -> ${route.modelId} (${Date.now() - started}ms)`,
@@ -601,6 +727,8 @@ function createGateway(deps = {}) {
           return entry;
         }
         const parsed = adapter.parseJson(json);
+        observed.hasToolCalls = !!(parsed.toolCalls && parsed.toolCalls.length);
+        observed.text = parsed.text;
         const responseObject = buildResponseObject({
           model: slug,
           text: parsed.text,
@@ -623,9 +751,9 @@ function createGateway(deps = {}) {
 
       writeSseHeaders(res);
       // 透传模式：上游报文逐字节转发，不做内部事件重建（见 adapters/responses.js）；
-      // pipe 只收集日志要用的信息（usage / responseId / 失败事件）。
+      // pipe 只收集日志要用的信息（usage / responseId / 失败事件 / 工具调用数）。
       pipe = adapter.passthrough
-        ? { usage: null, outputText: '', responseId: null, events: 0, completed: false, failed: null }
+        ? { usage: null, outputText: '', responseId: null, events: 0, completed: false, failed: null, toolCalls: 0 }
         : null;
       stream = adapter.passthrough ? null : new ResponsesStream({ res, model: slug });
       if (stream) stream.start();
@@ -642,6 +770,7 @@ function createGateway(deps = {}) {
                 stream.reasoningDelta(event.delta);
                 break;
               case 'tool_start':
+                sawToolCall = true;
                 stream.toolStart({ key: event.key ?? 0, id: event.id, name: event.name });
                 break;
               case 'tool_args':
@@ -687,6 +816,8 @@ function createGateway(deps = {}) {
             sendResponsesFailure(res, { responseId: pipe.responseId, message });
             return;
           }
+          observed.hasToolCalls = (pipe.toolCalls || 0) > 0;
+          observed.text = pipe.outputText;
           const entry = logFinal({
             level: 'info',
             msg: `完成 ${slug} -> ${route.modelId} (${Date.now() - started}ms)`,
@@ -699,6 +830,8 @@ function createGateway(deps = {}) {
           if (!res.writableEnded) res.end();
           return entry;
         }
+        observed.hasToolCalls = sawToolCall;
+        observed.text = stream.text;
         stream.complete({ requestBody: body });
         logFinal({
           level: 'info',
@@ -710,6 +843,7 @@ function createGateway(deps = {}) {
           events: stream.emittedTypes.length,
         });
       } catch (err) {
+        err.message = redactDiagnostic(err.message, [provider]);
         logEntry({ level: 'error', msg: `请求异常: ${err && err.message ? err.message : err}`, ...baseLog, status: 502, ms: Date.now() - started, clientGone });
         if (clientGone) {
           logFinal({
@@ -733,6 +867,7 @@ function createGateway(deps = {}) {
         }
       }
     } catch (err) {
+      err.message = redactDiagnostic(err.message, [provider]);
       if (clientGone) {
         logFinal({
           level: 'warn',
@@ -753,6 +888,13 @@ function createGateway(deps = {}) {
     } finally {
       clearTimeout(timer);
       res.removeListener('close', onClose);
+      if (!peerRequest && taskObserver && typeof taskObserver.requestFinished === 'function') {
+        try {
+          taskObserver.requestFinished({ requestId: baseLog.requestId });
+        } catch {
+          /* ignore */
+        }
+      }
     }
   }
 

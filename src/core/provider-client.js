@@ -4,6 +4,7 @@
 const DEFAULT_TIMEOUT = 10000;
 
 const { stripEndpoint } = require('./base-url.js');
+const { redactDiagnostic } = require('./redact.js');
 const { createSystemProxyFetch } = require('./system-proxy.js');
 const { buildRequest: buildChatRequest } = require('./gateway/adapters/openai.js');
 const { buildRequest: buildResponsesRequest } = require('./gateway/adapters/responses.js');
@@ -71,6 +72,15 @@ function normalizeList(list) {
     out.push({ id, label });
   }
   return out;
+}
+
+function isCompleteModelList(list) {
+  return Array.isArray(list) && list.every((item) => {
+    if (typeof item === 'string') return !!item.trim();
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
+    const candidate = item.id ?? item.slug ?? item.model ?? item.name;
+    return typeof candidate === 'string' && !!candidate.trim();
+  });
 }
 
 function setHeader(headers, name, value) {
@@ -318,13 +328,33 @@ function createProviderClient({ store, timeoutMs = DEFAULT_TIMEOUT, fetchImpl } 
       if (!r.ok) return { ok: false, models: [], error: r.error || '请求失败' };
       const list = extractList(r.json);
       if (!list) return { ok: false, models: [], error: '响应不是模型列表（缺少 data 数组）' };
+      if (!isCompleteModelList(list)) return { ok: false, models: [], error: '模型列表含无效条目，未更新本地模型状态' };
       return { ok: true, models: normalizeList(list) };
     } catch (err) {
       return { ok: false, models: [], error: describeError(err, limit) };
     }
   }
 
-  return { testProvider, testProviderModels, fetchRemoteModels, timeoutMs: limit };
+  function safeResult(result, id) {
+    const provider = getProvider(id);
+    const out = { ...result };
+    if (out.error) out.error = redactDiagnostic(out.error, [provider]);
+    if (Array.isArray(out.results)) {
+      out.results = out.results.map((item) => item.error
+        ? { ...item, error: redactDiagnostic(item.error, [provider]) } : item);
+    }
+    return out;
+  }
+
+  return {
+    testProvider: async (id) => safeResult(await testProvider(id), id),
+    testProviderModels: async (id, ids) => safeResult(await testProviderModels(id, ids), id),
+    fetchRemoteModels: async (id) => {
+      const result = await fetchRemoteModels(id);
+      return result.ok ? result : redactDiagnostic(result, [getProvider(id)]);
+    },
+    timeoutMs: limit,
+  };
 }
 
-module.exports = { createProviderClient, normalizeList, DEFAULT_TIMEOUT };
+module.exports = { createProviderClient, normalizeList, isCompleteModelList, DEFAULT_TIMEOUT };

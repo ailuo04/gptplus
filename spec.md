@@ -120,6 +120,8 @@ C:\ailuo_own\gpt++\
       app.js                   <- 主控制器/路由（C 负责）
       views/providers.js       <- 提供商 CRUD（C 负责）
       views/models.js          <- 模型列表/选择/测试（C 负责）
+      views/usage.js           <- 使用量统计（C 负责）
+      views/qq.js              <- QQ 远程助手独立页（C 负责）
       views/settings.js        <- 网关开关、注入开关、端口（C 负责）
   tools/                       <- 逆向/验证脚本（Lead 负责）
   research/                    <- 桌面端机制调研报告
@@ -140,18 +142,44 @@ C:\ailuo_own\gpt++\
     {
       "id": "p_xxx",              // 稳定 id
       "name": "梦幻API",
-      "baseUrl": "https://mhapi.net/v1",
-      "apiKey": "sk-...",
       "api": "openai",             // "openai" | "anthropic"
-      "headers": {},               // 额外请求头
       "enabled": true,
       "models": [
         { "id": "gpt-6.1-sol", "label": "GPT-6.1 Sol", "enabled": true, "reasoning": true }
-      ]
+      ],
+      "secret": {
+        "version": 1,
+        "ciphertext": "<系统安全存储密文>"
+      }
     }
   ]
 }
 ```
+
+提供商的 `baseUrl`、`apiKey`、`headers` 只在应用运行时内存中以明文存在，落盘时通过 Electron `safeStorage` 加密到 `providers[].secret`；`config.json` 不再保存这些字段的明文。旧版本含明文凭据的配置会在首次成功读取后迁移到该格式。若系统安全存储不可用，应用拒绝写入提供商凭据，避免回退到明文保存。
+
+### 4.1 提供商配置传输文件
+
+- 扩展名为 `.gptplus-providers`；外层 JSON 的 `format` 为 `gptplus-provider-config`，`version` 为 `3`。
+- 文件本身保持可读取的 JSON。名称、模型列表、接口协议、启用状态、模型顺序和默认模型保持明文；每个提供商的 Base URL、API Key、请求头分别通过 Electron `safeStorage` 加密后以 base64url 写入 `secrets`。
+- 导出和导入不要求、不接收、也不保存文件密码；文件不是整体加密包。系统安全存储不可用时直接拒绝导出或导入，不回退到明文。
+- 文件绑定当前系统账户，不能作为跨电脑或跨 Windows 用户的可移植备份；界面必须明确提示这一点。导入在同一台电脑的同一系统账户下自动解密。
+- 最大文件大小为 2 MiB。点击选择和拖拽都经相同的主进程扩展名、大小、结构、版本、系统安全存储和字段校验后生成脱敏预览；一次仅接受一个文件。
+- 解密后的完整配置只在主进程导入会话中暂存（5 分钟过期），预览不返回 API Key、Base URL 或请求头。写入前确认新增、自动改名新增、覆盖或跳过；覆盖需要额外确认，目标变化后必须重新预览。
+- 只接受当前版本 `3`；旧版密码文件、旧版整体密文、旧版明文 JSON 和不支持的加密参数直接拒绝，不做兼容迁移。
+- 保留本机回环地址的无认证提供商兼容：显式空 API Key 仅允许 localhost、127.0.0.1、::1；缺少字段或远端提供商空 Key 都拒绝。
+- 导入用同步内存事务暂存配置和默认模型更新，注入同步成功后只进行一次原子配置落盘。失败保留原提供商配置；注入外部文件恢复失败时单独报告。
+
+安全边界：应用运行时必须解密并使用凭据；拥有当前系统用户的解密能力、设备管理员权限或调试权限的人仍可能获得运行时 API Key。API Key 复制按钮按用户要求保留，仅主动点击时写入剪贴板，这是“不进入剪贴板”规则的明确例外。历史明文备份、系统快照、崩溃转储及剪贴板历史无法由本功能保证擦除；迁移不会删除用户旧备份。运行时 Provider 数据结构和上游请求格式保持不变。
+
+### 4.2 对等共享配置与远端模型
+
+- `sharing.enabled` 与 `remoteSync.enabled` 是独立开关，默认均为 `false`；同步间隔默认 60 分钟，范围 5-1440 分钟。打开自动同步只定时读取已连接对端的 `/peer/v1/models`，不会调用本机上游的 `/models`。首次同步及自动同步关闭时仍可手动执行。
+- `sharing.models` 只包含用户勾选的本机 `<providerId>::<modelId>`。共享端还会过滤已停用提供商/模型以及任何远端来源模型，避免再转发和递归。
+- `sharing.clients[]` 每项有独立随机客户端 ID、显示名和 SHA-256 bearer token 摘要；明文 token 仅创建时由主进程写入系统剪贴板一次，不返回 renderer、不记录日志，撤销只删除该客户端摘要。接收端连接使用独立的 bearer token 与 URL；它们与本地 `gateway.token` 无关。
+- `remoteSync.connections[]` 的 Base URL 与授权 token 仅在内存中解密使用，磁盘通过 Electron `safeStorage` 加密；不提供安全存储时拒绝保存。远端模型及同步状态保存在 `remoteSync.sources[]`，不写回本地 providers。
+- 首次发现的远端模型以来源 ID、来源提供商 ID 和原始模型 ID 稳定区分，默认禁用；本机显示名、启用决定和隐藏记录由接收端独立保存。同步成功时缺失模型保留且标记未检测到；失败或不完整响应仅更新连接错误，不改变旧清单。恢复出现时保留本地偏好。删除只在本机隐藏，后续同步不会重新显示，可手动恢复。
+- 所有新配置均可缺省读取为以上默认值；旧配置升级不改变既有提供商、模型、启用状态、模型顺序或注入设置。
 
 `~/.codex/config.toml`：只增量维护 **我们自己的** 段落，其它内容原样保留：
 
@@ -206,6 +234,14 @@ C:\ailuo_own\gpt++\
        API 的上游：encrypted reasoning、原生事件序列不经重建；compat 重试跳过；
      - `anthropic`：转换为 Messages API。
 
+### 6.1 对等端协议（peer/v1）
+
+- `GET /peer/v1/models` 与 `POST /peer/v1/responses` 只使用共享端单独发放的 Bearer 授权；不接受 `gateway.token`。权限按客户端 ID 独立撤销。未授权返回 `401 UNAUTHORIZED`，共享关闭返回 `403 SHARING_DISABLED`，未发布模型返回 `404 MODEL_NOT_FOUND`，版本不兼容返回 `426 VERSION_UNSUPPORTED`。
+- v1 清单包含 `protocolVersion:1`、`complete:true`、来源 `{id,name,revision,updatedAt}` 及模型 `{id,providerId,modelId,providerName,label,capabilities}`。`id` 固定为 `<providerId>::<modelId>`；能力标记包括 Responses、流式与推理。完整清单不包含 Base URL、API Key、请求头、客户端授权凭据或上游地址。
+- 只有结构完整且通过校验的清单才可应用；模型数最多 10,000，清单最多 4 MiB，重复或格式错误条目使整次同步失败。`complete:true` 的空数组表示完整空清单。
+- 接收端以来源哈希生成隔离 slug；Responses 请求经本地网关按原始共享 ID 鉴权转发到对应共享端。共享端检查该模型仍被明确发布并启用，然后使用共享端自己的 provider 配置与凭据访问上游。JSON/SSE 均透传；断连和超时通过 AbortSignal 传播。
+- 默认网关仍只绑定 `127.0.0.1`。用户可在已加入 tailnet 的机器上手动运行 `tailscale serve --bg <网关端口>`，再把 Serve 显示的 HTTPS 设备地址填入对端连接。需自行启用 Tailscale HTTPS 证书并配置 ACL；不使用 Funnel，应用不安装、登录或改写 Tailscale。
+
 ## 7. IPC 契约（主进程 ↔ 渲染层）
 
 `preload.cjs` 通过 `contextBridge` 暴露 `window.gptplus`。所有方法返回 Promise，
@@ -237,11 +273,31 @@ window.gptplus = {
   listProviders(): Promise<Provider[]>;
   saveProvider(input: ProviderInput): Promise<Provider[]>;
   deleteProvider(id: string): Promise<Provider[]>;
+  exportProviderConfig(input: { providerIds?: string[]|null }): Promise<{ canceled: boolean; count?: number }>;
+  pickProviderImportFile(): Promise<{ canceled: boolean; fileName?: string; bytes?: Uint8Array }>;
+  inspectProviderImport(input: { fileName: string; bytes: Uint8Array }): Promise<{ version: number; size: number; requiresPassword: false; portable: false }>;
+  prepareProviderImport(input: { fileName: string; bytes: Uint8Array }): Promise<{ sessionId: string; preview: object }>;
+  applyProviderImport(input: { sessionId: string; decisions: { sourceId: string; action: 'add'|'overwrite'|'skip' }[]; overwriteConfirmed?: boolean }): Promise<{ providers: Provider[]; counts: object; status: Status }>;
+  cancelProviderImport(sessionId: string): Promise<{ canceled: boolean }>;
   testProvider(id: string): Promise<{ ok: boolean; status?: number; latencyMs: number; error?: string }>;
   testProviderModels(patch: { providerId: string; modelIds: string[] }): Promise<{
     ok: boolean; results: { modelId: string; ok: boolean; status?: number; latencyMs: number; error?: string }[]; error?: string
   }>;
   fetchRemoteModels(id: string): Promise<{ ok: boolean; models: {id:string;label:string}[]; error?: string }>;
+
+  getPeerState(): Promise<object>;                 // 仅返回脱敏共享、连接和来源快照
+  setSharing(patch: { enabled?: boolean; name?: string; models?: {providerId:string;modelId:string}[] }): Promise<object>;
+  addSharingClient(patch: { name?: string }): Promise<{ id:string; name:string; copied:boolean; state:object }>;
+  revokeSharingClient(id: string): Promise<object>;
+  setRemoteSync(patch: { enabled?:boolean; intervalMinutes?:number }): Promise<object>;
+  saveRemoteConnection(patch: { id?:string; name?:string; baseUrl:string }): Promise<object>; // 授权 token 从主进程系统剪贴板读取
+  setRemoteConnectionEnabled(patch: { id:string; enabled:boolean }): Promise<object>;
+  deleteRemoteConnection(id:string): Promise<object>;
+  syncRemoteNow(id:string): Promise<object>;
+  setRemoteModelEnabled(patch: { providerId:string; modelId:string; enabled:boolean }): Promise<Status>;
+  deleteRemoteModel(patch: { providerId:string; modelId:string }): Promise<Status>; // 本机隐藏
+  restoreRemoteModel(patch: { providerId:string; modelId:string }): Promise<Status>;
+  setRemoteModelLabel(patch: { providerId:string; modelId:string; label:string }): Promise<Status>;
 
   listModels(): Promise<ModelRef[]>;                    // 全部 provider 的全部模型（渠道名 slug 化，按 modelOrder）
   setModelEnabled(patch: { providerId: string; modelId: string; enabled: boolean }): Promise<Status>;
@@ -256,6 +312,7 @@ window.gptplus = {
 
   getInject(): Promise<{ enabled: boolean; catalogPath: string|null; defaultModel: string|null }>;
   setInject(patch: { enabled?: boolean; defaultModel?: string|null }): Promise<Status>;
+                                        // 并默认选中；gptplus:chatgpt:relaunch 前会强制重写目录
   openCodexFolder(): Promise<{ ok: boolean; error?: string }>;
   openCodexConfig(): Promise<{ ok: boolean; error?: string }>;  // 用系统默认编辑器打开 config.toml
 
@@ -286,11 +343,12 @@ module.exports = {
 };
 
 // src/core/store.js
-createStore({ configPath }) => {
+createStore({ configPath, secretStorage? }) => {
   load(): Config                       // 缺失/损坏时返回默认值并备份损坏文件
   get(): Config                        // 内存快照（深拷贝）
   save(cfg): Config
   update(fn): Config                   // fn(draft) 就地修改
+  transaction(cfg, apply): any         // 同步暂存；apply 成功后一次落盘，失败恢复内存与原文件
   providers(): Provider[]
   getProvider(id): Provider | undefined
   upsertProvider(input): Provider      // 无 id 时生成 p_<8位>
@@ -362,3 +420,208 @@ createGateway({ store, paths, log }) => {
 | 渲染层（UI/CSS/交互） | `src/renderer/**` | C |
 
 禁止改动范围外文件；跨模块问题通过消息沟通，不改别人的文件。
+
+## 10. QQ 远程助手（任务中心 + OneBot 上报，v1.3.4）
+
+目标：在 QQ 上接收 Codex 任务通知（完成/失败/每 N 分钟进度），并通过主人 QQ
+的私聊命令远程控制本机 Codex（列任务、发新任务、插入要求、停止）。
+
+### 10.1 配置（`config.json` 新增 `qqbot` 块）
+
+```jsonc
+{
+  "qqbot": {
+    "enabled": false,
+    "apiUrl": "http://127.0.0.1:3000",   // NapCat HTTP 服务器地址
+    "accessToken": "",                    // NapCat 访问令牌（可空）
+    "eventToken": "",                     // 上报校验令牌（可空；非空时 /onebot/event 必须带）
+    "notifyQq": "",                       // 接收通知的 QQ（4-14 位数字）
+    "ownerQq": "",                        // 允许下发命令的 QQ（4-14 位数字）
+    "progressMinutes": 5,                 // 进行中提醒间隔，1-120 分钟
+    "codexPath": "",                      // codex.exe 显式路径（空则自动检测）
+    "workspaceDir": "",                   // 新任务默认工作目录（空则用户主目录）
+    "autoLaunch": false,                  // 开关打开/应用启动时自动拉起 NapCat
+    "launchCommand": "",                  // 拉起命令（可含参数；win 下经 cmd /c 执行，兼容 .bat；空则自动识别）
+    "launchQq": "",                       // 快速登录 QQ（4-14 位数字；作为 -q <QQ> 参数追加）
+    "webuiPort": 0,                       // NapCat WebUI 端口（一键安装写入；0=未写）
+    "webuiToken": ""                      // NapCat WebUI 令牌（一键安装写入，用于 app 内扫码登录）
+  }
+}
+```
+
+所有键可缺省；`normalizeQqBot` 负责清洗。令牌与 `gateway.token` 一样明文落盘
+（本机回环服务，威胁模型一致）。
+
+### 10.2 任务中心（`src/core/task-center.js`）
+
+`createTaskCenter({ store, log, now?, spawnImpl? })`，两类任务统一注册表：
+
+- **gateway 任务（g_ 前缀）**：由网关观察接口驱动，只能查看/停止。
+  - `turnRequest({body,slug}) -> {turnKey}|null`：turnKey = sha1(instructions
+    前 4000 字符 + 最后一条 user 消息)。同 turnKey 的重试/工具轮回并为一轮任务；
+    手动停止后 90 秒冷却期内同 turnKey 的客户端重试不再重建任务。客户端对话后
+    自动发起的「会话标题生成」请求（"You are a helpful assistant." 开头且要求
+    输出 title JSON，见 `isTitleGenBody`）不建任务、不通知。
+  - `turnResponse({body,slug,ok,status,hasToolCalls,text})`：status 200 且
+    `hasToolCalls=false` -> 任务完成；499 或 stopRequested -> 已停止；其它失败
+    仅标记 failing（客户端可能重试），由 stale sweep 收口（失败 3 分钟 / 空闲
+    10 分钟）。
+  - `requestStarted({turnKey,requestId,abort})` / `requestFinished({requestId})`：
+    注册在途请求的断开句柄，`stopTask` 用它断开上游流。
+- **exec 任务（e_ 前缀）**：`codex exec --json --skip-git-repo-check
+  --sandbox workspace-write <prompt>` 子进程，stdout JSONL 解析（thread_id /
+  agent_message / turn.completed / turn.failed 容错解析）。
+  - `startExecTask({prompt,cwd})`、`followUp(id,text)`（运行中排队，结束后
+    `codex exec resume <session|--last> <text>` 续跑）、`stopTask(id)`
+    （Windows 用 `taskkill /PID <pid> /T /F` 结束进程树）。
+  - codex 解析顺序：配置显式路径 > ChatGPT(MSIX) 内置
+    `<pkg>/app/resources/codex.exe` > npm 全局
+    `@openai/codex-win32-x64/vendor/.../bin/codex.exe` > PATH（.cmd 走 cmd.exe 包装）。
+- `tick()`（30s 定时）：每任务按 `progressMinutes` 发 progress 通知 + stale 清扫；
+  `listTasks() -> {running[], recent[]}`（含 id/kind/title/model/status/startedAt/
+  endedAt/rounds/queued/lastText/lastError）；`stop()` 供应用退出时结束子进程。
+- 事件：`on('notify', ({kind, task}))`，kind ∈ done|failed|stopped|stale|progress；
+  任务中心不发消息，QQ 侧负责格式化与发送。
+
+### 10.3 OneBot 接入（`src/core/qq-bot.js` + 网关路由）
+
+> 运行形态：OneBot 框架（NapCat / Lagrange.OneBot / LLOneBot 等任一 OneBot 11
+> 兼容端均可，免费开源）与 gpt++ 跑在同一台电脑，全部经 127.0.0.1 本机回环通信，
+> 不需要服务器、公网或任何付费服务。担心风控时用 QQ 小号登录框架，
+> 主号作为 notifyQq/ownerQq 收通知、发命令。
+
+- 发送：`POST {apiUrl}/send_private_msg`（Bearer accessToken），连通性探测
+  `GET {apiUrl}/get_login_info`；10 秒超时。
+- 自动拉起（`launchNapCat`）：启动命令取 `launchCommand`，留空时
+  `detectNapCatCommand()` 自动识别——候选目录为各盘根/用户目录/桌面/下载/
+  LOCALAPPDATA 下的 `NapCat` 与 `NapCat*` 文件夹及 npm 全局目录，按已知入口名
+  （NapCatWinBootMain.bat > launcher-user.bat > launcher.bat > … > napcat.cmd
+  > NapCat 开头的 bat/cmd/exe 兜底，免管理员的 user 版优先）取第一个命中。
+  spawn 前先 `syncNapCatConfig`：在 `<命令目录>/config/` 下没有 onebot11 配置时
+  写入默认模板（HTTP 服务器 = apiUrl 端口 + accessToken；HTTP 上报 = 本地网关
+  /onebot/event + eventToken；schema 对齐 NapCat 4.x，条目名 gptplus-api /
+  gptplus-report），已有配置只同步这两个自有条目，不碰用户其它设置；NapCat
+  登录后按模板生成 onebot11_<QQ>.json。随后先探测 `get_login_info`，已在线
+  直接复用；离线时 `spawn(cmd.exe /d /s /c, 命令 [-q 快速登录QQ])`
+  （NapCat 核心解析 -q/--qq；detached + unref + windowsHide，独立静默存活，
+  不保留前台控制台），每 2.5 秒轮询一次
+  `get_login_info`，120 秒内上线即成功，成功后按登录账号自动补全空的
+  launchQq/notifyQq/ownerQq（autoLaunch 开且网关启用时顺带 enabled）。
+  并发调用共享同一 Promise（去重）。触发点：应用启动（main.js 网关
+  autoStart 后）、开关打开（ipc qqbot:set 后台）与渲染层「拉起 NapCat」
+  按钮（ipc `qqbot:launch` 前台等待）；按钮只要求能解析到命令，其余两个
+  还要求 `enabled && autoLaunch`。
+- 接收：网关新增 `POST /onebot/event`（在网关令牌校验**之前**，由可选
+  `eventToken` 自行校验：`Authorization: Bearer` / `access-token` /
+  `X-Access-Token` / `?access_token=`）。NapCat 配置「HTTP POST 上报」指向
+  `http://127.0.0.1:<网关端口>/onebot/event`。
+- 只处理 `post_type=message && message_type=private && sender==ownerQq` 的文本
+  与图片（raw_message 或 message 段数组：文本剥 CQ 码，图片取 image 段的
+  图床直链，无直链时退回 NapCat 本地缓存文件）。**机器人只通报、不干预 Codex**：
+
+```
+帮助 | 任务/列表 | 状态
+模型/model                  // 重新选择回答模型
+新对话/重置                // 清空问答上下文与模型选择
+<任意其它文本或图片>       // 手机问答：首次提问先回模型列表（回序号选择，5 分钟内有效），
+                           // 选定后连续追问直接回答；POST 本地网关 /v1/responses
+                           //（stream:false，Bearer gateway.token，带 X-Gptplus-Qq-Chat: 1
+                           // 标记——网关任务观察据此跳过，聊天不会误报成 Codex 任务），
+                           // 内存态多轮（保留 12 条，闲置 30 分钟或「新对话」清空），
+                           // 不创建/停止/修改任何 Codex 任务
+```
+
+- 图片消息：收到 image 段（或 CQ:image 字符串兜底）立即下载图床直链
+  （30 秒超时；单张 ≤5MB、单条 ≤4 张；类型按响应头/魔数/扩展名识别）转成
+  data URL，随提问以 `input_image` 发给模型（openai/anthropic 适配器均支持）。
+  只发图不配文字时用默认提问「请描述这张图片的内容」；选模型前收到的图片
+  随待答问题暂存，回序号后一起发出（带图消息中的数字不当模型序号）。
+  多轮上下文只保留最近 2 条带图消息的图片，更早的剔除以控制请求体大小；
+  下载/超限失败会以「⚠ 命令执行失败」回复原因。
+
+- 通知格式（只留任务名+耗时+结果）：完成（`✅「名」· 耗时\n回答`）、失败
+  （+原因）、停止、已结束（空闲超时）、进行中（耗时+轮数）。
+
+### 10.4 IPC（preload `window.gptplus`）
+
+```ts
+getQqBot(): Promise<{ enabled, apiUrl, accessToken, eventToken, notifyQq, ownerQq,
+  progressMinutes, codexPath, workspaceDir, autoLaunch, launchCommand, launchQq,
+  launch: { phase: 'idle'|'launching'|'online'|'failed', at, error, account },
+  detectedLaunch: string,               // launchCommand 为空时自动识别到的启动命令（无则 ''）
+  webhookUrl, gatewayRunning, codex: { path, source } | { path:'', error },
+  install: NapCatInstallState }>;       // 一键安装状态快照（见 10.6）
+setQqBot(patch): Promise<同上>;   // 开启时要求 notifyQq 已填、gateway.enabled
+testQqBot(): Promise<{ api: {ok, account?, nickname?, error?}, sent: {ok, error?} }>;
+launchNapCat(): Promise<{ ok, detected?, alreadyRunning?, account?, nickname?, error? }>;
+installNapCat(): Promise<NapCatInstallState>;   // 启动/复用一键安装（并发去重），直到 done/failed 才返回
+getNapCatInstallState(): Promise<NapCatInstallState>;
+onNapCatInstall(cb): () => void;                // 事件 gptplus:qqbot:install，主进程节流推送
+onQqLaunch(cb): () => void;                     // 事件 gptplus:qqbot:launch，拉起状态变化推送
+getTasks(): Promise<{ running: TaskSnapshot[], recent: TaskSnapshot[], at: number }>;
+```
+
+### 10.5 边界与安全
+
+- 网关默认只绑 127.0.0.1，上报路由只暴露给本机 NapCat；若用户改绑 0.0.0.0，
+  必须设置 eventToken（设置页有提示）。
+- 命令只认 ownerQq 的私聊；NapCat 不可达时通知发送失败只记日志，不影响网关。
+- exec 任务继承注入的 `model_provider=gptplus` 配置；注入关闭时 codex 用官方
+  登录态，行为不变。
+
+### 10.6 一键安装（`src/core/napcat-install.js` + `napcat-webui.js` + `qr-code.js`）
+
+QQ 远程页「一键安装」把装 QQ 桌面版 + 装 NapCat + 写配置 + 拉起登录串成一个
+状态机（`createNapCatInstaller({store, qqBot, log, onEvent, fetchImpl, …})`，
+全依赖注入）。安装目录固定 `%LOCALAPPDATA%\NapCat`（detectNapCatCommand 的
+候选目录，自动识别可直接命中）。
+
+阶段（phase）：`prepare → qq-check →（未装 QQ 时）qq-download → qq-install →
+napcat-download → extract → configure → launch → done | failed`。
+
+- **QQ 检测**：注册表 `HKLM\SOFTWARE\WOW6432Node\...\Uninstall\QQ` 的
+  UninstallString 推导 QQ.exe（NapCat launcher 同款逻辑），失败兜底
+  `%ProgramFiles%\Tencent\QQNT\QQ.exe`。
+- **QQ 下载**：官网下载按钮背后的「彩虹配置」端点
+  `cdn-go.cn/qq-web/im.qq.com_new/latest/rainbow/windowsConfig.js` 永远返回
+  最新版直链（取 `ntDownloadX64Url`）；qqdl.gtimg.cn 不可达时换 dldir1.qq.com
+  （同路径换 host）。
+- **QQ 静默安装**：QQNT 安装器是 NSIS，`spawn(setup.exe, ['/S'])`（会弹一次
+  UAC），装完轮询注册表键确认（10 分钟窗口）。
+- **NapCat 下载**：GitHub Releases 的 `NapCat.Shell.zip`（latest 直链，约
+  36MB；失败追加 ghproxy 镜像前缀），流式下载带进度/看门狗（120s 无进度中断）。
+- **解压**：Windows 内置 bsdtar（`System32\tar.exe -xf`），先解压到
+  `<installDir>.new-<hex>` 临时目录、校验 launcher-user.bat 存在后原子替换，
+  避免半成品被自动识别误命中。无新依赖。
+- **configure**：写 store（launchCommand=解压出的 launcher-user.bat、
+  autoLaunch=true）；onebot11 配置仍由 launchNapCat 内的 syncNapCatConfig 写。
+- **launch/登录**：先 launchNapCat（内含 -q 快速登录与 2 分钟在线等待），
+  未上线则进入 WebUI 流程（`napcat-webui.js`）：
+  - 启动 NapCat 前写入 `config/webui.json`（端口 6099 固定、令牌随机生成，
+    port/token 存入 qqbot 配置）；已存在则读回真实值（NapCat 登录后会刷新 token）。
+  - 认证：`POST /api/auth/login {hash: sha256(token+".napcat")}` →
+    `data.Credential`，后续带 `Authorization: Bearer`；401 自动重读 webui.json
+    重认证一次。
+  - `GetQuickLoginListNew` 有历史账号 → `SetQuickLogin` 免扫码；
+    否则 `GetQQLoginQrcode` 取登录 URL，经 `qr-code.js`（vendored
+    qrcode-generator 生成矩阵 + 手写 1-bit PNG 编码，Node zlib）转 PNG
+    data URL，随事件推送 → 渲染层弹扫码窗（qrImage 变化才重开弹窗，
+    其余进度只更新弹窗文案：waiting_qrcode 提示扫码，qrcode_scanned 提示手机确认，
+    initializing 提示登录初始化；`loginError` 原样展示，过期时调用
+    `RefreshQRcode` 并等待新二维码 URL）。
+  - 轮询 `apiTest`（OneBot get_login_info）为最终登录判据；WebUI 的
+    `qrLoginAccepted` / `coreReady` 用于展示确认与初始化阶段，但不会代替
+    OneBot 在线验证。只有上线后才 `markLaunchOnline` 并 `adoptLoginAccount`
+    自动补全 launchQq/notifyQq/ownerQq；超时或 NapCat 返回登录错误均置
+    `failed`，不会把未登录状态报告为成功。NapCat 以 detached + unref +
+    windowsHide 启动，stdin/stdout/stderr 均忽略，不保留前台控制台。
+
+事件 `{phase, percent, detail, error, account, qrImage, loginPhase, at}`
+经 `onEvent` → main.js broadcast `gptplus:qqbot:install`；主进程节流
+（phase/detail/loginPhase/qrImage 变化或 percent ≥1 才推）。任何阶段失败置
+`failed`（error 带原因，界面可重试），不写 store。
+
+拉起状态 `{phase: 'idle'|'launching'|'online'|'failed', at, error, account}`
+的每次跃迁都经 qq-bot `setLaunch` 单一入口 → `onEvent` → main.js broadcast
+`gptplus:qqbot:launch`（phase/account/error 都没变不重复推）；渲染层订阅后
+实时刷新拉起芯片（「拉起中…/在线/失败」），不再依赖整页 reload。

@@ -11,17 +11,32 @@ const { createLogStore } = require('./log-store.js');
 const { createUsageStore } = require('./usage-store.js');
 const { createGateway } = require('./gateway/server.js');
 const { createSystemProxyFetch } = require('./system-proxy.js');
+const { createTaskCenter } = require('./task-center.js');
+const { createQqBot } = require('./qq-bot.js');
+const { createNapCatInstaller } = require('./napcat-install.js');
 const { slugForProvider, orderModels, modelKey } = require('./model-utils.js');
+const { redactDiagnostic } = require('./redact.js');
+const { createRemoteProviders, createRemoteSync, remoteProviderId } = require('./peer-sharing.js');
 
 /**
- * @param {{ onStatus?: (s:any)=>void, onLog?: (e:any)=>void, appVersion?: string }} [opts]
+ * @param {{ onStatus?: (s:any)=>void, onLog?: (e:any)=>void, appVersion?: string,
+ *           onQqInstall?: (s:any)=>void, onQqLaunch?: (s:any)=>void,
+ *           secretStorage?: { isAvailable?: () => boolean, encrypt: (text:string) => Buffer|Uint8Array,
+ *             decrypt: (bytes:Buffer) => string } }} [opts]
  */
 async function createContext(opts = {}) {
-  const { onStatus = () => {}, onLog = () => {}, appVersion = '0.0.0' } = opts;
+  const {
+    onStatus = () => {},
+    onLog = () => {},
+    onQqInstall = () => {},
+    onQqLaunch = () => {},
+    appVersion = '0.0.0',
+    secretStorage = null,
+  } = opts;
 
   paths.ensureDirs();
 
-  const store = createStore({ configPath: paths.CONFIG_PATH });
+  const store = createStore({ configPath: paths.CONFIG_PATH, secretStorage });
   const network = createSystemProxyFetch({ mode: store.get().network.proxyMode });
   const catalog = createCatalog({ store, paths });
   const codex = createCodexConfig({ store, catalog, paths });
@@ -37,7 +52,11 @@ async function createContext(opts = {}) {
   const listeners = new Set();
 
   function log(entry) {
-    const full = { at: Date.now(), level: 'info', ...entry };
+    const cfg = store.get();
+    const peerSecrets = (cfg.remoteSync.connections || []).map((connection) => ({
+      baseUrl: connection.baseUrl, apiKey: connection.authToken, headers: {},
+    }));
+    const full = redactDiagnostic({ at: Date.now(), level: 'info', ...entry }, [...store.providers(), ...peerSecrets]);
     logStore.append(full);
     if (full.final === true) usageStore.append(full);
     try {
@@ -54,27 +73,55 @@ async function createContext(opts = {}) {
     }
   }
 
+  // QQ 远程助手：任务中心跟踪网关会话与 codex exec 任务，qq-bot 负责收发消息。
+  const taskCenter = createTaskCenter({ store, log: (e) => log(e) });
+  // NapCat 拉起状态变化经 onQqLaunch 广播（idle/launching/online/failed）。
+  const qqBot = createQqBot({ store, taskCenter, log: (e) => log(e), onEvent: onQqLaunch });
+  // NapCat 一键安装器：下载 QQ/NapCat、静默安装、写配置并拉起（进度经 onQqInstall 广播）。
+  const napcatInstaller = createNapCatInstaller({
+    store,
+    qqBot,
+    log: (e) => log(e),
+    fetchImpl: network,
+    onEvent: onQqInstall,
+  });
+
   const gateway = createGateway({
     store,
     paths,
     fetch: network,
     log: (e) => log(e),
+    taskObserver: taskCenter,
+    onebot: { handleEvent: (req, res, body) => qqBot.handleWebhook(req, res, body) },
   });
+  qqBot.bindGateway(gateway);
+  taskCenter.start();
 
   function models() {
     const out = [];
-    const providers = store.providers();
+    const config = store.get();
+    const providers = [...store.providers(), ...createRemoteProviders(config, { includeHidden: true })];
     for (const { provider: p, model: m } of orderModels(providers, store.get().modelOrder)) {
+      const modelId = m.id;
+      const remote = p.remote === true;
       out.push({
-        slug: slugForProvider(p, m.id, providers),
+        slug: slugForProvider(p, modelId, providers),
         providerId: p.id,
-        providerName: p.name,
-        modelId: m.id,
-        label: m.label || m.id,
-        enabled: m.enabled !== false && p.enabled !== false,
+        providerName: remote ? p.name + ' · ' + (m.providerName || '远端提供商') : p.name,
+        modelId,
+        remoteModelId: remote ? m.modelId : null,
+        originProviderId: remote ? m.providerId : null,
+        sourceId: remote ? p.sourceId : null,
+        sourceName: remote ? p.name : null,
+        remote,
+        detected: m.detected !== false,
+        isNew: m.isNew === true,
+        hidden: remote && m.hidden === true,
+        label: m.label || modelId,
+        enabled: m.hidden !== true && m.enabled !== false && p.enabled !== false,
         reasoning: !!m.reasoning,
         providerEnabled: p.enabled !== false,
-        orderKey: modelKey(p.id, m.id),
+        orderKey: modelKey(p.id, modelId),
       });
     }
     return out;
@@ -115,6 +162,9 @@ async function createContext(opts = {}) {
         configPath: paths.CONFIG_PATH,
         backupDir: paths.BACKUP_DIR,
       },
+      sharing: { enabled: cfg.sharing.enabled, clients: cfg.sharing.clients.length, models: cfg.sharing.models.length },
+      remoteSync: { enabled: cfg.remoteSync.enabled, intervalMinutes: cfg.remoteSync.intervalMinutes,
+        connections: cfg.remoteSync.connections.length, sources: cfg.remoteSync.sources.length },
     };
   }
 
@@ -176,6 +226,39 @@ async function createContext(opts = {}) {
     return { changed: res.changed };
   }
 
+  function peerState() {
+    const cfg = store.get();
+    const selected = new Set(cfg.sharing.models.map((item) => item.providerId + '::' + item.modelId));
+    const localModels = [];
+    for (const provider of cfg.providers) for (const model of provider.models || []) {
+      localModels.push({ providerId: provider.id, providerName: provider.name, modelId: model.id,
+        label: model.label || model.id, enabled: provider.enabled !== false && model.enabled !== false,
+        selected: selected.has(provider.id + '::' + model.id) });
+    }
+    return {
+      sharing: { enabled: cfg.sharing.enabled, sourceId: cfg.sharing.sourceId, name: cfg.sharing.name,
+        clients: cfg.sharing.clients.map(({ id, name, createdAt }) => ({ id, name, createdAt })), localModels },
+      remoteSync: { enabled: cfg.remoteSync.enabled, intervalMinutes: cfg.remoteSync.intervalMinutes,
+        connections: cfg.remoteSync.connections.map(({ id, name, sourceId, lastAttemptAt, lastSuccessAt, lastError }) =>
+          ({ id, name, sourceId, lastAttemptAt, lastSuccessAt, lastError })),
+        sources: cfg.remoteSync.sources.map((source) => ({ ...source, models: source.models.map((model) =>
+          ({ ...model, gatewayProviderId: remoteProviderId(source.id) })) })) },
+    };
+  }
+
+  const remoteSyncManager = createRemoteSync({
+    store,
+    fetchImpl: network,
+    onChange: () => {
+      if (store.get().inject.enabled) {
+        try { syncInjection({ apply: true }); }
+        catch (err) { log({ level: 'error', msg: '远端清单已保存，但模型目录同步失败: ' + err.message }); }
+      }
+      try { onStatus({ ...status(), peer: peerState(), models: models() }); } catch { /* ignore notification failures */ }
+    },
+  });
+  remoteSyncManager.start();
+
   return {
     paths,
     store,
@@ -184,6 +267,9 @@ async function createContext(opts = {}) {
     providerClient,
     network,
     gateway,
+    taskCenter,
+    qqBot,
+    napcatInstaller,
     log,
     logs: () => logStore.all(),
     usage: () => usageStore.all(),
@@ -196,6 +282,8 @@ async function createContext(opts = {}) {
       return { mode, usage: usageStore.all(), trend: usageStore.trend() };
     },
     models,
+    peerState,
+    remoteSync: remoteSyncManager,
     status,
     emitStatus,
     markWrite,

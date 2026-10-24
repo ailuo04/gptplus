@@ -16,6 +16,7 @@ const { pipeResponsesSse } = require('../src/core/gateway/responses.js');
 const { slugify, parseSlug, createRouter } = require('../src/core/gateway/router.js');
 const openaiAdapter = require('../src/core/gateway/adapters/openai.js');
 const anthropicAdapter = require('../src/core/gateway/adapters/anthropic.js');
+const { createRemoteSync, hashPeerToken, remoteProviderId } = require('../src/core/peer-sharing.js');
 
 // ---------------------------------------------------------------------------
 // 测试脚手架
@@ -162,6 +163,182 @@ async function withGateway({ providers = [SAMPLE_PROVIDER], gatewayPatch = {}, l
   const started = await gw.start({ port: 0, host: '127.0.0.1', token: gatewayPatch.token ?? '' });
   return { gw, store, logs, port: started.port, base: started.url };
 }
+
+test('gateway: 上游错误回显的 API Key、URL 和私有请求头不会进入日志或错误响应', async (t) => {
+  let provider;
+  const upstream = await startMockUpstream((req, res) => {
+    assert.equal(req.headers.authorization, `Bearer ${provider.apiKey}`);
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: `${provider.apiKey} ${provider.baseUrl} private-header-value` } }));
+  });
+  t.after(() => upstream.close());
+  provider = { ...SAMPLE_PROVIDER, baseUrl: `${upstream.url}/v1`, headers: { 'X-Private': 'private-header-value' } };
+  const { gw, base, logs } = await withGateway({ providers: [provider] });
+  t.after(() => gw.stop());
+  const observed = [];
+  gw.on('log', (entry) => observed.push(entry));
+  const result = await postJson(`${base}/responses`, { model: 'p_ab12cd__gpt-6.1-sol', input: 'ok', stream: false });
+  assert.equal(result.status, 401);
+  const text = JSON.stringify({ result, logs, observed });
+  for (const secret of [provider.apiKey, provider.baseUrl, 'private-header-value']) assert.equal(text.includes(secret), false);
+  assert.match(text, /REDACTED/);
+});
+
+test('对等网关：A↔B 双向清单授权、独立上游凭据、Responses JSON/SSE 与撤销', async (t) => {
+  const makePeerStore = ({ providers, sharing, remoteSync }) => {
+    const cfg = {
+      version: 1,
+      gateway: { enabled: false, port: 0, host: '127.0.0.1', token: '' },
+      sharing: { enabled: false, sourceId: '', name: '', clients: [], models: [], ...sharing },
+      remoteSync: { enabled: false, intervalMinutes: 60, connections: [], sources: [], ...remoteSync },
+      providers,
+      modelOrder: [],
+    };
+    return {
+      get: () => JSON.parse(JSON.stringify(cfg)),
+      providers: () => cfg.providers,
+      getProvider: (id) => cfg.providers.find((item) => item.id === id),
+      update: (fn) => { fn(cfg); return cfg; },
+    };
+  };
+  const makeResponsesUpstream = async (side, key, traceHeader) => {
+    let canceledStreams = 0;
+    const server = await startMockUpstream((req, res, body) => {
+    assert.equal(req.url, '/v1/responses');
+    assert.equal(req.headers.authorization, 'Bearer ' + key, side + ' must use its own upstream key');
+    assert.equal(req.headers['x-' + side.toLowerCase() + '-trace'], traceHeader);
+    assert.equal(body.model, 'model-' + side.toLowerCase(), 'the origin gateway must restore its upstream model ID');
+    if (body.input === 'hold-open') {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
+      res.write('event: response.created\\ndata: ' + JSON.stringify({ type: 'response.created', response: { id: 'hold-' + side, status: 'in_progress' } }) + '\\n\\n');
+      res.on('close', () => { if (!res.writableEnded) canceledStreams += 1; });
+      return;
+    }
+    if (body.stream === false) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ id: 'resp-' + side, object: 'response', status: 'completed', model: body.model,
+        output: [{ id: 'msg-' + side, type: 'message', role: 'assistant', content: [{ type: 'output_text', text: side }] }],
+        usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 } }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
+    res.write('event: response.created\ndata: ' + JSON.stringify({ type: 'response.created', response: { id: 'resp-' + side, status: 'in_progress' } }) + '\n\n');
+    res.write('event: response.output_text.delta\ndata: ' + JSON.stringify({ type: 'response.output_text.delta', delta: side }) + '\n\n');
+    res.write('event: response.completed\ndata: ' + JSON.stringify({ type: 'response.completed', response: { id: 'resp-' + side, usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 } } }) + '\n\n');
+    res.end();
+    });
+    return { ...server, get canceledStreams() { return canceledStreams; } };
+  };
+
+  const upstreamA = await makeResponsesUpstream('A', 'key-A-only', 'trace-A');
+  const upstreamB = await makeResponsesUpstream('B', 'key-B-only', 'trace-B');
+  t.after(() => Promise.all([upstreamA.close(), upstreamB.close()]));
+  const tokenA = 'peer-token-for-A-'.padEnd(48, 'a');
+  const tokenB = 'peer-token-for-B-'.padEnd(48, 'b');
+  const providerA = { id: 'p_peerA001', name: 'A Provider', baseUrl: upstreamA.url + '/v1', apiKey: 'key-A-only',
+    headers: { 'X-A-Trace': 'trace-A' }, api: 'responses', enabled: true,
+    models: [{ id: 'model-a', label: 'Model A', enabled: true, reasoning: true }, { id: 'unpublished-a', label: 'Not shared', enabled: true }] };
+  const providerB = { id: 'p_peerB001', name: 'B Provider', baseUrl: upstreamB.url + '/v1', apiKey: 'key-B-only',
+    headers: { 'X-B-Trace': 'trace-B' }, api: 'responses', enabled: true,
+    models: [{ id: 'model-b', label: 'Model B', enabled: true, reasoning: false }] };
+  const storeA = makePeerStore({ providers: [providerA],
+    sharing: { enabled: true, sourceId: 'source-A', name: 'A', models: [{ providerId: providerA.id, modelId: 'model-a' }],
+      clients: [{ id: 'client-B', name: 'B', tokenHash: hashPeerToken(tokenA) }] },
+    remoteSync: { connections: [{ id: 'conn-B', name: 'B', baseUrl: '', authToken: tokenB, enabled: true }], sources: [] } });
+  const storeB = makePeerStore({ providers: [providerB],
+    sharing: { enabled: true, sourceId: 'source-B', name: 'B', models: [{ providerId: providerB.id, modelId: 'model-b' }],
+      clients: [{ id: 'client-A', name: 'A', tokenHash: hashPeerToken(tokenB) }] },
+    remoteSync: { connections: [{ id: 'conn-A', name: 'A', baseUrl: '', authToken: tokenA, enabled: true }], sources: [] } });
+  const gatewayA = createGateway({ store: storeA });
+  const gatewayB = createGateway({ store: storeB });
+  const startedA = await gatewayA.start({ port: 0, host: '127.0.0.1', token: '' });
+  const startedB = await gatewayB.start({ port: 0, host: '127.0.0.1', token: '' });
+  t.after(() => Promise.all([gatewayA.stop(), gatewayB.stop()]));
+  const rootA = startedA.url.replace(/\/v1$/, '');
+  const rootB = startedB.url.replace(/\/v1$/, '');
+  storeA.update((cfg) => { cfg.remoteSync.connections[0].baseUrl = rootB; });
+  storeB.update((cfg) => { cfg.remoteSync.connections[0].baseUrl = rootA; });
+
+  const unauthorized = await fetch(rootA + '/peer/v1/models');
+  assert.equal(unauthorized.status, 401, 'the ordinary gateway token must not authorize peer access');
+  const manifestA = await fetch(rootA + '/peer/v1/models', { headers: { Authorization: 'Bearer ' + tokenA } });
+  assert.equal(manifestA.status, 200);
+  const manifestBody = await manifestA.json();
+  assert.deepEqual(manifestBody.models.map((model) => model.id), [providerA.id + '::model-a']);
+  assert.equal(JSON.stringify(manifestBody).includes('key-A-only'), false);
+  assert.equal(JSON.stringify(manifestBody).includes(upstreamA.url), false);
+
+  const syncB = createRemoteSync({ store: storeB });
+  const syncA = createRemoteSync({ store: storeA });
+  const [syncedToB, syncedToA] = await Promise.all([
+    syncB.syncConnection('conn-A'), syncA.syncConnection('conn-B'),
+  ]);
+  assert.equal(syncedToB.ok, true, syncedToB.error || 'sync B failed');
+  assert.equal(syncedToA.ok, true, syncedToA.error || 'sync A failed');
+  const remoteA = storeB.get().remoteSync.sources[0].models[0];
+  const remoteB = storeA.get().remoteSync.sources[0].models[0];
+  assert.equal(remoteA.enabled, false, 'first-seen remote models start disabled');
+  assert.equal(remoteB.enabled, false);
+  storeB.update((cfg) => { cfg.remoteSync.sources[0].models[0].enabled = true; });
+  storeA.update((cfg) => { cfg.remoteSync.sources[0].models[0].enabled = true; });
+
+  const slugFor = (sourceId, providerId, modelId) => remoteProviderId(sourceId) + '__' + providerId + '::' + modelId;
+  const [responseAtoB, responseBtoA] = await Promise.all([
+    postJson(startedA.url + '/responses', { model: slugFor('source-B', providerB.id, 'model-b'), input: 'A to B', stream: false }),
+    postJson(startedB.url + '/responses', { model: slugFor('source-A', providerA.id, 'model-a'), input: 'B to A', stream: false }),
+  ]);
+  assert.equal(responseAtoB.status, 200);
+  assert.equal(JSON.parse(responseAtoB.text).output[0].content[0].text, 'B');
+  assert.equal(responseBtoA.status, 200);
+  assert.equal(JSON.parse(responseBtoA.text).output[0].content[0].text, 'A');
+  assert.equal(upstreamA.requests.length, 1);
+  assert.equal(upstreamB.requests.length, 1);
+
+  const streamed = await fetch(startedB.url + '/responses', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: slugFor('source-A', providerA.id, 'model-a'), input: 'stream', stream: true }) });
+  const streamText = await streamed.text();
+  assert.equal(streamed.status, 200);
+  assert.match(streamText, /response\.completed/);
+  assert.match(streamText, /"delta":"A"/);
+  assert.equal(upstreamA.requests.at(-1).headers.authorization, 'Bearer key-A-only');
+  assert.equal(upstreamB.requests.at(-1).headers.authorization, 'Bearer key-B-only');
+
+  const cancelResponse = await fetch(startedB.url + '/responses', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: slugFor('source-A', providerA.id, 'model-a'), input: 'hold-open', stream: true }) });
+  const cancelReader = cancelResponse.body.getReader();
+  await cancelReader.read();
+  await cancelReader.cancel();
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.ok(upstreamA.canceledStreams > 0, 'receiver cancellation must abort the source-side provider request');
+
+  const unpublished = await postJson(rootA + '/peer/v1/responses', { model: providerA.id + '::unpublished-a', input: 'no', stream: false },
+    { Authorization: 'Bearer ' + tokenA });
+  assert.equal(unpublished.status, 404, 'a valid client cannot guess an unshared local model');
+  storeA.update((cfg) => { cfg.sharing.clients = cfg.sharing.clients.filter((client) => client.id !== 'client-B'); });
+  assert.equal((await fetch(rootA + '/peer/v1/models', { headers: { Authorization: 'Bearer ' + tokenA } })).status, 401,
+    'revoking one client immediately removes its independent authorization');
+  const revokedInference = await postJson(rootA + '/peer/v1/responses', { model: providerA.id + '::model-a', input: 'no', stream: false },
+    { Authorization: 'Bearer ' + tokenA });
+  assert.equal(revokedInference.status, 401, 'revoked clients cannot continue inference either');
+});
+
+test('对等代理链路：上游超时会中止请求并返回脱敏失败，而不是悬挂', async (t) => {
+  let aborted = false;
+  const upstream = await startMockUpstream((req, res) => {
+    res.on('close', () => { if (!res.writableEnded) aborted = true; });
+  });
+  t.after(() => upstream.close());
+  const provider = { ...SAMPLE_PROVIDER, api: 'responses', baseUrl: upstream.url + '/v1', models: [{ id: 'slow-model', label: 'Slow', enabled: true }] };
+  const store = makeStore([provider], { token: '' });
+  const gateway = createGateway({ store, requestTimeoutMs: 30 });
+  const started = await gateway.start({ port: 0, host: '127.0.0.1', token: '' });
+  t.after(() => gateway.stop());
+  const result = await postJson(started.url + '/responses', { model: 'p_ab12cd__slow-model', input: 'slow', stream: false });
+  assert.equal(result.status, 502);
+  assert.match(result.text, /上游响应超时|请求超时/);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(aborted, true, 'timeout must abort the upstream request');
+});
 
 // ---------------------------------------------------------------------------
 // 1. slug 解析

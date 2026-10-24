@@ -2,11 +2,33 @@
 // IPC 注册：把渲染层调用映射到 core 模块。契约见 spec.md 第 7 节。
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { normalizeModelLimits, normalizeTheme } = require('./store.js');
 const { normalizeBaseUrl } = require('./base-url.js');
 const { slugForProvider } = require('./model-utils.js');
 const { resolveChatGptExe } = require('./chatgpt-install.js');
 const { relaunchChatGpt } = require('./chatgpt-launch.js');
+const { redactDiagnostic } = require('./redact.js');
+const {
+  hashPeerToken,
+  normalizePeerBaseUrl,
+  randomPeerId,
+  createRemoteProviders,
+  MIN_SYNC_INTERVAL_MINUTES,
+  MAX_SYNC_INTERVAL_MINUTES,
+} = require('./peer-sharing.js');
+const {
+  FILE_EXTENSION,
+  MAX_FILE_BYTES,
+  createExportPayload,
+  encryptProviderConfigLocal,
+  decryptProviderConfig,
+  inspectProviderConfigFile,
+  createImportPlan,
+  buildImportPreview,
+  newTransferSessionId,
+  ProviderTransferError,
+} = require('./provider-transfer.js');
 
 function sanitizeProviderInput(input, existing) {
   if (!input || typeof input !== 'object') throw new Error('缺少提供商数据');
@@ -44,6 +66,9 @@ function sanitizeProviderInput(input, existing) {
       label: String((typeof m === 'object' && m?.label) || id).trim() || id,
       enabled: typeof m === 'object' && m?.enabled === false ? false : true,
       reasoning: typeof m === 'object' && m?.reasoning === true,
+      ...(typeof m === 'object' && m?.isNew === true ? { isNew: true } : {}),
+      ...(typeof m === 'object' && m?.detected === false ? { detected: false } : {}),
+      ...(typeof m === 'object' && Number.isFinite(Number(m?.missingSince)) ? { missingSince: Number(m.missingSince) } : {}),
     });
   }
 
@@ -62,20 +87,65 @@ function withDerived(p) {
   return { ...p, hasKey: !!p.apiKey };
 }
 
+function writeBinaryAtomic(targetPath, bytes) {
+  const target = String(targetPath || '').trim();
+  if (!target) throw new Error('导出路径无效');
+  const dir = path.dirname(target);
+  fs.mkdirSync(dir, { recursive: true });
+  const temporary = path.join(
+    dir,
+    `.${path.basename(target)}.tmp-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
+  );
+  try {
+    fs.writeFileSync(temporary, bytes, { flag: 'wx' });
+    // Electron 的保存对话框已经处理了覆盖确认；先准备完整临时文件，再替换目标，
+    // 避免写入过程中留下半个明文/密文文件。
+    fs.renameSync(temporary, target);
+  } finally {
+    try { fs.rmSync(temporary, { force: true }); } catch { /* ignore */ }
+  }
+}
+
+function dateFileStamp(date = new Date()) {
+  const p = (value) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}${p(date.getMonth() + 1)}${p(date.getDate())}`;
+}
+
 /**
  * @param {{ ipcMain:any, shell:any, dialog:any, ctx:any, updater?:any, startup?:any,
  *           onStatus?:(s:any)=>void, onLog?:(e:any)=>void }} deps
  */
 function registerIpc(deps) {
-  const { ipcMain, shell, dialog, ctx, updater, startup, onStatus = () => {}, onLog = () => {} } = deps;
+  const { ipcMain, shell, dialog, clipboard, secretStorage, ctx, updater, startup, onStatus = () => {}, onLog = () => {} } = deps;
   const { store } = ctx;
+  const importSessions = new Map();
+  const IMPORT_SESSION_TTL = 5 * 60 * 1000;
+
+  function forgetImportSession(sessionId) {
+    const session = importSessions.get(sessionId);
+    if (!session) return false;
+    if (session.timer) clearTimeout(session.timer);
+    importSessions.delete(sessionId);
+    return true;
+  }
+
+  function rememberImportSession(payload) {
+    const sessionId = newTransferSessionId();
+    const timer = setTimeout(() => forgetImportSession(sessionId), IMPORT_SESSION_TTL);
+    if (typeof timer.unref === 'function') timer.unref();
+    importSessions.set(sessionId, { payload, timer, existing: store.providers() });
+    return sessionId;
+  }
 
   const handle = (channel, fn) => {
     ipcMain.handle(channel, async (_evt, ...args) => {
       try {
         return await fn(...args);
       } catch (err) {
-        const message = err && err.message ? err.message : String(err);
+        const transfer = channel === 'gptplus:provider:export' || channel.startsWith('gptplus:provider:import:');
+        const message = transfer
+          ? err instanceof ProviderTransferError ? err.message : '配置文件操作失败，现有提供商配置未修改'
+          : redactDiagnostic(err && err.message ? err.message : String(err), store.providers());
         ctx.log({ level: 'error', msg: `${channel}: ${message}` });
         throw new Error(message);
       }
@@ -84,8 +154,10 @@ function registerIpc(deps) {
 
   const publish = () => {
     const s = ctx.status();
-    onStatus(s);
-    return s;
+    const peer = typeof ctx.peerState === 'function' ? ctx.peerState() : null;
+    const next = peer ? { ...s, peer } : s;
+    onStatus(next);
+    return next;
   };
 
   const afterChange = () => {
@@ -223,6 +295,140 @@ function registerIpc(deps) {
     return store.providers().map(withDerived);
   });
 
+  // ---- 提供商配置安全导入/导出 ----
+  handle('gptplus:provider:export', async (input = {}) => {
+    const providerIds = input && Array.isArray(input.providerIds) ? input.providerIds : null;
+    const payload = createExportPayload(store.get(), providerIds);
+    const encrypted = encryptProviderConfigLocal(payload, secretStorage);
+    if (typeof dialog?.showSaveDialog !== 'function') throw new ProviderTransferError('UNAVAILABLE', '当前环境不支持导出配置文件');
+
+    const defaultPath = path.join(
+      ctx.paths.APP_DIR || path.dirname(ctx.paths.CONFIG_PATH || process.cwd()),
+      `gptplus-providers-${dateFileStamp()}.${FILE_EXTENSION.slice(1)}`,
+    );
+    const picked = await dialog.showSaveDialog({
+      title: '导出提供商配置',
+      defaultPath,
+      filters: [{ name: 'gpt++ 提供商配置', extensions: [FILE_EXTENSION.slice(1)] }],
+      properties: ['showOverwriteConfirmation', 'createDirectory'],
+    });
+    if (!picked || picked.canceled || !picked.filePath) return { canceled: true };
+
+    let target = String(picked.filePath);
+    if (!target.toLowerCase().endsWith(FILE_EXTENSION)) target += FILE_EXTENSION;
+    writeBinaryAtomic(target, encrypted);
+    ctx.log({ level: 'info', msg: `已导出提供商配置（敏感字段加密，${payload.providers.length} 个）` });
+    return { canceled: false, fileName: path.basename(target), count: payload.providers.length };
+  });
+
+  handle('gptplus:provider:import:pick', async () => {
+    if (typeof dialog?.showOpenDialog !== 'function') throw new ProviderTransferError('UNAVAILABLE', '当前环境不支持选择配置文件');
+    const picked = await dialog.showOpenDialog({
+      title: '选择字段加密提供商配置',
+      properties: ['openFile'],
+      filters: [{ name: 'gpt++ 字段加密提供商配置', extensions: [FILE_EXTENSION.slice(1)] }],
+    });
+    if (!picked || picked.canceled || !Array.isArray(picked.filePaths) || !picked.filePaths[0]) {
+      return { canceled: true };
+    }
+    const filePath = picked.filePaths[0];
+    if (!String(filePath).toLowerCase().endsWith(FILE_EXTENSION)) {
+      throw new ProviderTransferError('INVALID_FILE_TYPE', `请选择 ${FILE_EXTENSION} 字段加密配置文件`);
+    }
+    let bytes;
+    try {
+      const stat = fs.statSync(filePath);
+      if (!stat.isFile()) throw new Error('not-file');
+      if (stat.size === 0) throw new ProviderTransferError('EMPTY_FILE', '配置文件为空');
+      if (stat.size > MAX_FILE_BYTES) throw new ProviderTransferError('FILE_TOO_LARGE', '配置文件超过大小限制');
+      bytes = fs.readFileSync(filePath);
+    } catch (err) {
+      if (err instanceof ProviderTransferError) throw err;
+      throw new ProviderTransferError('READ_FAILED', '读取配置文件失败');
+    }
+    return {
+      canceled: false,
+      fileName: path.basename(filePath),
+      bytes,
+    };
+  });
+
+  handle('gptplus:provider:import:inspect', (input = {}) => inspectProviderConfigFile({
+    fileName: input && input.fileName,
+    bytes: input && input.bytes,
+  }));
+
+  handle('gptplus:provider:import:prepare', (input = {}) => {
+    const payload = decryptProviderConfig({
+      fileName: input && input.fileName,
+      bytes: input && input.bytes,
+      secretStorage,
+    });
+    const sessionId = rememberImportSession(payload);
+    return {
+      sessionId,
+      preview: buildImportPreview(payload, store.providers()),
+    };
+  });
+
+  handle('gptplus:provider:import:cancel', (sessionId) => {
+    forgetImportSession(String(sessionId || ''));
+    return { canceled: true };
+  });
+
+  handle('gptplus:provider:import:apply', (input = {}) => {
+    const sessionId = String(input && input.sessionId || '');
+    const session = importSessions.get(sessionId);
+    if (!session) throw new ProviderTransferError('SESSION_EXPIRED', '导入预览已过期，请重新选择配置文件');
+
+    const before = store.get();
+    if (Array.isArray(input.decisions) && input.decisions.some((item) => item?.action === 'overwrite')) {
+      if (input.overwriteConfirmed !== true) {
+        throw new ProviderTransferError('CONFIRM_OVERWRITE', '请再次确认覆盖同名提供商');
+      }
+      for (const decision of input.decisions.filter((item) => item?.action === 'overwrite')) {
+        const source = session.payload.providers.find((provider) => provider.id === decision.sourceId);
+        const matches = session.existing.filter((provider) => source && provider.name.trim().toLowerCase() === source.name.trim().toLowerCase());
+        if (matches.length !== 1 || JSON.stringify(store.getProvider(matches[0].id)) !== JSON.stringify(matches[0])) {
+          throw new ProviderTransferError('STALE_PREVIEW', '覆盖目标已变化，请重新预览导入配置');
+        }
+      }
+    }
+    const plan = createImportPlan({
+      currentConfig: before,
+      payload: session.payload,
+      decisions: input && input.decisions,
+    });
+    if (plan.sourceTargets.size === 0) {
+      forgetImportSession(sessionId);
+      return { providers: store.providers().map(withDerived), counts: plan.counts, status: ctx.status() };
+    }
+    let result;
+    try {
+      result = store.transaction(plan.config, () => {
+        // 全量导入也可能关闭注入，必须同步关闭状态，不能只处理 enabled=true。
+        if (before.inject.enabled || plan.config.inject.enabled) ctx.syncInjection({ apply: true });
+        return { providers: store.providers().map(withDerived), counts: plan.counts, status: ctx.status() };
+      });
+    } catch (err) {
+      if (before.inject.enabled || plan.config.inject.enabled) {
+        try {
+          ctx.syncInjection({ apply: true });
+        } catch {
+          ctx.log({ level: 'error', msg: '提供商导入已回滚，但注入状态恢复失败' });
+        }
+      }
+      throw new ProviderTransferError('IMPORT_FAILED', '导入失败，提供商配置已回滚');
+    }
+    forgetImportSession(sessionId);
+    ctx.log({
+      level: 'info',
+      msg: `已导入提供商配置（新增 ${plan.counts.added} 个，覆盖 ${plan.counts.overwritten} 个，跳过 ${plan.counts.skipped} 个）`,
+    });
+    onStatus(result.status);
+    return result;
+  });
+
   handle('gptplus:provider:test', (id) => ctx.providerClient.testProvider(id));
   handle('gptplus:provider:models:test', (patch = {}) => {
     const providerId = String(patch.providerId || '').trim();
@@ -231,11 +437,332 @@ function registerIpc(deps) {
   });
   handle('gptplus:provider:models:remote', (id) => ctx.providerClient.fetchRemoteModels(id));
 
+  // ---- 对等共享与远端同步 ----
+  handle('gptplus:peer:state:get', () => ctx.peerState());
+
+  handle('gptplus:sharing:set', async (patch = {}) => {
+    const before = store.get();
+    const enabled = patch.enabled === undefined ? before.sharing.enabled : !!patch.enabled;
+    const selected = Array.isArray(patch.models) ? patch.models : before.sharing.models;
+    const valid = [];
+    const seen = new Set();
+    for (const item of selected) {
+      const providerId = String(item?.providerId || '').trim();
+      const modelId = String(item?.modelId || '').trim();
+      const key = providerId + '::' + modelId;
+      const provider = store.getProvider(providerId);
+      const model = provider?.models?.find((candidate) => candidate.id === modelId);
+      if (!provider || provider.remote || !model || seen.has(key)) continue;
+      seen.add(key);
+      valid.push({ providerId, modelId });
+    }
+    if (enabled && !valid.some((item) => {
+      const provider = store.getProvider(item.providerId);
+      const model = provider?.models?.find((candidate) => candidate.id === item.modelId);
+      return provider?.enabled !== false && model?.enabled !== false;
+    })) throw new Error('请至少选择一个已启用的本机模型');
+    if (enabled && !store.get().gateway.enabled) throw new Error('请先启用本地网关');
+    if (enabled && !ctx.gateway.getState().running) {
+      await ctx.gateway.start({ port: before.gateway.port, host: before.gateway.host || '127.0.0.1', token: before.gateway.token });
+    }
+    store.update((draft) => {
+      draft.sharing.enabled = enabled;
+      if (patch.name !== undefined) draft.sharing.name = String(patch.name || '').trim().slice(0, 128) || '我的共享端';
+      draft.sharing.models = valid;
+    });
+    ctx.log({ level: 'info', msg: enabled ? '已开启本机模型共享（' + valid.length + ' 个模型）' : '已关闭本机模型共享' });
+    return { ...ctx.peerState(), status: publish() };
+  });
+
+  handle('gptplus:sharing:client:add', (patch = {}) => {
+    if (typeof clipboard?.writeText !== 'function') throw new Error('当前环境不能安全复制共享授权令牌');
+    const rawToken = crypto.randomBytes(32).toString('base64url');
+    const id = randomPeerId('client');
+    const name = String(patch.name || '新客户端').trim().slice(0, 80) || '新客户端';
+    const createdAt = Date.now();
+    store.update((draft) => {
+      draft.sharing.clients.push({ id, name, createdAt, tokenHash: hashPeerToken(rawToken) });
+    });
+    try {
+      clipboard.writeText(rawToken);
+    } catch (error) {
+      store.update((draft) => { draft.sharing.clients = draft.sharing.clients.filter((client) => client.id !== id); });
+      throw new Error('复制授权令牌失败，未创建客户端授权');
+    }
+    ctx.log({ level: 'info', msg: '已添加共享客户端「' + name + '」' });
+    publish();
+    return { id, name, createdAt, copied: true, state: ctx.peerState() };
+  });
+
+  handle('gptplus:sharing:client:revoke', (id) => {
+    const clientId = String(id || '').trim();
+    let removed = false;
+    store.update((draft) => {
+      const beforeCount = draft.sharing.clients.length;
+      draft.sharing.clients = draft.sharing.clients.filter((client) => client.id !== clientId);
+      removed = beforeCount !== draft.sharing.clients.length;
+    });
+    if (removed) ctx.log({ level: 'warn', msg: '已撤销一个共享客户端授权' });
+    publish();
+    return { ...ctx.peerState(), removed };
+  });
+
+  handle('gptplus:remote:sync:set', (patch = {}) => {
+    const current = store.get().remoteSync;
+    const enabled = patch.enabled === undefined ? current.enabled : !!patch.enabled;
+    const interval = patch.intervalMinutes === undefined ? current.intervalMinutes : Number(patch.intervalMinutes);
+    if (!Number.isInteger(interval) || interval < MIN_SYNC_INTERVAL_MINUTES || interval > MAX_SYNC_INTERVAL_MINUTES) {
+      throw new Error('同步间隔必须是 ' + MIN_SYNC_INTERVAL_MINUTES + '-' + MAX_SYNC_INTERVAL_MINUTES + ' 分钟之间的整数');
+    }
+    store.update((draft) => { draft.remoteSync.enabled = enabled; draft.remoteSync.intervalMinutes = interval; });
+    ctx.remoteSync.configure();
+    return { ...ctx.peerState(), status: publish() };
+  });
+
+  handle('gptplus:remote:connection:save', (patch = {}) => {
+    const existing = patch.id ? store.get().remoteSync.connections.find((item) => item.id === patch.id) : null;
+    const id = existing?.id || randomPeerId('conn');
+    const name = String(patch.name || existing?.name || '远端连接').trim().slice(0, 80) || '远端连接';
+    const baseUrl = normalizePeerBaseUrl(patch.baseUrl === undefined ? existing?.baseUrl : patch.baseUrl);
+    // 优先使用 renderer 直接传入的令牌；兼容旧版剪贴板流程作为备用。
+    const authToken = String(patch.authToken || clipboard?.readText?.() || '').trim();
+    if (!authToken) throw new Error('请输入对端授权令牌');
+    if (!patch.authToken) { try { clipboard.clear?.(); } catch { /* The token remains protected by OS clipboard permissions. */ } }
+    store.update((draft) => {
+      const item = draft.remoteSync.connections.find((connection) => connection.id === id);
+      const next = { id, name, baseUrl, authToken, enabled: patch.enabled === undefined ? item?.enabled !== false : patch.enabled !== false,
+        sourceId: item?.sourceId || null, lastAttemptAt: item?.lastAttemptAt || null, lastSuccessAt: item?.lastSuccessAt || null, lastError: item?.lastError || '' };
+      if (item) Object.assign(item, next);
+      else draft.remoteSync.connections.push(next);
+    });
+    ctx.remoteSync.configure();
+    ctx.log({ level: 'info', msg: '已保存远端连接「' + name + '」' });
+    publish();
+    return { ...ctx.peerState(), connection: { id, name } };
+  });
+
+  handle('gptplus:remote:connection:set-enabled', (patch = {}) => {
+    const id = String(patch.id || '').trim();
+    const enabled = patch.enabled !== false;
+    store.update((draft) => {
+      const connection = draft.remoteSync.connections.find((item) => item.id === id);
+      if (!connection) throw new Error('远端连接不存在');
+      connection.enabled = enabled;
+    });
+    ctx.remoteSync.configure();
+    publish();
+    return { ...ctx.peerState(), enabled };
+  });
+
+  handle('gptplus:remote:connection:delete', (id) => {
+    const connectionId = String(id || '').trim();
+    store.update((draft) => {
+      draft.remoteSync.connections = draft.remoteSync.connections.filter((connection) => connection.id !== connectionId);
+      for (const source of draft.remoteSync.sources) if (source.connectionId === connectionId) source.connectionId = null;
+    });
+    ctx.remoteSync.configure();
+    publish();
+    return ctx.peerState();
+  });
+
+  handle('gptplus:remote:sync:now', async (id) => {
+    const result = await ctx.remoteSync.syncConnection(String(id || '').trim());
+    return { result, state: ctx.peerState(), status: publish() };
+  });
+
+  function findRemoteModel(providerId, modelId, draft) {
+    const { createRemoteProviders } = require('./peer-sharing.js');
+    const provider = createRemoteProviders(draft, { includeHidden: true }).find((item) => item.id === providerId);
+    if (!provider) throw new Error('远端来源不存在');
+    const model = provider.models.find((item) => item.id === modelId);
+    if (!model) throw new Error('远端模型不存在');
+    const source = draft.remoteSync.sources.find((item) => item.id === provider.sourceId);
+    if (!source) throw new Error('远端清单不存在');
+    const stored = source.models.find((item) => item.id === modelId);
+    if (!stored) throw new Error('远端模型不存在');
+    return { provider, source, stored };
+  }
+
+  function updateRemoteModel(providerId, modelId, mutate) {
+    const before = store.get();
+    const key = providerId + '::' + modelId;
+    const remoteProviders = createRemoteProviders(before, { includeHidden: true });
+    const remoteProvider = remoteProviders.find((item) => item.id === providerId);
+    if (!remoteProvider) throw new Error('远端来源不存在');
+    const model = remoteProvider.models.find((item) => item.id === modelId);
+    if (!model) throw new Error('远端模型不存在');
+    try {
+      store.update((draft) => {
+        const found = findRemoteModel(providerId, modelId, draft);
+        mutate(found.stored, draft, found);
+      });
+      if (store.get().inject.enabled && !ctx.models().some((item) => item.enabled)) {
+        store.update((draft) => {
+          draft.inject.enabled = false;
+          draft.inject.catalogPath = null;
+          draft.inject.defaultModel = null;
+        });
+        ctx.codex.applyInjection({ enabled: false });
+        ctx.markWrite(true);
+        ctx.log({ level: 'warn', msg: '没有剩余启用模型，已还原 ChatGPT 官方模型' });
+        return publish();
+      }
+      if (store.get().inject.enabled) ctx.syncInjection({ apply: true });
+      return publish();
+    } catch (error) {
+      store.save(before);
+      if (before.inject.enabled) {
+        try { ctx.syncInjection({ apply: true }); }
+        catch (restoreError) { ctx.log({ level: 'error', msg: '远端模型操作已回滚，但目录恢复失败: ' + restoreError.message }); }
+      }
+      throw error;
+    }
+  }
+
+  handle('gptplus:remote:model:enabled:set', ({ providerId, modelId, enabled } = {}) => {
+    return updateRemoteModel(providerId, modelId, (model) => { model.enabled = !!enabled; });
+  });
+
+  handle('gptplus:remote:model:delete', ({ providerId, modelId } = {}) => {
+    return updateRemoteModel(providerId, modelId, (model, draft) => {
+      model.hidden = true;
+      model.enabled = false;
+      draft.modelOrder = (draft.modelOrder || []).filter((item) => item !== providerId + '::' + modelId);
+      if (draft.inject.defaultModel === slugForProvider(
+        createRemoteProviders(draft, { includeHidden: true }).find((item) => item.id === providerId),
+        modelId,
+        [...store.providers(), ...createRemoteProviders(draft, { includeHidden: true })],
+      )) draft.inject.defaultModel = null;
+    });
+  });
+
+  handle('gptplus:remote:model:restore', ({ providerId, modelId } = {}) => {
+    return updateRemoteModel(providerId, modelId, (model, draft) => {
+      model.hidden = false;
+      const key = providerId + '::' + modelId;
+      if (!draft.modelOrder.includes(key)) draft.modelOrder.push(key);
+    });
+  });
+
+  handle('gptplus:remote:model:label:set', ({ providerId, modelId, label } = {}) => {
+    const next = String(label || '').trim();
+    if (!next || next.length > 512) throw new Error('显示名不能为空且不能超过 512 个字符');
+    return updateRemoteModel(providerId, modelId, (model) => { model.label = next; model.customLabel = next; });
+  });
+
+  // ---- QQ 远程助手 ----
+  async function qqBotView() {
+    const cfg = store.get().qqbot;
+    const state = ctx.gateway.getState();
+    let codex = null;
+    try {
+      codex = await ctx.taskCenter.resolveCodex();
+    } catch (err) {
+      codex = { path: '', source: '', error: err.message };
+    }
+    return {
+      enabled: !!cfg.enabled,
+      apiUrl: cfg.apiUrl,
+      accessToken: cfg.accessToken,
+      eventToken: cfg.eventToken,
+      notifyQq: cfg.notifyQq,
+      ownerQq: cfg.ownerQq,
+      progressMinutes: cfg.progressMinutes,
+      codexPath: cfg.codexPath,
+      workspaceDir: cfg.workspaceDir,
+      autoLaunch: !!cfg.autoLaunch,
+      launchCommand: cfg.launchCommand,
+      launchQq: cfg.launchQq,
+      launch: ctx.qqBot.getLaunchState(),
+      // 启动命令未配置时才探测，给界面「检测到 xxx · 填入」提示用
+      detectedLaunch: cfg.launchCommand ? '' : (ctx.qqBot.detectNapCatCommand()?.command || ''),
+      webhookUrl: ctx.qqBot.webhookUrl(),
+      gatewayRunning: !!state.running,
+      codex,
+      install: ctx.napcatInstaller ? ctx.napcatInstaller.getState() : null,
+    };
+  }
+
+  handle('gptplus:qqbot:get', () => qqBotView());
+  // 轻量接口：QQ 页 8 秒轮询兜底刷新拉起状态（事件丢失时也能跟回真实状态）
+  handle('gptplus:qqbot:launch:state', () => ctx.qqBot.getLaunchState());
+
+  handle('gptplus:qqbot:set', async (patch = {}) => {
+    const current = store.get().qqbot;
+    const next = { ...current };
+    for (const key of ['apiUrl', 'accessToken', 'eventToken', 'notifyQq', 'ownerQq', 'codexPath', 'workspaceDir', 'launchCommand']) {
+      if (patch[key] !== undefined) next[key] = String(patch[key] ?? '').trim();
+    }
+    if (patch.progressMinutes !== undefined) {
+      const minutes = Number(patch.progressMinutes);
+      if (!Number.isInteger(minutes) || minutes < 1 || minutes > 120) {
+        throw new Error('进度通知间隔必须是 1-120 之间的整数分钟');
+      }
+      next.progressMinutes = minutes;
+    }
+    if (patch.enabled !== undefined) next.enabled = patch.enabled === true;
+    if (patch.autoLaunch !== undefined) next.autoLaunch = patch.autoLaunch === true;
+    if (next.apiUrl && !/^https?:\/\//i.test(next.apiUrl)) throw new Error('NapCat 服务地址必须是 http(s) URL');
+    if (next.notifyQq && !/^\d{4,14}$/.test(next.notifyQq)) throw new Error('通知 QQ 必须是 4-14 位数字');
+    if (next.ownerQq && !/^\d{4,14}$/.test(next.ownerQq)) throw new Error('主人 QQ 必须是 4-14 位数字');
+    if (next.launchQq && !/^\d{4,14}$/.test(next.launchQq)) throw new Error('快速登录 QQ 必须是 4-14 位数字');
+    if (next.enabled && !next.notifyQq) throw new Error('开启前请先填写通知 QQ');
+    if (next.enabled && !store.get().gateway.enabled) throw new Error('QQ 远程助手依赖本地网关上报与控制通道，请先启用网关');
+
+    store.update((draft) => {
+      draft.qqbot = next;
+    });
+
+    if (next.enabled && !ctx.gateway.getState().running) {
+      const cfg = store.get();
+      await ctx.gateway.start({
+        port: cfg.gateway.port,
+        host: cfg.gateway.host || '127.0.0.1',
+        token: cfg.gateway.token,
+      });
+    }
+    // 配置了自动拉起时后台拉起 NapCat（离线才拉、并发去重，不阻塞保存）。
+    if (next.enabled) void ctx.qqBot.maybeAutoLaunch();
+    ctx.log({ level: next.enabled ? 'info' : 'warn', msg: next.enabled ? 'QQ 远程助手已开启' : 'QQ 远程助手已关闭' });
+    return qqBotView();
+  });
+
+  handle('gptplus:qqbot:launch', async () => {
+    const result = await ctx.qqBot.launchNapCat();
+    ctx.log(result.ok
+      ? { level: 'info', msg: `NapCat 拉起成功（${result.account || '未知账号'}）` }
+      : { level: 'warn', msg: `NapCat 拉起失败: ${result.error}` });
+    return result;
+  });
+
+  // 一键安装：进行中重复调用直接返回当前状态（主进程内并发去重）
+  handle('gptplus:qqbot:install', () => ctx.napcatInstaller.install());
+  handle('gptplus:qqbot:install:state', () => ctx.napcatInstaller.getState());
+  // 拉起并登录：已装 NapCat 的场景（快速登录优先，否则 app 内弹二维码扫码）
+  handle('gptplus:qqbot:login', () => ctx.napcatInstaller.loginFlow());
+
+  handle('gptplus:qqbot:test', async () => {
+    const api = await ctx.qqBot.apiTest();
+    const sent = await ctx.qqBot.sendPrivate(`gpt++ QQ 远程助手测试消息（${new Date().toLocaleString()}）`);
+    if (sent.ok) ctx.log({ level: 'info', msg: 'QQ 远程助手测试消息已发送' });
+    else ctx.log({ level: 'warn', msg: `QQ 测试消息发送失败: ${sent.error}` });
+    return { api, sent };
+  });
+
+  handle('gptplus:tasks:get', () => ctx.taskCenter.listTasks());
+
   // ---- 模型与网关 ----
   handle('gptplus:models:list', () => ctx.models());
   handle('gptplus:model:enabled:set', ({ providerId, modelId, enabled } = {}) => {
     const next = !!enabled;
     const before = store.get();
+    const remoteProvider = createRemoteProviders(before, { includeHidden: true }).find((item) => item.id === providerId);
+    if (remoteProvider) {
+      return updateRemoteModel(providerId, modelId, (model) => {
+        if (model.hidden) throw new Error('远端模型不存在或已删除');
+        model.enabled = next;
+      });
+    }
     let changed = false;
     store.update((draft) => {
       const provider = (draft.providers || []).find((item) => item.id === providerId);
@@ -254,6 +781,13 @@ function registerIpc(deps) {
 
   handle('gptplus:model:delete', ({ providerId, modelId } = {}) => {
     const before = store.get();
+    const remoteProvider = createRemoteProviders(before, { includeHidden: true }).find((item) => item.id === providerId);
+    if (remoteProvider) {
+      return updateRemoteModel(providerId, modelId, (model) => {
+        model.hidden = true;
+        model.enabled = false;
+      });
+    }
     const provider = store.getProvider(providerId);
     if (!provider) throw new Error('提供商不存在');
     const target = (provider.models || []).find((item) => item.id === modelId);
@@ -322,6 +856,7 @@ function registerIpc(deps) {
         if (model && model.id) models.push({ key: provider.id + '::' + model.id });
       }
     }
+    for (const model of ctx.models().filter((item) => item.remote)) models.push({ key: model.orderKey });
     const current = Array.isArray(cfg.modelOrder) ? cfg.modelOrder.filter((key) => models.some((item) => item.key === key)) : [];
     for (const item of models) if (!current.includes(item.key)) current.push(item.key);
     const key = providerId + '::' + modelId;
@@ -345,6 +880,7 @@ function registerIpc(deps) {
         if (model && model.id) modelKeys.push(provider.id + '::' + model.id);
       }
     }
+    for (const model of ctx.models().filter((item) => item.remote)) if (model.orderKey) modelKeys.push(model.orderKey);
     const validKeys = new Set(modelKeys);
     const next = [];
     for (const key of orderKeys) {

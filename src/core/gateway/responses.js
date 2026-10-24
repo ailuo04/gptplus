@@ -802,6 +802,7 @@ async function pipeResponsesSse(upstream, res, out) {
       out.completed = true;
       out.usage = json?.response?.usage || null;
       out.outputText = extractResponseText(json?.response?.output);
+      out.toolCalls = countLoopToolItems(json?.response?.output);
     } else if (type === 'response.failed') {
       const err = json?.response?.error;
       out.failed = { message: (err && err.message) || '上游返回 response.failed' };
@@ -849,6 +850,23 @@ function extractResponseText(output) {
     if (!item || !Array.isArray(item.content)) return [];
     return item.content.map((part) => part && (part.text || part.refusal)).filter(Boolean);
   }).join('');
+}
+
+/**
+ * 统计响应里需要客户端回灌结果的工具调用（function_call / custom_tool_call /
+ * local_shell_call 等）。web_search_call / file_search_call 属于服务端工具，
+ * 客户端不会为它们再发一轮请求，不算「任务还在进行」的信号。
+ */
+function countLoopToolItems(output) {
+  if (!Array.isArray(output)) return 0;
+  let count = 0;
+  for (const item of output) {
+    const type = String((item && item.type) || '');
+    if (!type.endsWith('_call')) continue;
+    if (type === 'web_search_call' || type === 'file_search_call') continue;
+    count += 1;
+  }
+  return count;
 }
 
 /**
@@ -1006,6 +1024,7 @@ module.exports = {
   SseWriter,
   ResponsesStream,
   buildResponseObject,
+  countLoopToolItems,
   estimateUsage,
   extractErrorMessage,
   extractResponseText,

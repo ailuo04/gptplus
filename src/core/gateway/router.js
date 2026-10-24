@@ -4,6 +4,7 @@
  * 新 slug 只用于人类可读性，真正的上游路由仍然落到稳定 provider.id。
  */
 const { slugify, parseSlug, slugForProvider, slugPrefix, orderModels, modelIdOf } = require('../model-utils.js');
+const { createRemoteProviders, parseSharedModelId } = require('../peer-sharing.js');
 
 /**
  * 创建网关模型路由表。
@@ -13,11 +14,19 @@ const { slugify, parseSlug, slugForProvider, slugPrefix, orderModels, modelIdOf 
 function createRouter({ store } = {}) {
   const providers = () => {
     try {
-      const list = typeof store?.providers === 'function' ? store.providers() : store?.get?.()?.providers;
-      return Array.isArray(list) ? list.filter(Boolean) : [];
+      const config = typeof store?.get === 'function' ? store.get() : {};
+      const list = typeof store?.providers === 'function' ? store.providers() : config?.providers;
+      return [...(Array.isArray(list) ? list.filter(Boolean) : []), ...createRemoteProviders(config)];
     } catch {
       return [];
     }
+  };
+
+  const localProviders = () => {
+    try {
+      const list = typeof store?.providers === 'function' ? store.providers() : store?.get?.()?.providers;
+      return Array.isArray(list) ? list.filter((provider) => provider && !provider.remote) : [];
+    } catch { return []; }
   };
 
   const getProvider = (id) => {
@@ -92,7 +101,33 @@ function createRouter({ store } = {}) {
     };
   }
 
-  return { slugify, parseSlug, listModels, counts, resolve, getProvider, providers };
+  function resolveLocalModelId(remoteModelId) {
+    const parsed = parseSharedModelId(remoteModelId);
+    if (!parsed) return { ok: false, reason: 'MODEL_NOT_FOUND' };
+    const shared = store?.get?.()?.sharing;
+    const published = Array.isArray(shared?.models)
+      && shared.models.some((item) => item.providerId === parsed.providerId && item.modelId === parsed.modelId);
+    if (!published) return { ok: false, reason: 'MODEL_NOT_FOUND' };
+    const provider = localProviders().find((item) => item.id === parsed.providerId);
+    const model = provider && (provider.models || []).find((item) => modelIdOf(item) === parsed.modelId);
+    if (!provider || provider.enabled === false || !model || model.enabled === false) {
+      return { ok: false, reason: 'MODEL_NOT_FOUND' };
+    }
+    const all = localProviders();
+    return {
+      ok: true,
+      slug: slugForProvider(provider, parsed.modelId, all),
+      provider,
+      providerId: provider.id,
+      providerName: provider.name || provider.id,
+      modelId: parsed.modelId,
+      model,
+      declared: true,
+      enabled: true,
+    };
+  }
+
+  return { slugify, parseSlug, listModels, counts, resolve, resolveLocalModelId, getProvider, providers, localProviders };
 }
 
 module.exports = { createRouter, slugify, parseSlug, modelIdOf };

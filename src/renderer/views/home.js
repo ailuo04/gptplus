@@ -106,6 +106,7 @@ export function renderHome(root, ctx, actions) {
 
   root.replaceChildren(
     hero(ctx),
+    peerEntry(ctx),
     el('div', { class: 'home-grid' }, [
       recentCard(ctx),
       trafficCard(ctx),
@@ -115,6 +116,29 @@ export function renderHome(root, ctx, actions) {
       shortcutsCard(ctx),
     ]),
   );
+}
+
+function peerEntry(ctx) {
+  const { el, icon, state } = ctx;
+  const peer = state.peer || {};
+  const sharing = peer.sharing || {};
+  const remote = peer.remoteSync || {};
+  return el('section', { class: 'home-peer-entry' }, [
+    el('div', { class: 'home-peer-mark' }, [icon('plug', 17)]),
+    el('div', { class: 'home-peer-copy' }, [
+      el('span', { class: 'home-peer-title', text: '对等共享' }),
+      el('span', { class: 'home-peer-desc', text: '发布本机模型，或同步另一台电脑的模型；两种方式可同时使用。' }),
+    ]),
+    el('div', { class: 'home-peer-states' }, [
+      el('span', { class: 'chip ' + (sharing.enabled ? 'chip-ok' : ''), text: '共享' + (sharing.enabled ? '已开启' : '未开启') }),
+      el('span', { class: 'chip ' + (remote.enabled ? 'chip-ok' : ''), text: '自动同步' + (remote.enabled ? '已开启' : '未开启') }),
+    ]),
+    el('button', {
+      class: 'btn btn-sm btn-accent',
+      type: 'button',
+      on: { click: () => ctx.openPeerSettings() },
+    }, [icon('plug', 13), el('span', { text: '配置对等共享' })]),
+  ]);
 }
 
 // ============ 首屏：信号链路 ============

@@ -4,6 +4,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { slugify, parseSlug, slugForProvider, orderModels } = require('./model-utils.js');
+const { createRemoteProviders } = require('./peer-sharing.js');
 
 /** 官方 gpt-5.5 的推理档位（~/.codex/models_cache.json 实测值） */
 const REASONING_LEVELS_FULL = [
@@ -147,7 +148,8 @@ function createCatalog({ store, paths } = {}) {
     if (!Number.isSafeInteger(limits.autoCompactTokenLimit) || limits.autoCompactTokenLimit < 1024 || limits.autoCompactTokenLimit > limits.contextWindow) {
       limits.autoCompactTokenLimit = null;
     }
-    const providers = store.providers();
+    const config = store.get();
+    const providers = [...store.providers(), ...createRemoteProviders(config)];
     let priority = 1;
     for (const { provider, model } of orderModels(providers, store.get().modelOrder)) {
       if (!provider || provider.enabled === false || !model || !model.id || model.enabled === false) continue;

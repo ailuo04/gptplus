@@ -9,7 +9,7 @@ function copyRendererToTemp() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gptplus-live-usage-'));
   fs.mkdirSync(path.join(tmp, 'views'), { recursive: true });
   fs.writeFileSync(path.join(tmp, 'package.json'), '{"type":"module"}', 'utf8');
-  for (const rel of ['app.js', 'views/home.js', 'views/providers.js', 'views/models.js', 'views/usage.js', 'views/settings.js']) {
+  for (const rel of ['app.js', 'views/home.js', 'views/providers.js', 'views/models.js', 'views/usage.js', 'views/settings.js', 'views/qq.js']) {
     fs.copyFileSync(path.join(__dirname, '..', 'src', 'renderer', rel), path.join(tmp, rel));
   }
   return tmp;

@@ -400,9 +400,13 @@ function modelTable(ctx, models, defaultModel) {
         el('div', { class: 'cell-provider', title: m.providerName, text: m.providerName }),
         el('div', {}, [modelSwitch(ctx, m)]),
         el('div', {}, [
+          m.remote ? el('span', { class: 'chip chip-codex', text: '远端' }) : null,
+          m.isNew ? el('span', { class: 'chip chip-warn', text: '新增' }) : null,
+          m.remote && !m.detected ? el('span', { class: 'chip chip-err', text: '未检测到' }) : null,
+          m.remote && m.hidden ? el('span', { class: 'chip chip-warn', text: '本机已删除' }) : null,
           m.reasoning
             ? el('span', { class: 'chip chip-accent', text: '推理' })
-            : el('span', { class: 'faint', text: '—' }),
+            : !m.remote ? el('span', { class: 'faint', text: '—' }) : null,
         ]),
         el('div', {}, [
           isDefault
@@ -420,6 +424,7 @@ function modelTable(ctx, models, defaultModel) {
         el('div', { class: 'model-order-actions' }),
       ]);
       row.lastElementChild.append(
+        remoteLabelButton(ctx, m),
         deleteModelButton(ctx, m),
         dragHandle(ctx, row, visible, index),
       );
@@ -513,7 +518,7 @@ function emptyState(ctx) {
 
 function modelSwitch(ctx, model) {
   const { el } = ctx;
-  const available = model.providerEnabled !== false;
+  const available = model.providerEnabled !== false && model.hidden !== true;
   const on = model.enabled && available;
   return el('button', {
     class: 'model-switch switch-table',
@@ -543,13 +548,32 @@ function dragHandle(ctx, row, models, index) {
 function deleteModelButton(ctx, model) {
   const { el, icon } = ctx;
   return el('button', {
-    class: 'btn btn-icon btn-danger model-delete',
+    class: 'btn btn-icon ' + (model.remote && model.hidden ? 'btn-accent' : 'btn-danger') + ' model-delete',
     type: 'button',
     disabled: viewState.busy ? true : null,
-    title: '删除该模型',
+    title: model.remote && model.hidden ? '恢复该远端模型' : '删除该模型',
     attrs: { 'aria-label': `删除模型 ${model.label || model.modelId}` },
     on: { click: () => confirmDeleteModel(ctx, model) },
-  }, [icon('trash', 13)]);
+  }, [icon(model.remote && model.hidden ? 'refresh' : 'trash', 13)]);
+}
+
+function remoteLabelButton(ctx, model) {
+  if (!model.remote) return null;
+  const { el, icon } = ctx;
+  return el('button', { class: 'btn btn-icon', type: 'button', title: '修改远端模型显示名',
+    attrs: { 'aria-label': '修改远端模型显示名' }, on: { click: () => void renameRemoteModel(ctx, model) } }, [icon('pencil', 12)]);
+}
+
+async function renameRemoteModel(ctx, model) {
+  const next = window.prompt('远端模型显示名', model.label || model.modelId);
+  if (!next || next.trim() === model.label) return;
+  try {
+    const status = await ctx.api.setRemoteModelLabel({ providerId: model.providerId, modelId: model.modelId, label: next.trim() });
+    if (status && typeof status === 'object') ctx.state.status = status;
+    ctx.toast('远端模型显示名已保存', 'ok');
+    markRelaunchIfInjected(ctx);
+    await ctx.reload('models', { preserveScrollTop: true });
+  } catch (err) { ctx.toastError(err, '保存远端显示名失败'); }
 }
 
 /** 删除二次确认：说明会影响哪些地方，避免误删掉正在注入的模型。 */
@@ -557,6 +581,7 @@ function confirmDeleteModel(ctx, model) {
   const { el, icon, state } = ctx;
   const inject = state.inject || (state.status && state.status.inject) || {};
   const isDefault = inject.defaultModel === model.slug;
+  const restoring = model.remote && model.hidden;
   const sameProvider = (state.models || []).filter((item) => item.providerId === model.providerId);
   const emptiesProvider = sameProvider.length <= 1;
   const modelKeyOf = (item) => item.orderKey || `${item.providerId}::${item.modelId}`;
@@ -574,6 +599,12 @@ function confirmDeleteModel(ctx, model) {
       : '',
     '删除后如果想恢复，需要在提供商页重新添加这个模型 ID。',
   ].filter(Boolean);
+  if (model.remote) {
+    details.splice(0, details.length,
+      '「' + (model.label || model.modelId) + '」的处理只影响本机，远端共享端不会被修改。',
+      '隐藏记录会保留；以后可恢复显示。同步不会自动重新添加你在本机隐藏的模型。',
+    );
+  }
 
   const run = async () => {
     if (busy) return;
@@ -584,7 +615,11 @@ function confirmDeleteModel(ctx, model) {
     confirmBtn.lastElementChild.textContent = '删除中…';
     try {
       const wasInjected = !!inject.enabled;
-      const status = await ctx.api.deleteModel({ providerId: model.providerId, modelId: model.modelId });
+      const status = model.remote && model.hidden
+        ? await ctx.api.restoreRemoteModel({ providerId: model.providerId, modelId: model.modelId })
+        : model.remote
+          ? await ctx.api.deleteRemoteModel({ providerId: model.providerId, modelId: model.modelId })
+        : await ctx.api.deleteModel({ providerId: model.providerId, modelId: model.modelId });
       if (status && typeof status === 'object') {
         ctx.state.status = status;
         if (status.inject) ctx.state.inject = { ...(ctx.state.inject || {}), ...status.inject };
@@ -594,7 +629,11 @@ function confirmDeleteModel(ctx, model) {
       // 注入开启时，目录和 Codex 配置都刚被改写（或已被还原），都要重启客户端才生效。
       if (wasInjected) ctx.markRelaunchNeeded?.();
       const name = model.label || model.modelId;
-      if (injectionDropped) {
+      if (model.remote && model.hidden) {
+        ctx.toast('已恢复远端模型「' + name + '」，仍保持停用', 'ok');
+      } else if (model.remote) {
+        ctx.toast('已在本机隐藏远端模型「' + name + '」', 'warn');
+      } else if (injectionDropped) {
         ctx.toast(`已删除模型「${name}」，没有剩余启用模型，已还原 ChatGPT 官方模型`, 'warn');
       } else {
         ctx.toast(`已删除模型「${name}」`, 'ok');
@@ -1021,7 +1060,9 @@ async function toggleModel(ctx, model, enabled) {
   if (viewState.busy || !model.orderKey) return;
   viewState.busy = true;
   try {
-    const status = await ctx.api.setModelEnabled({ providerId: model.providerId, modelId: model.modelId, enabled });
+    const status = model.remote
+      ? await ctx.api.setRemoteModelEnabled({ providerId: model.providerId, modelId: model.modelId, enabled })
+      : await ctx.api.setModelEnabled({ providerId: model.providerId, modelId: model.modelId, enabled });
     ctx.state.status = status;
     markRelaunchIfInjected(ctx);
     ctx.toast((enabled ? '已启用' : '已停用') + '模型「' + (model.label || model.modelId) + '」', 'ok');

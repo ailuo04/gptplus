@@ -7,9 +7,10 @@
 
 import { renderProviders, openProviderForm, closeProviderForm } from './views/providers.js';
 import { dragRowOffsets, dragTargetIndex, renderModels, reorderModelKeys } from './views/models.js';
-import { renderUsage, usageRows } from './views/usage.js';
-import { renderSettings } from './views/settings.js';
+import { latestUsageIndicators, renderUsage, usageRows } from './views/usage.js';
+import { openPeerSettings, renderSettings } from './views/settings.js';
 import { renderHome } from './views/home.js';
+import { renderQq } from './views/qq.js';
 
 // ============ 静态图标（纯字面量，不含任何变量） ============
 const SVG_OPEN =
@@ -41,6 +42,7 @@ const ICONS = Object.freeze({
   chevronUp: SVG_OPEN + '<path d="M4.4 9.6L8 6l3.6 3.6"/></svg>',
   activity: SVG_OPEN + '<path d="M1.7 8h2.8l1.9-4.3 3 8.6 1.8-4.3h3.1"/></svg>',
   box: SVG_OPEN + '<path d="M2.5 5.4L8 2.7l5.5 2.7v5.2L8 13.3l-5.5-2.7z"/><path d="M2.5 5.4L8 8.1l5.5-2.7M8 8.1v5.2"/></svg>',
+  lock: SVG_OPEN + '<rect x="3.3" y="7" width="9.4" height="6.2" rx="1.2"/><path d="M5.2 7V5.1a2.8 2.8 0 0 1 5.6 0V7"/></svg>',
   dot: SVG_FILL + '<circle cx="8" cy="8" r="3"/></svg>',
   plug: SVG_OPEN + '<path d="M6 6.6V3.2M10 6.6V3.2"/><path d="M4.2 6.6h7.6v1.9a3.8 3.8 0 0 1-7.6 0z"/><path d="M8 12.3v1.4"/></svg>',
   code: SVG_OPEN + '<path d="M6.2 4.6L3 8l3.2 3.4M9.8 4.6L13 8l-3.2 3.4"/></svg>',
@@ -334,6 +336,7 @@ const state = {
   network: null,
   startup: null,
   inject: null,
+  peer: null,
   logs: [],
   usage: [],
   usageTrend: [],
@@ -342,6 +345,8 @@ const state = {
   logPaused: false,
   pendingRelaunch: false,
   relaunchNeeded: false,
+  // NapCat 一键安装进度（主进程推送/查询；QQ 页安装卡与扫码弹窗用）
+  napcatInstall: null,
   update: {
     enabled: false,
     status: 'idle',
@@ -354,7 +359,7 @@ const state = {
     rollbackReleases: null,
     lastCheckedAt: null,
   },
-  loaded: { status: false, providers: false, models: false, modelLimits: false, gateway: false, inject: false, startup: false, update: false, logs: false, usage: false },
+  loaded: { status: false, providers: false, models: false, modelLimits: false, gateway: false, inject: false, peer: false, startup: false, update: false, logs: false, usage: false },
 };
 
 const THEME_MODES = new Set(['dark', 'light', 'system']);
@@ -522,6 +527,7 @@ function handleIncomingLog(entry, rerender = renderCurrent) {
   const finalRecord = normalized.final === true || normalized.usageRecord === true;
   if (finalRecord) mergeUsageRecords([normalized]);
   updateUsageBadge();
+  if (finalRecord) renderRuntimeMetrics();
   if (state.view === 'usage') rerender(false, { preserveScrollTop: true });
   // 主页也展示最近请求与今日流量：只在请求终结时重绘一次，不跟着中间日志刷新。
   else if (state.view === 'home' && finalRecord) rerender(false, { preserveScrollTop: true });
@@ -682,6 +688,26 @@ async function loadInject() {
   state.loaded.inject = true;
 }
 
+async function loadPeer() {
+  if (typeof api.getPeerState === 'function') state.peer = await api.getPeerState();
+  state.loaded.peer = true;
+}
+
+async function loadQq() {
+  if (typeof api.getQqBot === 'function') state.qq = await api.getQqBot();
+  // 补拉安装进度快照（应用启动前就在装、事件已错过的场景）
+  if (typeof api.getNapCatInstallState === 'function') {
+    const snapshot = await api.getNapCatInstallState().catch(() => null);
+    if (snapshot && snapshot.phase && snapshot.phase !== 'idle') state.napcatInstall = snapshot;
+  }
+  state.loaded.qq = true;
+}
+
+async function loadTasks() {
+  if (typeof api.getTasks === 'function') state.tasks = await api.getTasks();
+  state.loaded.tasks = true;
+}
+
 async function loadLogs() {
   const logs = await api.getLogs();
   if (Array.isArray(logs)) {
@@ -708,6 +734,7 @@ async function loadUsage() {
     state.usageTrend = Array.isArray(trend) ? trend : [];
   }
   state.loaded.usage = true;
+  renderRuntimeMetrics();
 }
 
 /**
@@ -775,8 +802,14 @@ const RELOAD_PLAN = {
     [loadInject, '注入状态'],
     [loadUpdate, '更新状态'],
     [loadStatus, '全局状态'],
+    [loadPeer, '对等共享状态'],
   ],
   usage: [[loadUsage, '使用量统计'], [loadLogs, '使用量日志']],
+  qq: [
+    [loadQq, 'QQ 远程助手配置'],
+    [loadTasks, '任务列表'],
+    [loadStatus, '全局状态'],
+  ],
 };
 
 async function reload(scope = 'providers', options = {}) {
@@ -821,6 +854,7 @@ async function refreshUsageIncrementally() {
       state.usageTrend = Array.isArray(trend) ? trend : [];
     }
     state.loaded.usage = true;
+    renderRuntimeMetrics();
     if (state.view === 'usage') {
       renderChrome();
       renderCurrent(false, { preserveScrollTop: true });
@@ -853,7 +887,7 @@ const VIEW_META = {
     sub: '提供商、本地网关与 ChatGPT 客户端连成一条线路',
     render: renderHome,
     // 使用量由后台加载：历史记录可能有上万条，不能挡住首屏。
-    needs: ['providers', 'status', 'gateway', 'inject', 'models'],
+    needs: ['providers', 'status', 'gateway', 'inject', 'models', 'peer'],
   },
   providers: {
     title: '提供商',
@@ -873,11 +907,17 @@ const VIEW_META = {
     render: renderUsage,
     needs: ['usage'],
   },
+  qq: {
+    title: 'QQ 远程',
+    sub: 'QQ 接收 Codex 任务通知，私聊命令远程控制本机 Codex',
+    render: renderQq,
+    needs: ['qq', 'tasks', 'status'],
+  },
   settings: {
     title: '设置',
     sub: '本地网关、Codex 配置写入与客户端重启',
     render: renderSettings,
-    needs: ['modelLimits', 'gateway', 'inject', 'update', 'status'],
+    needs: ['modelLimits', 'gateway', 'inject', 'update', 'status', 'peer'],
   },
 };
 
@@ -931,6 +971,7 @@ function renderChrome() {
 
   // 状态栏链路
   renderFlow(s);
+  renderRuntimeMetrics();
   renderThemeControl();
 
   // 版本
@@ -1474,6 +1515,46 @@ function renderFlow(s) {
   dom.flow.replaceChildren(...nodes);
 }
 
+function renderRuntimeMetrics() {
+  if (!dom.runtimeMetrics) return;
+  const contextWindow = state.modelLimits?.contextWindow ?? state.status?.modelLimits?.contextWindow;
+  const metrics = latestUsageIndicators(state, contextWindow);
+  const speed = metrics?.speed == null ? '—' : metrics.speed < 10 ? metrics.speed.toFixed(1) : String(Math.round(metrics.speed));
+  const cacheRate = metrics?.cacheRate == null ? '—' : `${metrics.cacheRate.toFixed(1)}%`;
+  const contextRate = metrics?.contextRate == null ? '—' : `${Math.round(metrics.contextRate)}%`;
+  const estimateNote = metrics?.estimated ? '（Token 用量为网关估算）' : '';
+  const speedDetail = metrics?.speed == null
+    ? '暂无有效的输出 Token / 耗时数据'
+    : `输出速率估算：输出 Token ÷ 网关总耗时（${metrics.output.toLocaleString()} Token / ${metrics.elapsed.toLocaleString()}ms）${estimateNote}`;
+  const cacheDetail = metrics?.cacheRate == null
+    ? '最近请求未提供可计算的缓存 usage'
+    : `最近请求缓存命中：${metrics.cached.toLocaleString()} / ${metrics.input.toLocaleString()} 输入 Token${estimateNote}`;
+  const contextDetail = metrics?.contextRate == null
+    ? '暂无可用的输入 Token 或上下文窗口数据'
+    : `估算上下文占用：最近请求输入 ${metrics.input.toLocaleString()} / 配置窗口 ${metrics.contextWindow.toLocaleString()} Token${estimateNote}`;
+
+  dom.runtimeMetrics.replaceChildren(
+    el('span', {
+      class: 'runtime-metric',
+      title: `${speedDetail}；耗时包含等待上游响应`,
+      attrs: { 'aria-label': `输出速率 ${speed} tok/s` },
+    }, [icon('activity', 13), el('span', { class: 'nums', text: `${speed} tok/s` })]),
+    el('span', {
+      class: 'runtime-metric',
+      title: cacheDetail,
+      attrs: { 'aria-label': `缓存命中 ${cacheRate}` },
+    }, [icon('server', 13), el('span', { class: 'runtime-metric-label', text: '缓存命中' }), el('span', { class: 'nums', text: cacheRate })]),
+    el('span', {
+      class: 'runtime-metric runtime-metric-context',
+      title: `${contextDetail}。该值不是客户端实时上下文读数。`,
+      attrs: { 'aria-label': `估算上下文占用 ${contextRate}` },
+    }, [
+      el('span', { class: 'runtime-context-ring', style: { '--runtime-progress': `${metrics?.contextRate ?? 0}%` }, attrs: { 'aria-hidden': 'true' } }),
+      el('span', { class: 'nums', text: contextRate }),
+    ]),
+  );
+}
+
 function updateUsageBadge(badge = dom.nav?.querySelector('[data-badge="usage"]')) {
   setAnimatedText(badge, String(usageRows(state).length));
 }
@@ -1670,6 +1751,9 @@ const LOADER_BY_KEY = {
   inject: [loadInject, '注入状态'],
   usage: [loadUsage, '使用量统计'],
   logs: [loadLogs, '使用量日志'],
+  peer: [loadPeer, '对等共享状态'],
+  qq: [loadQq, 'QQ 远程助手配置'],
+  tasks: [loadTasks, '任务列表'],
 };
 
 const inflight = new Map();
@@ -1719,6 +1803,7 @@ const ctx = {
   isModalOpen,
   openProviderForm: (providerId) => openProviderForm(ctx, providerId),
   closeProviderForm: () => closeProviderForm(),
+  openPeerSettings: () => openPeerSettings(ctx),
   dragRowOffsets,
   dragTargetIndex,
   reorderModelKeys,
@@ -1741,6 +1826,8 @@ function subscribe() {
       if (s.gateway) state.gateway = { ...(state.gateway || {}), ...s.gateway };
       if (s.network) state.network = { ...(state.network || {}), ...s.network };
       if (s.inject) state.inject = { ...(state.inject || {}), ...s.inject };
+      if (Array.isArray(s.models)) state.models = s.models;
+      if (s.peer) updatePeerStatus(s);
       state.loaded.status = true;
       renderChrome();
       // 状态广播只更新顶部状态栏。配置操作自己的成功/失败流程负责更新当前视图，
@@ -1755,12 +1842,39 @@ function subscribe() {
     logLocal('warn', `订阅更新事件失败: ${describeError(err)}`);
   }
   try {
+    // 一键安装进度：QQ 页安装卡 + 扫码弹窗的数据源。渲染交给 QQ 页自己刷新
+    // （renderCurrent 的焦点保护会避免打断正在编辑的输入框）。
+    api.onNapCatInstall?.((next) => {
+      if (!next || typeof next !== 'object') return;
+      state.napcatInstall = next;
+      if (state.view === 'qq') renderCurrent(false, { preserveScrollTop: true });
+    });
+  } catch (err) {
+    logLocal('warn', `订阅安装事件失败: ${describeError(err)}`);
+  }
+  try {
+    // NapCat 拉起状态：主进程每次 phase 变化都会推送，页面开着时即时刷新
+    // 「拉起中…/在线/失败」芯片，不再依赖整页 reload。
+    api.onQqLaunch?.((next) => {
+      if (!next || typeof next !== 'object') return;
+      state.qq = { ...(state.qq || {}), launch: next };
+      if (state.view === 'qq') renderCurrent(false, { preserveScrollTop: true });
+    });
+  } catch (err) {
+    logLocal('warn', `订阅拉起状态事件失败: ${describeError(err)}`);
+  }
+  try {
     api.onLog((entry) => {
       handleIncomingLog(entry);
     });
   } catch (err) {
     logLocal('warn', `订阅日志事件失败: ${describeError(err)}`);
   }
+}
+
+function updatePeerStatus(status) {
+  state.peer = status.peer;
+  if (state.view === 'settings' || state.view === 'home') renderCurrent(false, { preserveScrollTop: true });
 }
 
 // ============ 静态 DOM 接线 ============
@@ -1850,6 +1964,7 @@ function cacheDom() {
   dom.logToggleCount = document.getElementById('log-toggle-count');
   dom.logAutoscroll = document.getElementById('log-autoscroll');
   dom.flow = document.getElementById('flow');
+  dom.runtimeMetrics = document.getElementById('runtime-metrics');
   dom.themeControl = document.getElementById('theme-control');
   dom.buildTag = document.getElementById('build-tag');
   dom.modalRoot = document.getElementById('modal-root');
