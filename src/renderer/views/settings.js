@@ -16,6 +16,9 @@ const viewState = {
   restoreBusy: false,
   rollbackBusy: false,
   pendingRollback: '',
+  updateIntervalDraft: null,
+  updateIntervalError: '',
+  updateIntervalBusy: false,
 };
 
 /** 渲染设置页 */
@@ -279,6 +282,17 @@ function updateCard(ctx) {
   const hasVersion = !!update.version;
   const busy = update.status === 'checking' || update.status === 'downloading';
   const pending = ['available', 'downloaded'].includes(update.status);
+  const configuredInterval = Number.isInteger(Number(update.checkIntervalMinutes))
+    ? Number(update.checkIntervalMinutes)
+    : 60;
+  if (viewState.updateIntervalDraft === null) viewState.updateIntervalDraft = String(configuredInterval);
+  const intervalInput = el('input', {
+    class: 'input mono' + (viewState.updateIntervalError ? ' is-invalid' : ''),
+    type: 'number',
+    value: viewState.updateIntervalDraft,
+    attrs: { min: '5', max: '1440', step: '1', 'aria-label': '自动检查更新间隔（分钟）', style: 'width:110px' },
+    on: { input: (event) => { viewState.updateIntervalDraft = event.target.value; viewState.updateIntervalError = ''; } },
+  });
   const statusText = update.status === 'checking'
     ? '正在检查 GitHub Release…'
     : update.status === 'latest'
@@ -317,6 +331,22 @@ function updateCard(ctx) {
               }, [icon('download', 13), el('span', { text: update.status === 'downloaded' ? '继续安装' : '立即更新' })])
             : null,
         ]),
+      ]),
+      el('div', { class: 'setting' }, [
+        el('div', { class: 'setting-main' }, [
+          el('div', { class: 'setting-title', text: '自动检查更新间隔' }),
+          el('div', { class: 'setting-desc', text: `启动后 ${update.initialCheckDelayMinutes || 2} 分钟首次检查，之后每隔设定时间检查；范围 5-1440 分钟。` }),
+        ]),
+        el('div', { class: 'setting-ctl' }, [intervalInput]),
+      ]),
+      viewState.updateIntervalError ? el('div', { class: 'hint-error', text: viewState.updateIntervalError }) : null,
+      el('div', { class: 'toolbar', style: { 'margin-top': '12px' } }, [
+        el('button', {
+          class: 'btn btn-sm btn-primary' + (viewState.updateIntervalBusy ? ' is-busy' : ''),
+          type: 'button',
+          disabled: viewState.updateIntervalBusy ? true : null,
+          on: { click: () => void saveUpdateInterval(ctx) },
+        }, [icon('check', 13), el('span', { text: viewState.updateIntervalBusy ? '保存中…' : '保存检查间隔' })]),
       ]),
       update.status === 'error'
         ? el('div', { class: 'hint-error', text: '请检查网络连接后再次点击“检查更新”。' })
@@ -871,6 +901,32 @@ async function saveModelLimits(ctx) {
   } finally {
     viewState.limitsBusy = false;
     await ctx.reload('settings');
+  }
+}
+
+async function saveUpdateInterval(ctx) {
+  if (viewState.updateIntervalBusy) return;
+  const value = Number(String(viewState.updateIntervalDraft ?? '').trim());
+  if (!Number.isInteger(value) || value < 5 || value > 1440) {
+    viewState.updateIntervalError = '自动检查间隔必须是 5-1440 分钟之间的整数';
+    ctx.renderCurrent(true);
+    ctx.toast('自动检查间隔不合法，未保存', 'warn');
+    return;
+  }
+  viewState.updateIntervalError = '';
+  viewState.updateIntervalBusy = true;
+  try {
+    const next = await ctx.api.setUpdateCheckInterval({ checkIntervalMinutes: value });
+    if (next && typeof next === 'object') ctx.state.update = { ...ctx.state.update, ...next };
+    viewState.updateIntervalDraft = null;
+    ctx.toast(`自动更新检查间隔已保存：${value} 分钟`, 'ok');
+    ctx.logLocal('info', `自动更新检查间隔已设置为 ${value} 分钟`);
+  } catch (err) {
+    viewState.updateIntervalError = ctx.describeError(err, '保存自动更新检查间隔失败');
+    ctx.toastError(err, '保存自动更新检查间隔失败');
+  } finally {
+    viewState.updateIntervalBusy = false;
+    await ctx.reload('settings', { preserveScrollTop: true });
   }
 }
 

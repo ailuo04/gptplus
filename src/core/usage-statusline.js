@@ -17,7 +17,7 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
   const STALE_MS = 120000;
   const CIRCUMFERENCE = 37.7;
   const SYNC_INTERVAL_MS = 5000;
-  const runtimeKey = "gptplus-usage-statusline-v2";
+  const runtimeKey = "gptplus-usage-statusline-v3";
   if (globalThis.__gptplusUsageStatuslineRuntime === runtimeKey && globalThis.__gptplusUsageStatusline) {
     return { ok: true, installed: true, reused: true };
   }
@@ -270,7 +270,8 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
       const style = document.createElement("style");
       style.id = STYLE_ID;
       style.setAttribute(EXT_ATTR, "true");
-      style.textContent = "#" + ID + "{display:flex;align-items:center;justify-content:center;gap:24px;box-sizing:border-box;width:100%;margin:6px 0 0;padding:0 10px;font:inherit;font-size:12px;line-height:17px;color:color-mix(in srgb,var(--color-token-text-primary,#dfdfdf) 82%,transparent);user-select:none;cursor:default}#" + ID + "[data-hidden=\\\"true\\\"]{display:none}#" + ID + " .gptplus-usage-item{display:inline-flex;align-items:center;gap:5px;white-space:nowrap;font-variant-numeric:tabular-nums;transition:opacity .2s}#" + ID + " .gptplus-usage-value{font-weight:500}#" + ID + " .gptplus-usage-item svg{flex:0 0 auto;opacity:.8}#" + ID + "[data-stale=\\\"true\\\"] .gptplus-usage-item[data-usage=\\\"speed\\\"]{opacity:.55}";
+      const textColor = "color-mix(in srgb,var(--color-token-text-primary,#dfdfdf) 82%,transparent)";
+      style.textContent = "#" + ID + "{display:flex;align-items:center;justify-content:center;gap:24px;box-sizing:border-box;width:100%;margin:6px 0 0;padding:0 10px;font:inherit;font-size:12px;line-height:17px;color:" + textColor + ";user-select:none;cursor:default}#" + ID + "[data-hidden=\\\"true\\\"]{display:none}#" + ID + " .gptplus-usage-item{display:inline-flex;align-items:center;gap:5px;white-space:nowrap;font-variant-numeric:tabular-nums;transition:opacity .2s}#" + ID + " .gptplus-usage-item,#" + ID + " .gptplus-usage-value,#" + ID + " .gptplus-usage-item svg{color:" + textColor + "!important}#" + ID + " .gptplus-usage-value{font-weight:500}#" + ID + " .gptplus-usage-item svg{flex:0 0 auto;opacity:1}#" + ID + "[data-stale=\\\"true\\\"] .gptplus-usage-item{opacity:.55}";
       document.head?.appendChild(style);
     }
     document.getElementById(ID)?.remove();

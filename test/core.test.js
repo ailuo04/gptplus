@@ -665,30 +665,30 @@ function transferConfig() {
   };
 }
 
-test('provider-transfer: 系统安全存储逐字段加密，导出不要求密码且可往返', () => {
+test('provider-transfer: 应用内置密钥加密完整内容，导出不要求密码且可跨系统往返', () => {
   const config = transferConfig();
   const payload = providerTransfer.createExportPayload(config);
-  const secretStorage = createTestSecretStorage();
-  const first = providerTransfer.encryptProviderConfigLocal(payload, secretStorage);
-  const second = providerTransfer.encryptProviderConfigLocal(payload, secretStorage);
+  const first = providerTransfer.encryptProviderConfigPortable(payload);
+  const second = providerTransfer.encryptProviderConfigPortable(payload);
   const text = first.toString('utf8');
   const envelope = JSON.parse(text);
 
   assert.equal(text.includes('sk-transfer-secret-1'), false, 'API Key 不应出现在导出文件中');
   assert.equal(text.includes('https://mhapi.example/v1'), false, 'Base URL 不应出现在导出文件中');
   assert.equal(text.includes('secret-header'), false, '自定义请求头值也不应出现在导出文件中');
+  assert.equal(text.includes('apinode'), false, '提供商名称也不应出现在导出文件中');
   assert.equal(envelope.version, providerTransfer.FILE_VERSION);
-  assert.equal(envelope.encryption, 'electron-safeStorage');
-  assert.equal(envelope.providers[0].name, payload.providers[0].name, '非敏感字段保留可读');
+  assert.equal(envelope.encryption, 'gptplus-portable-aes-256-gcm');
+  assert.equal(envelope.scope, 'application');
+  assert.equal(typeof envelope.payload, 'string');
   assert.notDeepEqual(first, second, '每次加密应生成不同密文');
   const inspected = providerTransfer.inspectProviderConfigFile({ fileName: 'backup.gptplus-providers', bytes: first });
   assert.equal(inspected.requiresPassword, false);
-  assert.equal(inspected.portable, false);
+  assert.equal(inspected.portable, true);
 
   const decoded = providerTransfer.decryptProviderConfig({
     fileName: 'backup.gptplus-providers',
     bytes: first,
-    secretStorage,
   });
   assert.deepEqual(decoded.providers, payload.providers);
   assert.deepEqual(decoded.modelOrder, payload.modelOrder);
@@ -696,23 +696,17 @@ test('provider-transfer: 系统安全存储逐字段加密，导出不要求密�
   assert.equal(decoded.injectEnabled, true);
 });
 
-test('provider-transfer: 其它系统账户、篡改密文、错误扩展名和不支持版本都会被拒绝', () => {
+test('provider-transfer: 篡改密文、错误扩展名和不支持版本都会被拒绝', () => {
   const payload = providerTransfer.createExportPayload(transferConfig());
-  const secretStorage = createTestSecretStorage();
-  const encrypted = providerTransfer.encryptProviderConfigLocal(payload, secretStorage);
-
-  assert.throws(
-    () => providerTransfer.decryptProviderConfig({ fileName: 'backup.gptplus-providers', bytes: encrypted, secretStorage: createTestSecretStorage() }),
-    (err) => err && err.code === 'DECRYPT_FAILED',
-  );
+  const encrypted = providerTransfer.encryptProviderConfigPortable(payload);
 
   const tamperedEnvelope = JSON.parse(encrypted.toString('utf8'));
-  const ciphertext = Buffer.from(tamperedEnvelope.providers[0].secrets.apiKey, 'base64url');
-  ciphertext[0] ^= 1;
-  tamperedEnvelope.providers[0].secrets.apiKey = ciphertext.toString('base64url');
+  const ciphertext = Buffer.from(tamperedEnvelope.payload, 'base64url');
+  ciphertext[ciphertext.length - 1] ^= 1;
+  tamperedEnvelope.payload = ciphertext.toString('base64url');
   const tampered = Buffer.from(JSON.stringify(tamperedEnvelope), 'utf8');
   assert.throws(
-    () => providerTransfer.decryptProviderConfig({ fileName: 'backup.gptplus-providers', bytes: tampered, secretStorage }),
+    () => providerTransfer.decryptProviderConfig({ fileName: 'backup.gptplus-providers', bytes: tampered }),
     (err) => err && err.code === 'DECRYPT_FAILED',
   );
 
@@ -735,13 +729,11 @@ test('provider-transfer: 其它系统账户、篡改密文、错误扩展名和�
 });
 
 test('provider-transfer: 空配置、选中导出和必填字段校验', () => {
-  const secretStorage = createTestSecretStorage();
   const emptyPayload = providerTransfer.createExportPayload({ providers: [], modelOrder: [], inject: { enabled: false } });
-  const emptyFile = providerTransfer.encryptProviderConfigLocal(emptyPayload, secretStorage);
+  const emptyFile = providerTransfer.encryptProviderConfigPortable(emptyPayload);
   const emptyDecoded = providerTransfer.decryptProviderConfig({
     fileName: 'empty.gptplus-providers',
     bytes: emptyFile,
-    secretStorage,
   });
   assert.deepEqual(emptyDecoded.providers, []);
 
@@ -751,13 +743,13 @@ test('provider-transfer: 空配置、选中导出和必填字段校验', () => {
   assert.equal(selected.injectEnabled, null, '部分导出不能修改目标环境的全局开关');
 
   assert.throws(
-    () => providerTransfer.encryptProviderConfigLocal({
+    () => providerTransfer.encryptProviderConfigPortable({
       format: providerTransfer.FILE_FORMAT,
       version: providerTransfer.PAYLOAD_VERSION,
       providers: [{ id: 'p_bad', name: '坏配置', baseUrl: '', apiKey: 'x', api: 'openai', headers: {}, models: [{ id: 'm' }] }],
       modelOrder: [],
       defaultModelRef: null,
-    }, secretStorage),
+    }),
     (err) => err && err.code === 'INVALID_CONFIG',
   );
 });
@@ -793,14 +785,13 @@ test('provider-transfer: 密文篡改会拒绝，跨提供商模型顺序保持�
   const config = transferConfig();
   config.modelOrder = ['p_demo0001::claude-x', 'p_demo0002::qwen3', 'p_demo0001::gpt-6.1-sol'];
   const payload = providerTransfer.createExportPayload(config);
-  const secretStorage = createTestSecretStorage();
-  const bytes = providerTransfer.encryptProviderConfigLocal(payload, secretStorage);
+  const bytes = providerTransfer.encryptProviderConfigPortable(payload);
   const tampered = JSON.parse(bytes);
-  const ciphertext = Buffer.from(tampered.providers[0].secrets.baseUrl, 'base64url');
-  ciphertext[0] ^= 1;
-  tampered.providers[0].secrets.baseUrl = ciphertext.toString('base64url');
+  const ciphertext = Buffer.from(tampered.payload, 'base64url');
+  ciphertext[ciphertext.length - 1] ^= 1;
+  tampered.payload = ciphertext.toString('base64url');
   assert.throws(() => providerTransfer.decryptProviderConfig({
-    fileName: 'test.gptplus-providers', bytes: Buffer.from(JSON.stringify(tampered)), secretStorage,
+    fileName: 'test.gptplus-providers', bytes: Buffer.from(JSON.stringify(tampered)),
   }), (err) => err.code === 'DECRYPT_FAILED');
   for (const version of [0, 2]) {
     const envelope = { ...JSON.parse(bytes), version };
@@ -814,14 +805,23 @@ test('provider-transfer: 密文篡改会拒绝，跨提供商模型顺序保持�
   assert.deepEqual(plan.config.modelOrder, config.modelOrder);
 });
 
-test('provider-transfer: 无可用系统安全存储时拒绝导出和导入', () => {
+test('provider-transfer: 旧版本和错误协议会被拒绝，便携导入不依赖系统安全存储', () => {
   const payload = providerTransfer.createExportPayload(transferConfig());
-  const unavailable = { isAvailable: () => false, encrypt: () => Buffer.from('x'), decrypt: () => 'x' };
-  assert.throws(() => providerTransfer.encryptProviderConfigLocal(payload, unavailable), (err) => err.code === 'SECURE_STORAGE_UNAVAILABLE');
-  const encrypted = providerTransfer.encryptProviderConfigLocal(payload, createTestSecretStorage());
-  assert.throws(() => providerTransfer.decryptProviderConfig({
-    fileName: 'backup.gptplus-providers', bytes: encrypted, secretStorage: unavailable,
-  }), (err) => err.code === 'SECURE_STORAGE_UNAVAILABLE');
+  const encrypted = JSON.parse(providerTransfer.encryptProviderConfigPortable(payload));
+  const old = Buffer.from(JSON.stringify({ ...encrypted, version: 3 }), 'utf8');
+  assert.throws(
+    () => providerTransfer.inspectProviderConfigFile({ fileName: 'backup.gptplus-providers', bytes: old }),
+    (err) => err.code === 'UNSUPPORTED_VERSION',
+  );
+  const wrongCipher = Buffer.from(JSON.stringify({ ...encrypted, encryption: 'electron-safeStorage' }), 'utf8');
+  assert.throws(
+    () => providerTransfer.inspectProviderConfigFile({ fileName: 'backup.gptplus-providers', bytes: wrongCipher }),
+    (err) => err.code === 'UNSUPPORTED_ALGORITHM',
+  );
+  assert.deepEqual(
+    providerTransfer.decryptProviderConfig({ fileName: 'backup.gptplus-providers', bytes: Buffer.from(JSON.stringify(encrypted)) }).providers,
+    payload.providers,
+  );
 });
 
 test('store: 导入事务在同步成功后才落盘，嵌套更新及写入失败不会污染原配置', (t) => {
@@ -2129,8 +2129,9 @@ test('ipc: 提供商配置导出、文件选择、解密预览和原子导入使
 
   const picked = await channels.get('gptplus:provider:import:pick')({});
   const inspected = await channels.get('gptplus:provider:import:inspect')({}, picked);
-  assert.equal(inspected.cipher, 'electron-safeStorage');
+  assert.equal(inspected.cipher, 'gptplus-portable-aes-256-gcm');
   assert.equal(inspected.requiresPassword, false);
+  assert.equal(inspected.portable, true);
   const prepared = await channels.get('gptplus:provider:import:prepare')({}, picked);
   assert.equal(prepared.preview.providers[0].name, provider.name);
   assert.equal('baseUrl' in prepared.preview.providers[0], false);
@@ -2205,7 +2206,7 @@ test('ipc: 提供商导入同步失败时回滚全部配置且不泄露敏感字
     modelOrder: [],
     inject: { enabled: true, defaultModel: 'p_import01__import-model' },
   });
-  const encrypted = providerTransfer.encryptProviderConfigLocal(sourcePayload, secretStorage);
+  const encrypted = providerTransfer.encryptProviderConfigPortable(sourcePayload);
   const channels = new Map();
   const logs = [];
   const ctx = {

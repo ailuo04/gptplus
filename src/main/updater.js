@@ -7,6 +7,10 @@ const path = require('node:path');
 const UPDATER_CACHE_DIR = 'gptplus-updater';
 const RELEASES_API = 'https://api.github.com/repos/ailuo04/gptplus/releases?per_page=100';
 const RELEASE_DOWNLOAD_BASE = 'https://github.com/ailuo04/gptplus/releases/download';
+const INITIAL_CHECK_DELAY_MINUTES = 2;
+const DEFAULT_CHECK_INTERVAL_MINUTES = 60;
+const MIN_CHECK_INTERVAL_MINUTES = 5;
+const MAX_CHECK_INTERVAL_MINUTES = 1440;
 
 function stableVersion(value) {
   const match = String(value || '').replace(/^v/i, '').match(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
@@ -18,6 +22,15 @@ function compareVersions(left, right) {
     if (left.parts[index] !== right.parts[index]) return left.parts[index] < right.parts[index] ? -1 : 1;
   }
   return 0;
+}
+
+function normalizeCheckIntervalMinutes(value) {
+  const candidate = Number(value);
+  return Number.isInteger(candidate)
+    && candidate >= MIN_CHECK_INTERVAL_MINUTES
+    && candidate <= MAX_CHECK_INTERVAL_MINUTES
+    ? candidate
+    : DEFAULT_CHECK_INTERVAL_MINUTES;
 }
 
 async function listRollbackReleases({ currentVersion, fetchImpl = globalThis.fetch }) {
@@ -116,8 +129,10 @@ async function cleanupInstalledUpdateCache(options = {}) {
  * 配置 GitHub Release 自动更新。
  * 开发模式、冒烟测试和未打包运行时不执行网络更新检查。
  * @param {{ app: any, autoUpdater: any, isDev?: boolean, isSmoke?: boolean,
- *   onLog?: (entry: object) => void, onState?: (state: object) => void }} options
+ *   onLog?: (entry: object) => void, onState?: (state: object) => void,
+ *   checkIntervalMinutes?: number, initialCheckDelayMs?: number, timers?: object }} options
  * @returns {{ enabled: boolean, getState: () => object, checkForUpdates: () => Promise<any>,
+ *   setCheckIntervalMinutes: (value: number) => object, stopAutomaticChecks: () => void,
  *   downloadUpdate: () => Promise<object> }} 更新控制器
  */
 function setupAutoUpdater(options = {}) {
@@ -129,6 +144,9 @@ function setupAutoUpdater(options = {}) {
     fetchImpl = globalThis.fetch,
     onLog = () => {},
     onState = () => {},
+    checkIntervalMinutes = DEFAULT_CHECK_INTERVAL_MINUTES,
+    initialCheckDelayMs = INITIAL_CHECK_DELAY_MINUTES * 60 * 1000,
+    timers = globalThis,
   } = options;
 
   const disabled = isDev || isSmoke || !app?.isPackaged || process.platform === 'linux';
@@ -142,6 +160,8 @@ function setupAutoUpdater(options = {}) {
     percent: 0,
     error: null,
     lastCheckedAt: null,
+    checkIntervalMinutes: normalizeCheckIntervalMinutes(checkIntervalMinutes),
+    initialCheckDelayMinutes: INITIAL_CHECK_DELAY_MINUTES,
   };
   const publish = (patch = {}) => {
     Object.assign(state, patch);
@@ -153,6 +173,12 @@ function setupAutoUpdater(options = {}) {
       enabled: false,
       getState: () => ({ ...state }),
       checkForUpdates: async () => ({ ...state }),
+      setCheckIntervalMinutes: (value) => {
+        const next = normalizeCheckIntervalMinutes(value);
+        if (next !== state.checkIntervalMinutes) publish({ checkIntervalMinutes: next });
+        return { ...state };
+      },
+      stopAutomaticChecks: () => {},
       downloadUpdate: async () => ({ ...state }),
       listRollbackReleases: async () => [],
       rollbackToVersion: async () => ({ ...state }),
@@ -163,6 +189,8 @@ function setupAutoUpdater(options = {}) {
   let downloading = false;
   let installAfterDownload = false;
   let rollbackTarget = null;
+  let initialCheckTimer = null;
+  let intervalTimer = null;
 
   const log = (level, msg) => {
     onLog({ at: Date.now(), level, msg });
@@ -172,6 +200,17 @@ function setupAutoUpdater(options = {}) {
   autoUpdater.autoInstallOnAppQuit = false;
   // 保留 electron-updater 的 blockmap 差分下载，减少更新时的网络流量。
   autoUpdater.disableDifferentialDownload = false;
+
+  const clearTimer = (timer) => {
+    if (timer !== null && typeof timers.clearTimeout === 'function') timers.clearTimeout(timer);
+  };
+  const clearIntervalTimer = (timer) => {
+    if (timer !== null && typeof timers.clearInterval === 'function') timers.clearInterval(timer);
+  };
+  const unrefTimer = (timer) => {
+    if (timer && typeof timer.unref === 'function') timer.unref();
+    return timer;
+  };
 
   const resetRollbackFeed = () => {
     rollbackTarget = null;
@@ -263,22 +302,65 @@ function setupAutoUpdater(options = {}) {
     log('error', `自动更新失败: ${err.message}`);
   });
 
+  const checkForUpdates = async () => {
+    if (checking || downloading) return { ...state };
+    checking = true;
+    publish({ status: 'checking', error: null });
+    try {
+      return await autoUpdater.checkForUpdates();
+    } catch (err) {
+      checking = false;
+      publish({ status: 'error', error: err.message, lastCheckedAt: Date.now() });
+      log('warn', `检查更新失败: ${err.message}`);
+      return { ...state };
+    }
+  };
+
+  const scheduleIntervalCheck = () => {
+    clearIntervalTimer(intervalTimer);
+    intervalTimer = null;
+    if (typeof timers.setInterval !== 'function') return;
+    intervalTimer = unrefTimer(timers.setInterval(
+      () => { void checkForUpdates(); },
+      state.checkIntervalMinutes * 60 * 1000,
+    ));
+  };
+
+  const scheduleAutomaticChecks = () => {
+    clearTimer(initialCheckTimer);
+    initialCheckTimer = null;
+    if (typeof timers.setTimeout !== 'function') return;
+    initialCheckTimer = unrefTimer(timers.setTimeout(async () => {
+      initialCheckTimer = null;
+      await checkForUpdates();
+      scheduleIntervalCheck();
+    }, Math.max(0, Number(initialCheckDelayMs) || 0)));
+  };
+
+  const stopAutomaticChecks = () => {
+    clearTimer(initialCheckTimer);
+    clearIntervalTimer(intervalTimer);
+    initialCheckTimer = null;
+    intervalTimer = null;
+  };
+
+  const setCheckIntervalMinutes = (value) => {
+    const next = normalizeCheckIntervalMinutes(value);
+    if (next !== state.checkIntervalMinutes) {
+      publish({ checkIntervalMinutes: next });
+      if (intervalTimer !== null) scheduleIntervalCheck();
+    }
+    return { ...state };
+  };
+
+  scheduleAutomaticChecks();
+
   return {
     enabled: true,
     getState: () => ({ ...state }),
-    async checkForUpdates() {
-      if (checking || downloading) return { ...state };
-      checking = true;
-      publish({ status: 'checking', error: null });
-      try {
-        return await autoUpdater.checkForUpdates();
-      } catch (err) {
-        checking = false;
-        publish({ status: 'error', error: err.message, lastCheckedAt: Date.now() });
-        log('warn', `检查更新失败: ${err.message}`);
-        return { ...state };
-      }
-    },
+    checkForUpdates,
+    setCheckIntervalMinutes,
+    stopAutomaticChecks,
     async listRollbackReleases() {
       if (checking || downloading) return [];
       return listRollbackReleases({ currentVersion: state.currentVersion, fetchImpl });

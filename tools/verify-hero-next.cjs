@@ -156,7 +156,7 @@ app.whenReady().then(async () => {
   win = new BrowserWindow({
     width: 1400, height: 900, show: false,
     webPreferences: {
-      preload: path.join(root, 'probe', 'hero-next-preload.cjs'),
+      preload: path.join(root, 'test', 'fixtures', 'hero-next-preload.cjs'),
       contextIsolation: true, nodeIntegration: false, backgroundThrottling: false,
     },
   });

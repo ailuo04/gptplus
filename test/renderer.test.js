@@ -961,6 +961,7 @@ test('更新状态变化时同步刷新设置页更新卡片', () => {
 
 test('提供商表单支持多模型行与从 /models 拉取', () => {
   const src = read(path.join(VIEWS, 'providers.js'));
+  const cssSrc = read(path.join(ROOT, 'src/renderer/styles.css'));
   assert.match(src, /fetchRemoteModels/, '表单必须调用 fetchRemoteModels');
   assert.match(src, /saveProvider/, '表单必须调用 saveProvider');
   assert.match(src, /testProvider/, '卡片必须调用 testProvider');
@@ -978,6 +979,8 @@ test('提供商表单支持多模型行与从 /models 拉取', () => {
   assert.match(src, /event\.preventDefault\(\)/, '拖拽导入必须阻止浏览器直接打开文件');
   assert.match(src, /provider-import-dropzone/, '导入弹窗必须提供拖拽接收区域');
   assert.match(src, /复制 API Key/, 'API Key 复制入口必须保留');
+  assert.match(cssSrc, /\.provider-file-drop-overlay\s*\{[\s\S]*?position:\s*fixed;[\s\S]*?align-items:\s*center;[\s\S]*?justify-content:\s*center;/, '窗口级拖拽覆盖层必须在窗口正中显示');
+  assert.match(cssSrc, /\.provider-file-drop-card\s*\{[\s\S]*?width:\s*min\(356px, 100%\);[\s\S]*?backdrop-filter:\s*blur\(28px\) saturate\(155%\)/, '提示必须使用紧凑尺寸的液态玻璃卡片');
 });
 
 test('设置页覆盖网关、探活、目录与还原注入', () => {
@@ -1934,7 +1937,7 @@ function callsOf(ctx, name) {
   return ctx._calls.filter((c) => c[0] === name);
 }
 
-test('提供商配置：系统账户字段加密文件点击和拖拽共用预览，覆盖必须再次确认', async () => {
+test('提供商配置：便携加密文件点击和拖拽共用预览，覆盖必须再次确认', async () => {
   const tmp = copyRendererToTemp();
   const transfer = require(path.join(ROOT, 'src/core/provider-transfer.js'));
   try {
@@ -1954,7 +1957,7 @@ test('提供商配置：系统账户字段加密文件点击和拖拽共用预�
       },
       isAvailable: () => true,
     };
-    const encrypted = transfer.encryptProviderConfigLocal(payload, secretStorage);
+    const encrypted = transfer.encryptProviderConfigPortable(payload);
     const source = () => ({ fileName: 'test.gptplus-providers', bytes: new Uint8Array(encrypted) });
     const file = () => ({ name: 'test.gptplus-providers', size: encrypted.length,
       arrayBuffer: async () => new Uint8Array(encrypted).buffer });
@@ -1992,26 +1995,53 @@ test('提供商配置：系统账户字段加密文件点击和拖拽共用预�
     let prevented = 0;
     const event = (files = []) => ({ dataTransfer: { types: ['Files'], files },
       preventDefault() { prevented += 1; }, stopPropagation() {} });
+    const dropOverlay = document.body.find('provider-file-drop-overlay')[0];
+    assert.ok(dropOverlay, '窗口级拖拽提示面板必须创建');
+    globalHandlers.get('dragenter')(event());
+    assert.equal(dropOverlay.hidden, false, '拖入文件时窗口必须显示接收态');
+    globalHandlers.get('dragenter')(event());
+    globalHandlers.get('dragleave')({ ...event(), relatedTarget: null });
+    assert.equal(dropOverlay.hidden, false, '窗口内部切换目标时不能提前清除接收态');
+    globalHandlers.get('dragleave')({ ...event(), relatedTarget: null });
+    assert.equal(dropOverlay.hidden, true, '拖出窗口后必须清除接收态');
+    globalHandlers.get('dragenter')(event());
+    prevented = 0;
     globalHandlers.get('dragover')(event());
-    globalHandlers.get('drop')(event([file()]));
-    assert.equal(prevented, 2, '窗口级拖拽保护也必须识别处于受保护模式的 Files 类型');
+    assert.equal(prevented, 1, '窗口级拖拽保护必须识别 Files 类型并阻止浏览器默认打开');
+    globalHandlers.get('dragend')(event());
+    assert.equal(dropOverlay.hidden, true, '拖拽取消后必须清除接收态');
+    globalHandlers.get('dragenter')(event());
+    globalHandlers.get('drop')(event());
+    assert.equal(dropOverlay.hidden, true, '无文件放下或取消时必须清除接收态');
 
-    for (const mode of ['pick', 'area-drop', 'dialog-drop']) {
-      if (mode === 'area-drop') root.find('provider-transfer-zone')[0].listeners.drop[0](event([file()]));
+    for (const mode of ['pick', 'area-drop', 'dialog-drop', 'window-drop']) {
+      if (mode === 'area-drop') {
+        globalHandlers.get('dragenter')(event());
+        root.find('provider-transfer-zone')[0].listeners.drop[0](event([file()]));
+        assert.equal(dropOverlay.hidden, true, '主页拖放区放下文件后必须清除窗口接收态');
+      }
+      else if (mode === 'window-drop') {
+        globalHandlers.get('dragenter')(event());
+        assert.equal(dropOverlay.hidden, false);
+        globalHandlers.get('drop')(event([file()]));
+        assert.equal(dropOverlay.hidden, true, '放下文件后必须清除接收态');
+      }
       else {
         click(buttonsWithText(actions, '导入配置')[0]);
         if (mode === 'pick') click(buttonsWithText(modal, '选择文件')[0]);
         else {
           const zone = modal.find('provider-import-dropzone')[0];
+          globalHandlers.get('dragenter')(event());
           zone.listeners.dragenter[0](event());
           assert.equal(zone.classList.contains('is-dragover'), true);
           zone.listeners.dragleave[0]({ relatedTarget: null });
           assert.equal(zone.classList.contains('is-dragover'), false);
           zone.listeners.drop[0](event([file()]));
+          assert.equal(dropOverlay.hidden, true, '弹窗拖放区放下文件后必须清除窗口接收态');
         }
       }
       await flush();
-      assert.equal(writes, mode === 'pick' ? 0 : mode === 'area-drop' ? 1 : 2);
+      assert.equal(writes, mode === 'pick' ? 0 : mode === 'area-drop' ? 1 : mode === 'dialog-drop' ? 2 : 3);
       assert.match(modal.allText(), /GPT-6.1 Sol/);
       assert.doesNotMatch(modal.allText(), /解密密码|导出时设置的密码/);
       assert.equal(byAttr(modal, 'type', 'password').length, 0, '配置导入不得要求文件密码');
@@ -2028,8 +2058,8 @@ test('提供商配置：系统账户字段加密文件点击和拖拽共用预�
       await flush();
       assert.equal(writes, beforeWrites + 1);
     }
-    assert.equal(inspections, 3);
-    assert.equal(preparations, 3);
+    assert.equal(inspections, 4);
+    assert.equal(preparations, 4);
 
     let reads = 0;
     const cases = [
@@ -2054,14 +2084,14 @@ test('提供商配置：系统账户字段加密文件点击和拖拽共用预�
     }]));
     await flush();
     assert.match(modal.allText(), /配置文件不是有效的 JSON 格式/);
-    assert.equal(writes, 3);
+    assert.equal(writes, 4);
     ctx.closeModal();
 
     let exported = null;
     ctx.api.exportProviderConfig = async (input) => {
       exported = input;
       assert.equal('password' in input, false, '导出接口不应再传文件密码');
-      transfer.encryptProviderConfigLocal(transfer.createExportPayload(state, input.providerIds), secretStorage);
+      transfer.encryptProviderConfigPortable(transfer.createExportPayload(state, input.providerIds));
       return { count: input.providerIds?.length || state.providers.length };
     };
     click(buttonsWithText(actions, '导出全部')[0]);

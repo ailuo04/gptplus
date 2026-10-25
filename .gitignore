@@ -2,7 +2,9 @@
 node_modules/
 dist/
 out/
-dist-release-check/
+dist-*/
+build/*-preview/
+build/nsis-temp*/
 
 # 运行时/探针产物（不进版本库）
 probe/

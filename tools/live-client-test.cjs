@@ -14,8 +14,17 @@ const catalogPath = path.join(home, 'catalog.json');
 fs.rmSync(home, { recursive: true, force: true });
 fs.mkdirSync(home, { recursive: true });
 
-// 复用已验证可通过校验的条目
-const proto = JSON.parse(fs.readFileSync(path.join(ROOT, 'probe', 'custom', 'my-catalog.json'), 'utf8'));
+// 直接用应用模块生成目录，不依赖以前探针留下的文件。
+const { createStore } = require('../src/core/store.js');
+const { createCatalog } = require('../src/core/catalog.js');
+const store = createStore({ configPath: path.join(home, 'config.json') });
+store.upsertProvider({
+  name: 'Proto', baseUrl: 'http://127.0.0.1:18122', api: 'responses', enabled: true,
+  models: [{ id: 'gpt-6.1-sol', label: 'Proto Model (test)', enabled: true }],
+});
+const proto = createCatalog({
+  store, paths: { CATALOG_PATH: catalogPath, CODEX_HOME: home },
+}).buildCatalogJson();
 proto.models[0].slug = 'p_test__gpt-6.1-sol';
 proto.models[0].display_name = 'Proto Model (test)';
 fs.writeFileSync(catalogPath, JSON.stringify(proto, null, 2), 'utf8');

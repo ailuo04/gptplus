@@ -32,7 +32,12 @@ test('Windows 打包配置使用稳定 appId、安全的内部文件名，并且
 test('release build requires signing and unsigned build is explicit', () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
   assert.match(pkg.scripts.dist, /build-release\.cjs/);
-  assert.match(pkg.scripts['dist:unsigned'], /electron-builder/);
+  assert.match(pkg.scripts['dist:unsigned'], /build-unsigned\.cjs/);
+  const unsignedBuild = fs.readFileSync(path.join(ROOT, 'tools', 'build-unsigned.cjs'), 'utf8');
+  assert.match(unsignedBuild, /TEMP: tempDir/);
+  assert.match(unsignedBuild, /TMP: tempDir/);
+  assert.match(unsignedBuild, /electron-builder', 'cli\.js/);
+  assert.match(unsignedBuild, /--config\.win\.signExecutable=false/);
   assert.match(pkg.scripts['verify:signature'], /verify-signature\.cjs/);
   assert.equal(pkg.build.win.signExecutable, true);
 });

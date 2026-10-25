@@ -15,15 +15,75 @@ const viewState = {
 };
 
 let providerDropGuardInstalled = false;
+let providerDropContext = null;
+let providerDropDepth = 0;
+let providerDropOverlay = null;
 
-function installProviderDropGuard() {
+function createProviderDropOverlay(ctx) {
+  if (providerDropOverlay || typeof document === 'undefined' || !document.body) return;
+  const { el, icon } = ctx;
+  providerDropOverlay = el('div', {
+    class: 'provider-file-drop-overlay',
+    attrs: { 'aria-hidden': 'true' },
+  }, [
+    el('div', { class: 'provider-file-drop-card' }, [
+      el('div', { class: 'provider-file-drop-icon' }, [icon('box', 19)]),
+      el('div', { class: 'provider-file-drop-title', text: '松开鼠标即可导入' }),
+      el('div', { class: 'provider-file-drop-hint', text: 'gpt++ 会检查文件并展示导入预览' }),
+    ]),
+  ]);
+  providerDropOverlay.hidden = true;
+  document.body.appendChild(providerDropOverlay);
+}
+
+function setProviderDropVisual(active) {
+  if (typeof document === 'undefined') return;
+  if (providerDropOverlay) providerDropOverlay.hidden = !active;
+}
+
+function clearProviderDropVisual() {
+  providerDropDepth = 0;
+  setProviderDropVisual(false);
+}
+
+export function installProviderDropGuard(ctx) {
+  providerDropContext = ctx;
+  createProviderDropOverlay(ctx);
   if (providerDropGuardInstalled || typeof window === 'undefined') return;
-  const guard = (event) => {
+  const isFileTransfer = (event) => {
     const transfer = event.dataTransfer;
-    if (transfer && (Array.from(transfer.types || []).includes('Files') || transfer.files?.length)) event.preventDefault();
+    return !!transfer && (Array.from(transfer.types || []).includes('Files') || transfer.files?.length);
   };
+  const handleDragEnter = (event) => {
+    if (!isFileTransfer(event)) return;
+    event.preventDefault();
+    providerDropDepth += 1;
+    setProviderDropVisual(true);
+  };
+  const guard = (event) => {
+    if (!isFileTransfer(event)) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+  };
+  const handleDragLeave = (event) => {
+    if (!isFileTransfer(event)) return;
+    event.preventDefault();
+    providerDropDepth = Math.max(0, providerDropDepth - 1);
+    if (!providerDropDepth) setProviderDropVisual(false);
+  };
+  const handleDrop = (event) => {
+    if (!isFileTransfer(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    clearProviderDropVisual();
+    const files = event.dataTransfer?.files;
+    if (files?.length && providerDropContext) void openImportDialog(providerDropContext, files);
+  };
+  window.addEventListener('dragenter', handleDragEnter);
   window.addEventListener('dragover', guard);
-  window.addEventListener('drop', guard);
+  window.addEventListener('dragleave', handleDragLeave);
+  window.addEventListener('drop', handleDrop);
+  window.addEventListener('dragend', clearProviderDropVisual);
   providerDropGuardInstalled = true;
 }
 
@@ -35,7 +95,7 @@ function installProviderDropGuard() {
  */
 export function renderProviders(root, ctx, actions) {
   const { el, icon, state } = ctx;
-  installProviderDropGuard();
+  installProviderDropGuard(ctx);
   const providers = state.providers || [];
   const providerIds = new Set(providers.map((provider) => provider.id));
   for (const id of Object.keys(viewState.selected)) {
@@ -125,6 +185,8 @@ function transferZone(ctx) {
       },
       drop: (event) => {
         event.preventDefault();
+        event.stopPropagation();
+        clearProviderDropVisual();
         zone.classList.remove('is-dragover');
         void openImportDialog(ctx, event.dataTransfer?.files);
       },
@@ -132,8 +194,8 @@ function transferZone(ctx) {
   }, [
     el('div', { class: 'provider-transfer-zone-icon' }, [icon('box', 17)]),
     el('div', { class: 'grow' }, [
-      el('div', { class: 'provider-transfer-zone-title', text: '拖入字段加密配置文件即可导入' }),
-      el('div', { class: 'hint', text: '支持点击选择文件；敏感字段只在系统安全存储解密通过后写入本机配置' }),
+      el('div', { class: 'provider-transfer-zone-title', text: '将便携加密配置文件拖入窗口任意位置即可导入' }),
+      el('div', { class: 'hint', text: '也可点击选择文件；完整配置由应用内解密后写入本机配置' }),
     ]),
     el('button', {
       class: 'btn btn-sm btn-ghost',
@@ -163,7 +225,7 @@ function emptyState(ctx) {
         class: 'btn btn-ghost',
         type: 'button',
         on: { click: () => openImportDialog(ctx) },
-      }, [icon('folder', 13), el('span', { text: '导入字段加密配置' })]),
+      }, [icon('folder', 13), el('span', { text: '导入便携加密配置' })]),
       el('button', {
         class: 'btn btn-ghost',
         type: 'button',
@@ -339,14 +401,14 @@ function fileBytes(file) {
   if (!file) return Promise.reject(new Error('没有选择文件'));
   const declaredSize = Number(file.size);
   if (Number.isFinite(declaredSize)) {
-    if (declaredSize === 0) return Promise.reject(new Error('字段加密配置文件为空'));
-    if (declaredSize > MAX_IMPORT_FILE_BYTES) return Promise.reject(new Error('字段加密配置文件超过大小限制'));
+    if (declaredSize === 0) return Promise.reject(new Error('便携加密配置文件为空'));
+    if (declaredSize > MAX_IMPORT_FILE_BYTES) return Promise.reject(new Error('便携加密配置文件超过大小限制'));
   }
   if (typeof file.arrayBuffer === 'function') {
     return file.arrayBuffer().then((buffer) => {
       const bytes = new Uint8Array(buffer);
-      if (bytes.length === 0) throw new Error('字段加密配置文件为空');
-      if (bytes.length > MAX_IMPORT_FILE_BYTES) throw new Error('字段加密配置文件超过大小限制');
+      if (bytes.length === 0) throw new Error('便携加密配置文件为空');
+      if (bytes.length > MAX_IMPORT_FILE_BYTES) throw new Error('便携加密配置文件超过大小限制');
       return bytes;
     });
   }
@@ -357,11 +419,11 @@ function fileBytes(file) {
       reader.onload = () => {
         const bytes = new Uint8Array(reader.result);
         if (bytes.length === 0) {
-          reject(new Error('字段加密配置文件为空'));
+          reject(new Error('便携加密配置文件为空'));
           return;
         }
         if (bytes.length > MAX_IMPORT_FILE_BYTES) {
-          reject(new Error('字段加密配置文件超过大小限制'));
+          reject(new Error('便携加密配置文件超过大小限制'));
           return;
         }
         resolve(bytes);
@@ -374,7 +436,7 @@ function fileBytes(file) {
 
 function importSourceFromFile(file) {
   if (!String(file?.name || '').toLowerCase().endsWith('.gptplus-providers')) {
-    return Promise.reject(new Error('请选择 .gptplus-providers 字段加密配置文件'));
+    return Promise.reject(new Error('请选择 .gptplus-providers 便携加密配置文件'));
   }
   return fileBytes(file).then((bytes) => ({
     fileName: String(file.name || ''),
@@ -463,7 +525,7 @@ function openExportDialog(ctx, initialIds = null) {
     ]),
     el('div', { class: 'note note-warn' }, [
       icon('alert', 14),
-      el('div', { class: 'grow', text: '文件本身保持可读取的 JSON；API Key、Base URL、请求头等敏感字段由当前系统账户加密后写入文件。只能在同一台电脑的同一 Windows 用户账户下导入。' }),
+      el('div', { class: 'grow', text: '文件外层保持可读取的 JSON，完整配置由应用内置密钥加密，不需要文件密码，可在安装同版本 gpt++ 的其他电脑导入。' }),
     ]),
   ]);
 
@@ -510,7 +572,7 @@ function openExportDialog(ctx, initialIds = null) {
     el('div', { class: 'modal-head' }, [
       el('div', { class: 'grow' }, [
         el('h2', { text: '导出提供商配置' }),
-        el('div', { class: 'modal-sub', text: '敏感字段加密后写入文件，不额外设置文件密码' }),
+        el('div', { class: 'modal-sub', text: '完整配置使用应用内置密钥加密，不额外设置文件密码' }),
       ]),
       el('button', { class: 'btn btn-icon', type: 'button', title: '关闭', attrs: { 'aria-label': '关闭' }, on: { click: () => ctx.closeModal() } }, [icon('x', 15)]),
     ]),
@@ -596,6 +658,7 @@ async function openImportDialog(ctx, initialFiles = null) {
     zone.addEventListener('drop', (event) => {
       event.preventDefault();
       event.stopPropagation();
+      clearProviderDropVisual();
       zone.classList.remove('is-dragover');
       void acceptFiles(event.dataTransfer?.files);
     });
@@ -633,7 +696,7 @@ async function openImportDialog(ctx, initialFiles = null) {
     if (state.busy || state.closed) return;
     const list = files ? Array.from(files) : [];
     if (list.length !== 1) {
-      setError(list.length > 1 ? '一次只能导入一个字段加密配置文件' : '请拖入一个字段加密配置文件');
+      setError(list.length > 1 ? '一次只能导入一个便携加密配置文件' : '请拖入一个便携加密配置文件');
       render();
       return;
     }
@@ -758,7 +821,7 @@ async function openImportDialog(ctx, initialFiles = null) {
   function renderChoose() {
     const zone = el('div', { class: 'provider-import-dropzone' }, [
       el('div', { class: 'provider-import-dropzone-icon' }, [icon('box', 22)]),
-      el('div', { class: 'provider-import-dropzone-title', text: '将字段加密配置文件拖到这里' }),
+      el('div', { class: 'provider-import-dropzone-title', text: '将便携加密配置文件拖到这里或窗口任意位置' }),
       el('div', { class: 'hint', text: '只允许单个 .gptplus-providers 文件' }),
       el('button', { class: 'btn btn-primary btn-sm', type: 'button', disabled: state.busy ? true : null, on: { click: () => void chooseFile() } }, [icon('folder', 13), el('span', { text: '选择文件' })]),
     ]);

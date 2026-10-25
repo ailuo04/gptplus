@@ -63,6 +63,10 @@ test('usage statusline script retains the composer placement, icons, and valid s
   assert.match(script, /if \(!document\.body\)/, 'must wait for body before observing');
   assert.match(script, /__gptplusUsageStatusline/);
   assert.match(script, /READY_WAIT_MS = 2000/);
+  assert.match(script, /gptplus-usage-statusline-v3/);
+  assert.match(script, /color:" \+ textColor \+ "!important/);
+  assert.match(script, /gptplus-usage-item svg\{flex:0 0 auto;opacity:1\}/);
+  assert.match(script, /data-stale=.*gptplus-usage-item\{opacity:\.55\}/);
   assert.doesNotMatch(script, /fetch\(endpoint/);
 });
 

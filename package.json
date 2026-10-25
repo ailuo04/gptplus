@@ -1,7 +1,7 @@
 {
   "name": "gptplus",
   "productName": "gpt++",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "为 ChatGPT 桌面客户端管理自定义模型提供商：本地网关 + 模型目录注入",
   "main": "src/main/main.js",
   "private": true,
@@ -20,7 +20,7 @@
     "dev": "electron . --dev",
     "pack": "electron-builder --dir",
     "dist": "node tools/build-release.cjs",
-    "dist:unsigned": "electron-builder --win nsis --publish never",
+    "dist:unsigned": "node tools/build-unsigned.cjs",
     "verify:signature": "node tools/verify-signature.cjs",
     "test": "node --test --test-concurrency=1 \"test/**/*.test.js\"",
     "test:core": "node --test test/core.test.js",

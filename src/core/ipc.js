@@ -3,7 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { normalizeModelLimits, normalizeTheme } = require('./store.js');
+const { normalizeModelLimits, normalizeTheme, normalizeUpdateSettings } = require('./store.js');
 const { normalizeBaseUrl } = require('./base-url.js');
 const { slugForProvider } = require('./model-utils.js');
 const { resolveChatGptExe } = require('./chatgpt-install.js');
@@ -22,7 +22,7 @@ const {
   FILE_EXTENSION,
   MAX_FILE_BYTES,
   createExportPayload,
-  encryptProviderConfigLocal,
+  encryptProviderConfigPortable,
   decryptProviderConfig,
   inspectProviderConfigFile,
   createImportPlan,
@@ -201,6 +201,15 @@ function registerIpc(deps) {
   });
   handle('gptplus:update:state', () => updater?.getState?.() || { enabled: false, status: 'disabled' });
   handle('gptplus:update:check', () => updater?.checkForUpdates?.() || { enabled: false, status: 'disabled' });
+  handle('gptplus:update:interval:set', (patch = {}) => {
+    const raw = patch && typeof patch === 'object' ? patch.checkIntervalMinutes : patch;
+    const next = normalizeUpdateSettings({ checkIntervalMinutes: raw }).checkIntervalMinutes;
+    if (Number(raw) !== next) throw new Error('自动检查间隔必须是 5-1440 分钟之间的整数');
+    store.update((draft) => {
+      draft.updates = { ...draft.updates, checkIntervalMinutes: next };
+    });
+    return updater?.setCheckIntervalMinutes?.(next) || { enabled: false, status: 'disabled', checkIntervalMinutes: next };
+  });
   handle('gptplus:update:download', () => updater?.downloadUpdate?.() || { enabled: false, status: 'disabled' });
   handle('gptplus:update:rollbacks', () => updater?.listRollbackReleases?.() || []);
   handle('gptplus:update:rollback', (version) => updater?.rollbackToVersion?.(version) || { enabled: false, status: 'disabled' });
@@ -323,7 +332,7 @@ function registerIpc(deps) {
   handle('gptplus:provider:export', async (input = {}) => {
     const providerIds = input && Array.isArray(input.providerIds) ? input.providerIds : null;
     const payload = createExportPayload(store.get(), providerIds);
-    const encrypted = encryptProviderConfigLocal(payload, secretStorage);
+    const encrypted = encryptProviderConfigPortable(payload);
     if (typeof dialog?.showSaveDialog !== 'function') throw new ProviderTransferError('UNAVAILABLE', '当前环境不支持导出配置文件');
 
     const defaultPath = path.join(
@@ -331,7 +340,7 @@ function registerIpc(deps) {
       `gptplus-providers-${dateFileStamp()}.${FILE_EXTENSION.slice(1)}`,
     );
     const picked = await dialog.showSaveDialog({
-      title: '导出提供商配置',
+      title: '导出便携提供商配置',
       defaultPath,
       filters: [{ name: 'gpt++ 提供商配置', extensions: [FILE_EXTENSION.slice(1)] }],
       properties: ['showOverwriteConfirmation', 'createDirectory'],
@@ -341,23 +350,23 @@ function registerIpc(deps) {
     let target = String(picked.filePath);
     if (!target.toLowerCase().endsWith(FILE_EXTENSION)) target += FILE_EXTENSION;
     writeBinaryAtomic(target, encrypted);
-    ctx.log({ level: 'info', msg: `已导出提供商配置（敏感字段加密，${payload.providers.length} 个）` });
+    ctx.log({ level: 'info', msg: `已导出提供商配置（便携加密，${payload.providers.length} 个）` });
     return { canceled: false, fileName: path.basename(target), count: payload.providers.length };
   });
 
   handle('gptplus:provider:import:pick', async () => {
     if (typeof dialog?.showOpenDialog !== 'function') throw new ProviderTransferError('UNAVAILABLE', '当前环境不支持选择配置文件');
     const picked = await dialog.showOpenDialog({
-      title: '选择字段加密提供商配置',
+      title: '选择便携加密提供商配置',
       properties: ['openFile'],
-      filters: [{ name: 'gpt++ 字段加密提供商配置', extensions: [FILE_EXTENSION.slice(1)] }],
+      filters: [{ name: 'gpt++ 便携加密提供商配置', extensions: [FILE_EXTENSION.slice(1)] }],
     });
     if (!picked || picked.canceled || !Array.isArray(picked.filePaths) || !picked.filePaths[0]) {
       return { canceled: true };
     }
     const filePath = picked.filePaths[0];
     if (!String(filePath).toLowerCase().endsWith(FILE_EXTENSION)) {
-      throw new ProviderTransferError('INVALID_FILE_TYPE', `请选择 ${FILE_EXTENSION} 字段加密配置文件`);
+      throw new ProviderTransferError('INVALID_FILE_TYPE', `请选择 ${FILE_EXTENSION} 便携加密配置文件`);
     }
     let bytes;
     try {
@@ -386,7 +395,6 @@ function registerIpc(deps) {
     const payload = decryptProviderConfig({
       fileName: input && input.fileName,
       bytes: input && input.bytes,
-      secretStorage,
     });
     const sessionId = rememberImportSession(payload);
     return {

@@ -1,7 +1,7 @@
 'use strict';
 
-// 提供商配置的字段级加密导入/导出。
-// 新格式是可读 JSON，每个提供商的 baseUrl、apiKey、headers 各自使用系统安全存储加密。
+// 提供商配置的整体加密导入/导出。
+// 文件保持可读 JSON，完整 payload 使用应用内置密钥进行便携式 AES-GCM 加密。
 // 该模块保持纯 Node CommonJS，方便在没有 Electron 的单元测试中覆盖。
 const crypto = require('node:crypto');
 const { normalizeConfig } = require('./store.js');
@@ -9,9 +9,19 @@ const { slugForProvider } = require('./model-utils.js');
 
 const FILE_FORMAT = 'gptplus-provider-config';
 const FILE_EXTENSION = '.gptplus-providers';
-const FILE_VERSION = 3;
+const FILE_VERSION = 4;
 const PAYLOAD_VERSION = 2;
-const SYSTEM_CIPHER = 'electron-safeStorage';
+const PORTABLE_CIPHER = 'gptplus-portable-aes-256-gcm';
+const PORTABLE_SCOPE = 'application';
+// This material is intentionally stable across machines and ordinary releases.
+// It is embedded in the application, so this format protects files at rest and
+// in transit from casual inspection, but does not hide secrets from a user who
+// can reverse-engineer the installed application.
+const PORTABLE_KEY_MATERIAL = 'gptplus-provider-config-portable-key-v1';
+const PORTABLE_KEY = crypto.createHash('sha256').update(PORTABLE_KEY_MATERIAL, 'utf8').digest();
+const PORTABLE_FIELD_VERSION = 1;
+const PORTABLE_IV_BYTES = 12;
+const PORTABLE_TAG_BYTES = 16;
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 
 class ProviderTransferError extends Error {
@@ -35,7 +45,7 @@ function deepCopy(value) {
 }
 
 function encode(value) {
-  // Base64url 仅用于 JSON 传输，密文由 Electron safeStorage 生成。
+  // Base64url 仅用于 JSON 传输，实际密文由 AES-GCM 生成。
   return Buffer.from(value).toString('base64url');
 }
 
@@ -57,7 +67,7 @@ function toBuffer(bytes) {
   if (bytes instanceof Uint8Array) return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   if (bytes instanceof ArrayBuffer) return Buffer.from(bytes);
   if (ArrayBuffer.isView(bytes)) return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  fail('INVALID_FILE', '没有收到有效的字段加密配置文件');
+  fail('INVALID_FILE', '没有收到有效的便携加密配置文件');
 }
 
 function fileExtension(name) {
@@ -68,7 +78,7 @@ function fileExtension(name) {
 
 function assertFileName(name) {
   if (!fileExtension(name)) {
-    fail('INVALID_FILE_TYPE', `请选择 ${FILE_EXTENSION} 字段加密配置文件`);
+    fail('INVALID_FILE_TYPE', `请选择 ${FILE_EXTENSION} 便携加密配置文件`);
   }
 }
 
@@ -267,107 +277,86 @@ function createExportPayload(config, providerIds = null) {
   };
 }
 
-function requireSystemStorage(secretStorage) {
-  if (!secretStorage || typeof secretStorage.encrypt !== 'function' || typeof secretStorage.decrypt !== 'function') {
-    fail('SECURE_STORAGE_UNAVAILABLE', '当前环境缺少系统安全存储，无法保护提供商配置');
-  }
-  if (typeof secretStorage.isAvailable === 'function') {
-    let available = false;
-    try { available = secretStorage.isAvailable() === true; } catch { available = false; }
-    if (!available) fail('SECURE_STORAGE_UNAVAILABLE', '当前系统安全存储不可用，无法保护提供商配置');
-  }
+function portableFieldAad(fieldName) {
+  return Buffer.from(`${FILE_FORMAT}:v${FILE_VERSION}:${fieldName}`, 'utf8');
 }
 
-function encryptSystemField(secretStorage, fieldName, value) {
+function encryptPortableField(fieldName, value) {
   const plaintext = Buffer.from(JSON.stringify({ version: 1, field: fieldName, value }), 'utf8');
+  const iv = crypto.randomBytes(PORTABLE_IV_BYTES);
   try {
-    const encrypted = toBuffer(secretStorage.encrypt(plaintext.toString('utf8')));
-    if (!encrypted.length) fail('ENCRYPTION_FAILED', '系统安全存储返回了空密文');
-    return encode(encrypted);
-  } catch (err) {
-    if (err instanceof ProviderTransferError) throw err;
-    fail('ENCRYPTION_FAILED', '系统安全存储加密失败，未导出配置');
+    const cipher = crypto.createCipheriv('aes-256-gcm', PORTABLE_KEY, iv);
+    cipher.setAAD(portableFieldAad(fieldName));
+    const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+    const packed = Buffer.concat([
+      Buffer.from([PORTABLE_FIELD_VERSION]),
+      iv,
+      cipher.getAuthTag(),
+      ciphertext,
+    ]);
+    return encode(packed);
+  } catch {
+    fail('ENCRYPTION_FAILED', '便携加密配置生成失败，未导出配置');
   } finally {
     plaintext.fill(0);
   }
 }
 
-function decryptSystemField(secretStorage, fieldName, value) {
-  const encrypted = decode(value, `${fieldName}.ciphertext`);
+function decryptPortableField(fieldName, value) {
+  const packed = decode(value, `${fieldName}.ciphertext`);
+  const minLength = 1 + PORTABLE_IV_BYTES + PORTABLE_TAG_BYTES + 1;
+  if (packed.length < minLength || packed[0] !== PORTABLE_FIELD_VERSION) {
+    fail('INVALID_FILE', '便携加密配置的字段密文格式无效');
+  }
+  const ivStart = 1;
+  const tagStart = ivStart + PORTABLE_IV_BYTES;
+  const ciphertextStart = tagStart + PORTABLE_TAG_BYTES;
+  const iv = packed.subarray(ivStart, tagStart);
+  const tag = packed.subarray(tagStart, ciphertextStart);
+  const ciphertext = packed.subarray(ciphertextStart);
   try {
-    const decoded = JSON.parse(String(secretStorage.decrypt(encrypted)));
-    if (!isPlainObject(decoded) || decoded.version !== 1 || decoded.field !== fieldName || !Object.hasOwn(decoded, 'value')) {
-      fail('INVALID_FILE', '系统安全存储中的字段密文格式无效');
+    const decipher = crypto.createDecipheriv('aes-256-gcm', PORTABLE_KEY, iv);
+    decipher.setAAD(portableFieldAad(fieldName));
+    decipher.setAuthTag(tag);
+    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    try {
+      const decoded = JSON.parse(plaintext.toString('utf8'));
+      if (!isPlainObject(decoded) || decoded.version !== 1 || decoded.field !== fieldName || !Object.hasOwn(decoded, 'value')) {
+        fail('INVALID_FILE', '便携加密配置中的字段格式无效');
+      }
+      return decoded.value;
+    } finally {
+      plaintext.fill(0);
     }
-    return decoded.value;
   } catch (err) {
     if (err instanceof ProviderTransferError) throw err;
-    fail('DECRYPT_FAILED', '此文件无法由当前系统账户解密，或文件已损坏');
+    fail('DECRYPT_FAILED', '便携加密配置无法解密，文件可能已损坏或版本不兼容');
   }
 }
 
-function encryptProviderConfigLocal(payload, secretStorage) {
-  requireSystemStorage(secretStorage);
+function encryptProviderConfigPortable(payload) {
   const valid = validatePayload(payload);
-  const providers = valid.providers.map((provider) => ({
-    id: provider.id,
-    name: provider.name,
-    api: provider.api,
-    enabled: provider.enabled,
-    models: provider.models,
-    secrets: {
-      baseUrl: encryptSystemField(secretStorage, 'baseUrl', provider.baseUrl),
-      apiKey: encryptSystemField(secretStorage, 'apiKey', provider.apiKey),
-      headers: encryptSystemField(secretStorage, 'headers', provider.headers),
-    },
-  }));
   const envelope = {
     format: FILE_FORMAT,
     version: FILE_VERSION,
-    encryption: SYSTEM_CIPHER,
-    scope: 'current-system-user',
-    providers,
-    modelOrder: valid.modelOrder,
-    defaultModelRef: valid.defaultModelRef,
-    injectEnabled: valid.injectEnabled,
+    encryption: PORTABLE_CIPHER,
+    scope: PORTABLE_SCOPE,
+    payload: encryptPortableField('payload', valid),
   };
   const bytes = Buffer.from(JSON.stringify(envelope, null, 2) + '\n', 'utf8');
   if (bytes.length > MAX_FILE_BYTES) fail('FILE_TOO_LARGE', '配置文件超过大小限制');
   return bytes;
 }
 
-function decryptProviderConfigV3({ envelope, secretStorage }) {
-  requireSystemStorage(secretStorage);
-  if (envelope.encryption !== SYSTEM_CIPHER || envelope.scope !== 'current-system-user') {
-    fail('UNSUPPORTED_ALGORITHM', '不支持的系统安全存储格式');
+function decryptProviderConfigV4({ envelope }) {
+  if (envelope.encryption !== PORTABLE_CIPHER || envelope.scope !== PORTABLE_SCOPE) {
+    fail('UNSUPPORTED_ALGORITHM', '不支持的便携加密配置格式');
   }
-  if (!Array.isArray(envelope.providers)) fail('INVALID_FILE', '配置文件缺少提供商列表');
-  const providers = envelope.providers.map((item, idx) => {
-    if (!isPlainObject(item) || !isPlainObject(item.secrets)) {
-      fail('INVALID_FILE', `第 ${idx + 1} 个提供商的密文格式无效`);
-    }
-    return {
-      id: item.id,
-      name: item.name,
-      api: item.api,
-      enabled: item.enabled,
-      models: item.models,
-      baseUrl: decryptSystemField(secretStorage, 'baseUrl', item.secrets.baseUrl),
-      apiKey: decryptSystemField(secretStorage, 'apiKey', item.secrets.apiKey),
-      headers: decryptSystemField(secretStorage, 'headers', item.secrets.headers),
-    };
-  });
-  return validatePayload({
-    format: FILE_FORMAT,
-    version: PAYLOAD_VERSION,
-    providers,
-    modelOrder: envelope.modelOrder,
-    defaultModelRef: envelope.defaultModelRef,
-    injectEnabled: envelope.injectEnabled,
-  });
+  const payload = decryptPortableField('payload', envelope.payload);
+  return validatePayload(payload);
 }
 
-function decryptProviderConfig({ fileName, bytes, secretStorage } = {}) {
+function decryptProviderConfig({ fileName, bytes } = {}) {
   assertFileName(fileName);
   const raw = toBuffer(bytes);
   assertFileSize(raw);
@@ -381,7 +370,7 @@ function decryptProviderConfig({ fileName, bytes, secretStorage } = {}) {
   if (!isPlainObject(envelope)) fail('INVALID_FILE', '配置文件结构无效');
   if (envelope.format !== FILE_FORMAT) fail('INVALID_FILE', '不是 gpt++ 提供商配置文件');
   if (envelope.version !== FILE_VERSION) fail('UNSUPPORTED_VERSION', '不支持的配置文件版本');
-  return decryptProviderConfigV3({ envelope, secretStorage });
+  return decryptProviderConfigV4({ envelope });
 }
 
 function inspectProviderConfigFile({ fileName, bytes } = {}) {
@@ -392,18 +381,16 @@ function inspectProviderConfigFile({ fileName, bytes } = {}) {
   try { envelope = JSON.parse(raw.toString('utf8')); } catch { fail('INVALID_FILE', '配置文件不是有效的 JSON 格式'); }
   if (!isPlainObject(envelope)) fail('INVALID_FILE', '配置文件结构无效');
   if (envelope.format !== FILE_FORMAT) fail('INVALID_FILE', '不是 gpt++ 提供商配置文件');
-  if (envelope.version !== FILE_VERSION) {
-    fail('UNSUPPORTED_VERSION', '不支持的配置文件版本');
-  }
-  if (envelope.version === FILE_VERSION && envelope.encryption !== SYSTEM_CIPHER) {
-    fail('UNSUPPORTED_ALGORITHM', '不支持的系统安全存储格式');
+  if (envelope.version !== FILE_VERSION) fail('UNSUPPORTED_VERSION', '不支持的配置文件版本');
+  if (envelope.encryption !== PORTABLE_CIPHER || envelope.scope !== PORTABLE_SCOPE) {
+    fail('UNSUPPORTED_ALGORITHM', '不支持的便携加密配置格式');
   }
   return {
     format: FILE_FORMAT,
     version: envelope.version,
-    cipher: SYSTEM_CIPHER,
+    cipher: PORTABLE_CIPHER,
     requiresPassword: false,
-    portable: false,
+    portable: true,
     size: raw.length,
   };
 }
@@ -612,7 +599,7 @@ module.exports = {
   PAYLOAD_VERSION,
   MAX_FILE_BYTES,
   createExportPayload,
-  encryptProviderConfigLocal,
+  encryptProviderConfigPortable,
   decryptProviderConfig,
   inspectProviderConfigFile,
   createImportPlan,

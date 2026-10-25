@@ -131,6 +131,7 @@ contextBridge.exposeInMainWorld('gptplus', {
   // 软件更新
   getUpdateState: () => invoke('gptplus:update:state'),
   checkForUpdates: () => invoke('gptplus:update:check'),
+  setUpdateCheckInterval: (patch) => invoke('gptplus:update:interval:set', patch),
   downloadUpdate: () => invoke('gptplus:update:download'),
   listRollbackReleases: () => invoke('gptplus:update:rollbacks'),
   rollbackToVersion: (version) => invoke('gptplus:update:rollback', version),

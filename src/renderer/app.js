@@ -5,7 +5,7 @@
 //   2. 代码中唯一的 innerHTML 用法是 ICONS 表里的静态图标字面量（见 icon()）。
 //   3. 没有远程资源：无 fetch、无外部字体、无 CDN（CSP 也是 default-src 'none'）。
 
-import { renderProviders, openProviderForm, closeProviderForm } from './views/providers.js';
+import { renderProviders, openProviderForm, closeProviderForm, installProviderDropGuard } from './views/providers.js';
 import { dragRowOffsets, dragTargetIndex, renderModels, reorderModelKeys } from './views/models.js';
 import { renderUsage, usageRows } from './views/usage.js';
 import { openPeerSettings, renderSettings } from './views/settings.js';
@@ -365,6 +365,8 @@ const state = {
     rollbackTarget: null,
     rollbackReleases: null,
     lastCheckedAt: null,
+    checkIntervalMinutes: 60,
+    initialCheckDelayMinutes: 2,
   },
   loaded: { status: false, providers: false, models: false, modelLimits: false, gateway: false, inject: false, peer: false, startup: false, update: false, logs: false, usage: false, weixin: false, plugins: false },
 };
@@ -1990,6 +1992,7 @@ async function boot() {
   }
   api = window.gptplus;
   ctx.api = api;
+  installProviderDropGuard(ctx);
 
   // 先接收状态广播，网关在主进程后台启动时不会错过状态更新。
   subscribe();

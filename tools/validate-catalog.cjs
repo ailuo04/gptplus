@@ -6,6 +6,7 @@ const { spawnSync } = require('child_process');
 const CODEX = 'C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.930.2377.0_x64__2p2nqsd0c76g0\\app\\resources\\codex.exe';
 const home = 'C:\\ailuo_own\\gpt++\\probe\\custom';
 const catalogPath = path.join(home, 'my-catalog.json');
+fs.mkdirSync(home, { recursive: true });
 
 const cache = JSON.parse(fs.readFileSync('C:\\Users\\ailuo\\.codex\\models_cache.json', 'utf8'));
 const donor = cache.models.find((m) => m.slug === 'gpt-5.5') || cache.models[0];

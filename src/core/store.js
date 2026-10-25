@@ -13,6 +13,9 @@ const DEFAULT_CONTEXT_WINDOW = 1_000_000;
 const DEFAULT_AUTO_COMPACT_TOKEN_LIMIT = null;
 const KEEP_BACKUPS = 10;
 const DEFAULT_STARTUP_TARGET = 'gptplus';
+const DEFAULT_UPDATE_INTERVAL_MINUTES = 60;
+const MIN_UPDATE_INTERVAL_MINUTES = 5;
+const MAX_UPDATE_INTERVAL_MINUTES = 1440;
 const SECURE_SECRET_VERSION = 1;
 const MAX_SECURE_SECRET_BYTES = 1024 * 1024;
 
@@ -101,6 +104,17 @@ function normalizeModelLimits(raw) {
   }
 
   return { contextWindow, autoCompactTokenLimit };
+}
+
+function normalizeUpdateSettings(raw) {
+  const src = isPlainObject(raw) ? raw : {};
+  const candidate = Number(src.checkIntervalMinutes);
+  const checkIntervalMinutes = Number.isInteger(candidate)
+    && candidate >= MIN_UPDATE_INTERVAL_MINUTES
+    && candidate <= MAX_UPDATE_INTERVAL_MINUTES
+    ? candidate
+    : DEFAULT_UPDATE_INTERVAL_MINUTES;
+  return { checkIntervalMinutes };
 }
 
 function normalizeModelOrder(raw) {
@@ -328,6 +342,7 @@ function normalizeConfig(raw) {
       token: typeof g.token === 'string' ? g.token : randomToken(),
     },
     modelLimits: normalizeModelLimits(src.modelLimits),
+    updates: normalizeUpdateSettings(src.updates),
     modelOrder: normalizeModelOrder(src.modelOrder),
     inject: {
       enabled: inj.enabled === true,
@@ -360,6 +375,7 @@ function defaultConfig() {
     network: { proxyMode: DEFAULT_PROXY_MODE },
     gateway: { enabled: true, port: DEFAULT_PORT, host: DEFAULT_HOST, token: randomToken() },
     modelLimits: { contextWindow: DEFAULT_CONTEXT_WINDOW, autoCompactTokenLimit: DEFAULT_AUTO_COMPACT_TOKEN_LIMIT },
+    updates: { checkIntervalMinutes: DEFAULT_UPDATE_INTERVAL_MINUTES },
     modelOrder: [],
     inject: { enabled: false, catalogPath: null, defaultModel: null },
     chatgpt: { executablePath: null },
@@ -829,6 +845,7 @@ module.exports = {
   normalizeProvider,
   normalizeTheme,
   normalizeModelLimits,
+  normalizeUpdateSettings,
   normalizeModelOrder,
   normalizeWeixin,
   normalizePlugins,
@@ -837,5 +854,8 @@ module.exports = {
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_AUTO_COMPACT_TOKEN_LIMIT,
   DEFAULT_STARTUP_TARGET,
+  DEFAULT_UPDATE_INTERVAL_MINUTES,
+  MIN_UPDATE_INTERVAL_MINUTES,
+  MAX_UPDATE_INTERVAL_MINUTES,
   normalizeStartupTarget,
 };

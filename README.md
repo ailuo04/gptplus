@@ -124,6 +124,11 @@ node tools\verify-picker.cjs    # 决定性验证：用真实客户端 app-serve
 node tools\live-client-test.cjs # 真机：真实客户端经本地网关拿回复
 ```
 
+`test/` 是正式回归测试，`test/fixtures/` 保存验证所需的固定夹具，不属于可删除的临时文件。
+`probe/` 只保存可重新生成的日志、截图和隔离测试数据；不运行验证时可以整体清空。
+`dist/` 保存打包产物，其他 `dist-*/` 与 `build/*-preview/` 是可清理的临时构建目录。
+应用运行所需的代码和资源均在 `src/`，实际用户配置位于上文列出的用户目录中。
+
 架构、接口契约与实测结论见 [spec.md](spec.md)；
 桌面端机制调研见 [research/desktop-model-picker.md](research/desktop-model-picker.md)
 与 [research/codex-gateway-protocol.md](research/codex-gateway-protocol.md)；

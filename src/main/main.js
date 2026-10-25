@@ -105,6 +105,7 @@ let isQuitting = false;
 let windowReady = false;
 /** @type {any} */
 let ctx = null; // { store, gateway, injector, codex, catalog, providerClient }
+let updaterController = null;
 
 function showWindow() {
   if (!win || win.isDestroyed()) {
@@ -423,8 +424,12 @@ function createWindow() {
             apiKeys: window.gptplus ? Object.keys(window.gptplus) : [],
           };
         })()`);
-        if (smokeDump) fs.writeFileSync(smokeDump, JSON.stringify(report, null, 2), 'utf8');
+        if (smokeDump) {
+          fs.mkdirSync(path.dirname(path.resolve(smokeDump)), { recursive: true });
+          fs.writeFileSync(smokeDump, JSON.stringify(report, null, 2), 'utf8');
+        }
         if (smokeShot) {
+          fs.mkdirSync(path.dirname(path.resolve(smokeShot)), { recursive: true });
           const img = await win.webContents.capturePage();
           fs.writeFileSync(smokeShot, img.toPNG());
         }
@@ -482,12 +487,14 @@ async function boot() {
     isDev,
     isSmoke,
     fetchImpl: ctx.network,
+    checkIntervalMinutes: ctx.store.get().updates.checkIntervalMinutes,
     onState: (state) => broadcast('gptplus:update', state),
     onLog: (entry) => {
       ctx.log?.(entry);
       broadcast('gptplus:log', entry);
     },
   });
+  updaterController = updater;
 
   void cleanupInstalledUpdateCache({ app }).then((cleaned) => {
     if (cleaned) ctx.log?.({ at: Date.now(), level: 'info', msg: '已清理已安装版本的更新缓存' });
@@ -510,12 +517,6 @@ async function boot() {
   migrateStartupSettings();
   createWindow();
   createTray();
-  if (updater.enabled) {
-    // 启动即检测：checkForUpdates 是纯异步网络请求，不会拖慢首屏；
-    // 窗口尚未加载完时渲染层会在 boot 里通过 getUpdateState 补读最新状态。
-    void updater.checkForUpdates();
-  }
-
   // 网关启动需要等待端口监听，不应阻塞窗口和首屏；完成后再广播最新状态。
   const gatewayReady = (async () => {
     try {
@@ -574,6 +575,7 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   isQuitting = true;
+  updaterController?.stopAutomaticChecks?.();
   if (tray) {
     tray.destroy();
     tray = null;

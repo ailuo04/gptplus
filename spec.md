@@ -168,13 +168,13 @@ C:\ailuo_own\gpt++\
 
 ### 4.1 提供商配置传输文件
 
-- 扩展名为 `.gptplus-providers`；外层 JSON 的 `format` 为 `gptplus-provider-config`，`version` 为 `3`。
-- 文件本身保持可读取的 JSON。名称、模型列表、接口协议、启用状态、模型顺序和默认模型保持明文；每个提供商的 Base URL、API Key、请求头分别通过 Electron `safeStorage` 加密后以 base64url 写入 `secrets`。
-- 导出和导入不要求、不接收、也不保存文件密码；文件不是整体加密包。系统安全存储不可用时直接拒绝导出或导入，不回退到明文。
-- 文件绑定当前系统账户，不能作为跨电脑或跨 Windows 用户的可移植备份；界面必须明确提示这一点。导入在同一台电脑的同一系统账户下自动解密。
-- 最大文件大小为 2 MiB。点击选择和拖拽都经相同的主进程扩展名、大小、结构、版本、系统安全存储和字段校验后生成脱敏预览；一次仅接受一个文件。
+- 扩展名为 `.gptplus-providers`；外层 JSON 的 `format` 为 `gptplus-provider-config`，`version` 为 `4`。
+- 文件本身保持可读取的 JSON，但只保留格式、版本、加密算法、作用域和整体 `payload` 密文；提供商名称、模型列表、Base URL、API Key、请求头、模型顺序和默认模型全部位于 payload 内。
+- 导出和导入不要求、不接收、也不保存文件密码；payload 使用应用内置密钥通过 AES-256-GCM 加密，并使用随机 nonce 和认证标签，密文被修改时导入失败。
+- 文件使用稳定的应用级密钥，不绑定电脑或 Windows 用户；安装兼容版本的 gpt++ 后可在其他电脑导入。密钥随应用发布，因此该格式主要防止文件被直接查看，不能防止能够分析应用程序的用户取得 API Key。
+- 最大文件大小为 2 MiB。点击选择和拖拽都经相同的主进程扩展名、大小、结构、版本、便携密钥和字段校验后生成脱敏预览；一次仅接受一个文件。
 - 解密后的完整配置只在主进程导入会话中暂存（5 分钟过期），预览不返回 API Key、Base URL 或请求头。写入前确认新增、自动改名新增、覆盖或跳过；覆盖需要额外确认，目标变化后必须重新预览。
-- 只接受当前版本 `3`；旧版密码文件、旧版整体密文、旧版明文 JSON 和不支持的加密参数直接拒绝，不做兼容迁移。
+- 只接受当前版本 `4`；旧版系统账户密文、旧版密码文件、旧版整体密文、旧版明文 JSON 和不支持的加密参数直接拒绝，不做兼容迁移。后续版本在未主动修改传输协议时继续兼容 v4。
 - 保留本机回环地址的无认证提供商兼容：显式空 API Key 仅允许 localhost、127.0.0.1、::1；缺少字段或远端提供商空 Key 都拒绝。
 - 导入用同步内存事务暂存配置和默认模型更新，注入同步成功后只进行一次原子配置落盘。失败保留原提供商配置；注入外部文件恢复失败时单独报告。
 
@@ -188,6 +188,12 @@ C:\ailuo_own\gpt++\
 - `remoteSync.connections[]` 的 Base URL 与授权 token 仅在内存中解密使用，磁盘通过 Electron `safeStorage` 加密；不提供安全存储时拒绝保存。远端模型及同步状态保存在 `remoteSync.sources[]`，不写回本地 providers。
 - 首次发现的远端模型以来源 ID、来源提供商 ID 和原始模型 ID 稳定区分，默认禁用；本机显示名、启用决定和隐藏记录由接收端独立保存。同步成功时缺失模型保留且标记未检测到；失败或不完整响应仅更新连接错误，不改变旧清单。恢复出现时保留本地偏好。删除只在本机隐藏，后续同步不会重新显示，可手动恢复。
 - 所有新配置均可缺省读取为以上默认值；旧配置升级不改变既有提供商、模型、启用状态、模型顺序或注入设置。
+
+### 4.3 软件更新检查
+
+- 自动更新不会在应用启动时立即访问网络；启动后等待 2 分钟进行首次检查，之后按 `updates.checkIntervalMinutes` 定时检查，默认 60 分钟，范围 5-1440 分钟。
+- 自动检查只查询版本，不自动下载或安装；发现新版本后仍由用户确认下载和安装。设置页的手动检查仍立即执行。
+- `updates.checkIntervalMinutes` 持久化到本地配置；修改后立即重排后续定时器。未主动改变调度协议的后续版本继续读取该配置。
 
 `~/.codex/config.toml`：只增量维护 **我们自己的** 段落，其它内容原样保留：
 
@@ -283,7 +289,7 @@ window.gptplus = {
   deleteProvider(id: string): Promise<Provider[]>;
   exportProviderConfig(input: { providerIds?: string[]|null }): Promise<{ canceled: boolean; count?: number }>;
   pickProviderImportFile(): Promise<{ canceled: boolean; fileName?: string; bytes?: Uint8Array }>;
-  inspectProviderImport(input: { fileName: string; bytes: Uint8Array }): Promise<{ version: number; size: number; requiresPassword: false; portable: false }>;
+  inspectProviderImport(input: { fileName: string; bytes: Uint8Array }): Promise<{ version: number; size: number; requiresPassword: false; portable: true }>;
   prepareProviderImport(input: { fileName: string; bytes: Uint8Array }): Promise<{ sessionId: string; preview: object }>;
   applyProviderImport(input: { sessionId: string; decisions: { sourceId: string; action: 'add'|'overwrite'|'skip' }[]; overwriteConfirmed?: boolean }): Promise<{ providers: Provider[]; counts: object; status: Status }>;
   cancelProviderImport(sessionId: string): Promise<{ canceled: boolean }>;
@@ -306,6 +312,10 @@ window.gptplus = {
   deleteRemoteModel(patch: { providerId:string; modelId:string }): Promise<Status>; // 本机隐藏
   restoreRemoteModel(patch: { providerId:string; modelId:string }): Promise<Status>;
   setRemoteModelLabel(patch: { providerId:string; modelId:string; label:string }): Promise<Status>;
+
+  getUpdateState(): Promise<{ enabled: boolean; status: string; checkIntervalMinutes: number; initialCheckDelayMinutes: 2 }>;
+  checkForUpdates(): Promise<object>;                 // 用户手动立即检查
+  setUpdateCheckInterval(patch: { checkIntervalMinutes: number }): Promise<object>;
 
   listModels(): Promise<ModelRef[]>;                    // 全部 provider 的全部模型（渠道名 slug 化，按 modelOrder）
   setModelEnabled(patch: { providerId: string; modelId: string; enabled: boolean }): Promise<Status>;
