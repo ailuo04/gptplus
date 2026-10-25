@@ -8,6 +8,7 @@ const { normalizeBaseUrl } = require('./base-url.js');
 const { slugForProvider } = require('./model-utils.js');
 const { resolveChatGptExe } = require('./chatgpt-install.js');
 const { relaunchChatGpt } = require('./chatgpt-launch.js');
+const { launchChatGptWithUsageStatusline } = require('./chatgpt-statusline.js');
 const { redactDiagnostic } = require('./redact.js');
 const {
   hashPeerToken,
@@ -118,6 +119,7 @@ function dateFileStamp(date = new Date()) {
 function registerIpc(deps) {
   const { ipcMain, shell, dialog, clipboard, secretStorage, ctx, updater, startup, onStatus = () => {}, onLog = () => {} } = deps;
   const { store } = ctx;
+  const plugins = ctx.plugins || null;
   const importSessions = new Map();
   const IMPORT_SESSION_TTL = 5 * 60 * 1000;
 
@@ -175,6 +177,28 @@ function registerIpc(deps) {
 
   // ---- 状态 ----
   handle('gptplus:status:get', () => ctx.status());
+  handle('gptplus:plugin:list', () => plugins ? plugins.list() : []);
+  handle('gptplus:plugin:install', (id) => {
+    if (!plugins) throw new Error('插件管理器不可用');
+    return plugins.install(id);
+  });
+  handle('gptplus:plugin:uninstall', async (id) => {
+    if (!plugins) throw new Error('插件管理器不可用');
+    const plugin = plugins.get(id);
+    if (plugin.id === 'weixin') await ctx.weixinConnect?.stop?.({ persist: false });
+    return plugins.uninstall(id);
+  });
+  handle('gptplus:plugin:enabled:set', async (patch = {}) => {
+    if (!plugins) throw new Error('插件管理器不可用');
+    const id = String(patch.id || '').trim();
+    const enabled = patch.enabled === true;
+    if (!enabled && id === 'weixin') await ctx.weixinConnect?.stop?.({ persist: false });
+    return plugins.setEnabled(id, enabled);
+  });
+  handle('gptplus:plugin:config:set', (patch = {}) => {
+    if (!plugins) throw new Error('插件管理器不可用');
+    return plugins.setConfig(String(patch.id || '').trim(), patch.config);
+  });
   handle('gptplus:update:state', () => updater?.getState?.() || { enabled: false, status: 'disabled' });
   handle('gptplus:update:check', () => updater?.checkForUpdates?.() || { enabled: false, status: 'disabled' });
   handle('gptplus:update:download', () => updater?.downloadUpdate?.() || { enabled: false, status: 'disabled' });
@@ -650,106 +674,98 @@ function registerIpc(deps) {
     return updateRemoteModel(providerId, modelId, (model) => { model.label = next; model.customLabel = next; });
   });
 
-  // ---- QQ 远程助手 ----
-  async function qqBotView() {
-    const cfg = store.get().qqbot;
-    const state = ctx.gateway.getState();
-    let codex = null;
-    try {
-      codex = await ctx.taskCenter.resolveCodex();
-    } catch (err) {
-      codex = { path: '', source: '', error: err.message };
-    }
+  // ---- 微信连接（iLink） ----
+  function requireWeixinPlugin() {
+    if (plugins && !plugins.isActive('weixin')) throw new Error('微信连接插件未启用');
+  }
+
+  function weixinView() {
+    const cfg = store.get().weixin;
     return {
-      enabled: !!cfg.enabled,
-      apiUrl: cfg.apiUrl,
-      accessToken: cfg.accessToken,
-      eventToken: cfg.eventToken,
-      notifyQq: cfg.notifyQq,
-      ownerQq: cfg.ownerQq,
-      progressMinutes: cfg.progressMinutes,
-      codexPath: cfg.codexPath,
-      workspaceDir: cfg.workspaceDir,
-      autoLaunch: !!cfg.autoLaunch,
-      launchCommand: cfg.launchCommand,
-      launchQq: cfg.launchQq,
-      launch: ctx.qqBot.getLaunchState(),
-      // 启动命令未配置时才探测，给界面「检测到 xxx · 填入」提示用
-      detectedLaunch: cfg.launchCommand ? '' : (ctx.qqBot.detectNapCatCommand()?.command || ''),
-      webhookUrl: ctx.qqBot.webhookUrl(),
-      gatewayRunning: !!state.running,
-      codex,
-      install: ctx.napcatInstaller ? ctx.napcatInstaller.getState() : null,
+      ...cfg,
+      status: ctx.weixinConnect.getStatus(),
     };
   }
 
-  handle('gptplus:qqbot:get', () => qqBotView());
-  // 轻量接口：QQ 页 8 秒轮询兜底刷新拉起状态（事件丢失时也能跟回真实状态）
-  handle('gptplus:qqbot:launch:state', () => ctx.qqBot.getLaunchState());
+  handle('gptplus:weixin:get', () => weixinView());
+  handle('gptplus:weixin:status', () => ctx.weixinConnect.getStatus());
 
-  handle('gptplus:qqbot:set', async (patch = {}) => {
-    const current = store.get().qqbot;
+  handle('gptplus:weixin:set', (patch = {}) => {
+    const current = store.get().weixin;
     const next = { ...current };
-    for (const key of ['apiUrl', 'accessToken', 'eventToken', 'notifyQq', 'ownerQq', 'codexPath', 'workspaceDir', 'launchCommand']) {
+    for (const key of ['baseUrl', 'token', 'accountId', 'allowFrom', 'routeTag', 'workDir', 'model', 'codexPath']) {
       if (patch[key] !== undefined) next[key] = String(patch[key] ?? '').trim();
     }
-    if (patch.progressMinutes !== undefined) {
-      const minutes = Number(patch.progressMinutes);
-      if (!Number.isInteger(minutes) || minutes < 1 || minutes > 120) {
-        throw new Error('进度通知间隔必须是 1-120 之间的整数分钟');
+    if (patch.sandbox !== undefined) {
+      if (!['read-only', 'workspace-write', 'danger-full-access'].includes(patch.sandbox)) {
+        throw new Error('无效的沙箱权限');
       }
-      next.progressMinutes = minutes;
+      next.sandbox = patch.sandbox;
     }
     if (patch.enabled !== undefined) next.enabled = patch.enabled === true;
-    if (patch.autoLaunch !== undefined) next.autoLaunch = patch.autoLaunch === true;
-    if (next.apiUrl && !/^https?:\/\//i.test(next.apiUrl)) throw new Error('NapCat 服务地址必须是 http(s) URL');
-    if (next.notifyQq && !/^\d{4,14}$/.test(next.notifyQq)) throw new Error('通知 QQ 必须是 4-14 位数字');
-    if (next.ownerQq && !/^\d{4,14}$/.test(next.ownerQq)) throw new Error('主人 QQ 必须是 4-14 位数字');
-    if (next.launchQq && !/^\d{4,14}$/.test(next.launchQq)) throw new Error('快速登录 QQ 必须是 4-14 位数字');
-    if (next.enabled && !next.notifyQq) throw new Error('开启前请先填写通知 QQ');
-    if (next.enabled && !store.get().gateway.enabled) throw new Error('QQ 远程助手依赖本地网关上报与控制通道，请先启用网关');
+    if (next.baseUrl && !/^https?:\/\//i.test(next.baseUrl)) throw new Error('iLink API 地址必须是 http(s) URL');
+    next.baseUrl = next.baseUrl.replace(/\/+$/, '');
+    if (next.enabled && !next.token) throw new Error('请先扫码登录微信');
 
     store.update((draft) => {
-      draft.qqbot = next;
+      draft.weixin = next;
     });
-
-    if (next.enabled && !ctx.gateway.getState().running) {
-      const cfg = store.get();
-      await ctx.gateway.start({
-        port: cfg.gateway.port,
-        host: cfg.gateway.host || '127.0.0.1',
-        token: cfg.gateway.token,
-      });
-    }
-    // 配置了自动拉起时后台拉起 NapCat（离线才拉、并发去重，不阻塞保存）。
-    if (next.enabled) void ctx.qqBot.maybeAutoLaunch();
-    ctx.log({ level: next.enabled ? 'info' : 'warn', msg: next.enabled ? 'QQ 远程助手已开启' : 'QQ 远程助手已关闭' });
-    return qqBotView();
+    ctx.log({ level: 'info', msg: '微信连接设置已保存' });
+    return weixinView();
   });
 
-  handle('gptplus:qqbot:launch', async () => {
-    const result = await ctx.qqBot.launchNapCat();
+  handle('gptplus:weixin:start', async () => {
+    requireWeixinPlugin();
+    const result = await ctx.weixinConnect.start();
     ctx.log(result.ok
-      ? { level: 'info', msg: `NapCat 拉起成功（${result.account || '未知账号'}）` }
-      : { level: 'warn', msg: `NapCat 拉起失败: ${result.error}` });
+      ? { level: 'info', msg: '微信连接已启动' }
+      : { level: 'warn', msg: `微信连接启动失败: ${result.error}` });
     return result;
   });
 
-  // 一键安装：进行中重复调用直接返回当前状态（主进程内并发去重）
-  handle('gptplus:qqbot:install', () => ctx.napcatInstaller.install());
-  handle('gptplus:qqbot:install:state', () => ctx.napcatInstaller.getState());
-  // 拉起并登录：已装 NapCat 的场景（快速登录优先，否则 app 内弹二维码扫码）
-  handle('gptplus:qqbot:login', () => ctx.napcatInstaller.loginFlow());
-
-  handle('gptplus:qqbot:test', async () => {
-    const api = await ctx.qqBot.apiTest();
-    const sent = await ctx.qqBot.sendPrivate(`gpt++ QQ 远程助手测试消息（${new Date().toLocaleString()}）`);
-    if (sent.ok) ctx.log({ level: 'info', msg: 'QQ 远程助手测试消息已发送' });
-    else ctx.log({ level: 'warn', msg: `QQ 测试消息发送失败: ${sent.error}` });
-    return { api, sent };
+  handle('gptplus:weixin:stop', async () => {
+    const result = await ctx.weixinConnect.stop();
+    ctx.log({ level: 'warn', msg: '微信连接已停止' });
+    return result;
   });
 
-  handle('gptplus:tasks:get', () => ctx.taskCenter.listTasks());
+  handle('gptplus:weixin:qr:start', (patch = {}) => {
+    requireWeixinPlugin();
+    return ctx.weixinConnect.qrStart({
+      baseUrl: patch.baseUrl,
+      routeTag: patch.routeTag,
+    });
+  });
+  handle('gptplus:weixin:qr:status', () => ctx.weixinConnect.qrStatus());
+
+  handle('gptplus:weixin:pick-workdir', async () => {
+    const result = await dialog.showOpenDialog({
+      title: '选择微信连接工作目录',
+      properties: ['openDirectory', 'createDirectory'],
+    });
+    return result.canceled || !result.filePaths.length ? null : result.filePaths[0];
+  });
+
+  handle('gptplus:weixin:pick-codex', async () => {
+    const result = await dialog.showOpenDialog({
+      title: '选择 Codex CLI',
+      properties: ['openFile'],
+      filters: [{ name: 'Codex CLI', extensions: ['exe', 'cmd', 'bat'] }],
+    });
+    return result.canceled || !result.filePaths.length ? null : result.filePaths[0];
+  });
+
+  handle('gptplus:weixin:detect-codex', async () => {
+    const { resolveCodexCli } = require('./codex-cli.js');
+    return resolveCodexCli({ chatgptPath: store.get().chatgpt?.executablePath || null });
+  });
+
+  handle('gptplus:weixin:open-link', async (url) => {
+    const value = String(url || '').trim();
+    if (!/^https?:\/\//i.test(value)) throw new Error('只允许打开 http(s) 链接');
+    await shell.openExternal(value);
+    return true;
+  });
 
   // ---- 模型与网关 ----
   handle('gptplus:models:list', () => ctx.models());
@@ -1096,7 +1112,26 @@ function registerIpc(deps) {
       return { ok: false, error: '找不到 ChatGPT.exe，请选择客户端可执行文件后重试' };
     }
 
-    const result = await relaunchChatGpt({ executablePath: exe });
+    let result;
+    try {
+      const usageStatuslineEnabled = ctx.plugins?.isActive?.('usage-statusline') !== false;
+      if (usageStatuslineEnabled) {
+        result = await launchChatGptWithUsageStatusline({
+          ctx,
+          launchOptions: { executablePath: exe },
+          wrapperDir: path.join(ctx.paths.APP_DIR, 'cdp'),
+          launch: ({ cdpPort, wrapperDir }) => relaunchChatGpt({
+            executablePath: exe,
+            cdpPort,
+            wrapperDir,
+          }),
+        });
+      } else {
+        result = await relaunchChatGpt({ executablePath: exe });
+      }
+    } catch (error) {
+      result = { ok: false, error: error.message };
+    }
     if (result.ok) {
       ctx.log({
         level: 'info',

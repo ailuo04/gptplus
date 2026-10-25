@@ -202,37 +202,45 @@ function normalizeRemoteSync(raw) {
   return { enabled: src.enabled === true, intervalMinutes, connections, sources };
 }
 
-/** QQ 远程助手配置：NapCat(OneBot 11) 地址/令牌、通知与命令白名单 QQ。 */
-function normalizeQqBot(raw) {
+/** 插件安装状态与插件自己的配置，未知插件字段保留以便以后升级扩展。 */
+function normalizePlugins(raw) {
   const src = isPlainObject(raw) ? raw : {};
+  const out = {};
+  for (const [rawId, rawState] of Object.entries(src)) {
+    const id = String(rawId || '').trim();
+    if (!/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(id) || !isPlainObject(rawState)) continue;
+    out[id] = {
+      installed: rawState.installed === true,
+      enabled: rawState.enabled === true,
+      config: isPlainObject(rawState.config) ? deepCopy(rawState.config) : {},
+    };
+  }
+  return out;
+}
+
+/** 微信连接（iLink）：登录凭据、允许联系人、每联系人独立 Codex 会话的运行配置。 */
+function normalizeWeixin(raw, legacy = null) {
+  const hasOwnConfig = isPlainObject(raw);
+  const src = hasOwnConfig ? raw : {};
+  const old = isPlainObject(legacy) ? legacy : {};
   const cleanText = (value, max) => String(value == null ? '' : value).trim().slice(0, max);
-  let apiUrl = cleanText(src.apiUrl, 300);
-  if (apiUrl && !/^https?:\/\//i.test(apiUrl)) apiUrl = 'http://127.0.0.1:3000';
-  apiUrl = apiUrl.replace(/\/+$/, '');
-  const cleanQq = (value) => {
-    const qq = cleanText(value, 16);
-    return /^\d{4,14}$/.test(qq) ? qq : '';
-  };
-  const progressCandidate = Number(src.progressMinutes);
-  const progressMinutes = Number.isInteger(progressCandidate) && progressCandidate >= 1 && progressCandidate <= 120
-    ? progressCandidate : 5;
-  const webuiPort = Number(src.webuiPort);
+  let baseUrl = cleanText(src.baseUrl, 300);
+  if (!baseUrl || !/^https?:\/\//i.test(baseUrl)) baseUrl = 'https://ilinkai.weixin.qq.com';
+  baseUrl = baseUrl.replace(/\/+$/, '');
+  const sandbox = ['workspace-write', 'danger-full-access'].includes(src.sandbox)
+    ? src.sandbox : 'read-only';
   return {
     enabled: src.enabled === true,
-    apiUrl: apiUrl || 'http://127.0.0.1:3000',
-    accessToken: cleanText(src.accessToken, 256),
-    eventToken: cleanText(src.eventToken, 256),
-    notifyQq: cleanQq(src.notifyQq),
-    ownerQq: cleanQq(src.ownerQq),
-    progressMinutes,
-    codexPath: cleanText(src.codexPath, 1024),
-    workspaceDir: cleanText(src.workspaceDir, 1024),
-    autoLaunch: src.autoLaunch === true,
-    launchCommand: cleanText(src.launchCommand, 2048),
-    launchQq: cleanQq(src.launchQq),
-    // NapCat WebUI（app 内扫码登录用）；一键安装时自动写入，不进用户表单
-    webuiPort: Number.isInteger(webuiPort) && webuiPort >= 1 && webuiPort <= 65535 ? webuiPort : 0,
-    webuiToken: cleanText(src.webuiToken, 128),
+    baseUrl,
+    token: cleanText(src.token, 1024),
+    accountId: cleanText(src.accountId, 256),
+    allowFrom: cleanText(src.allowFrom, 1024),
+    routeTag: cleanText(src.routeTag, 256),
+    // 首次升级时沿用旧 QQ 助手的工作目录 / Codex 路径，其它 QQ 配置直接丢弃。
+    workDir: cleanText(hasOwnConfig ? src.workDir : old.workspaceDir, 1024),
+    model: cleanText(src.model, 256),
+    sandbox,
+    codexPath: cleanText(hasOwnConfig ? src.codexPath : old.codexPath, 2048),
   };
 }
 
@@ -339,7 +347,8 @@ function normalizeConfig(raw) {
     },
     sharing: normalizeSharing(src.sharing),
     remoteSync: normalizeRemoteSync(src.remoteSync),
-    qqbot: normalizeQqBot(src.qqbot),
+    plugins: normalizePlugins(src.plugins),
+    weixin: normalizeWeixin(src.weixin, src.qqbot),
     providers,
   };
 }
@@ -357,7 +366,8 @@ function defaultConfig() {
     startup: { target: DEFAULT_STARTUP_TARGET },
     sharing: normalizeSharing(null),
     remoteSync: normalizeRemoteSync(null),
-    qqbot: normalizeQqBot(null),
+    plugins: {},
+    weixin: normalizeWeixin(null),
     providers: [],
   });
 }
@@ -820,7 +830,8 @@ module.exports = {
   normalizeTheme,
   normalizeModelLimits,
   normalizeModelOrder,
-  normalizeQqBot,
+  normalizeWeixin,
+  normalizePlugins,
   DEFAULT_THEME,
   DEFAULT_PROXY_MODE,
   DEFAULT_CONTEXT_WINDOW,

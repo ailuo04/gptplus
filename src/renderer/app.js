@@ -7,10 +7,11 @@
 
 import { renderProviders, openProviderForm, closeProviderForm } from './views/providers.js';
 import { dragRowOffsets, dragTargetIndex, renderModels, reorderModelKeys } from './views/models.js';
-import { latestUsageIndicators, renderUsage, usageRows } from './views/usage.js';
+import { renderUsage, usageRows } from './views/usage.js';
 import { openPeerSettings, renderSettings } from './views/settings.js';
 import { renderHome } from './views/home.js';
-import { renderQq } from './views/qq.js';
+import { renderWeixin } from './views/weixin.js';
+import { renderPlugins } from './views/plugins.js';
 
 // ============ 静态图标（纯字面量，不含任何变量） ============
 const SVG_OPEN =
@@ -49,6 +50,12 @@ const ICONS = Object.freeze({
   sun: SVG_OPEN + '<circle cx="8" cy="8" r="2.4"/><path d="M8 1.8v1.5M8 12.7v1.5M1.8 8h1.5M12.7 8h1.5M3.6 3.6l1.1 1.1M11.3 11.3l1.1 1.1M12.4 3.6l-1.1 1.1M4.7 11.3l-1.1 1.1"/></svg>',
   moon: SVG_OPEN + '<path d="M12.8 10.7A5.5 5.5 0 0 1 5.3 3.2 5.6 5.6 0 1 0 12.8 10.7z"/></svg>',
   monitor: SVG_OPEN + '<rect x="2.3" y="2.8" width="11.4" height="8" rx="1.2"/><path d="M6 13.2h4M8 10.8v2.4"/></svg>',
+  wechat: SVG_OPEN + '<path d="M2.4 3.1h7.4v5.3H6.1L4 10.4V8.4H2.4z"/><path d="M6.2 8.4h7.4v5.1h-1.5v1.7l-2-1.7H6.2z"/></svg>',
+  message: SVG_OPEN + '<path d="M2.7 3.3h10.6v7.1H6.7L4.1 12.8v-2.4H2.7z"/><path d="M5.3 6.2h5.4M5.3 8.3h3.4"/></svg>',
+  qr: SVG_OPEN + '<path d="M2.6 6V2.7H6M10 2.7h3.4V6M13.4 10v3.3H10M6 13.3H2.6V10"/><path d="M5.2 5.2h1.6v1.6H5.2zM9.2 9.2h1.6v1.6H9.2z"/>',
+  play: SVG_OPEN + '<path d="M5.2 3.2l7 4.8-7 4.8z"/>',
+  search: SVG_OPEN + '<circle cx="7.1" cy="7.1" r="4.3"/><path d="M10.4 10.4l3 3"/>',
+  external: SVG_OPEN + '<path d="M9.2 2.6h4.2v4.2M13.1 2.9L7.4 8.6"/><path d="M12.1 9.5v3.1a.9.9 0 0 1-.9.9H3.7a.9.9 0 0 1-.9-.9V5.1a.9.9 0 0 1 .9-.9h3.1"/>',
 });
 
 // ============ DOM 构造helper ============
@@ -345,8 +352,8 @@ const state = {
   logPaused: false,
   pendingRelaunch: false,
   relaunchNeeded: false,
-  // NapCat 一键安装进度（主进程推送/查询；QQ 页安装卡与扫码弹窗用）
-  napcatInstall: null,
+  weixin: null,
+  plugins: [],
   update: {
     enabled: false,
     status: 'idle',
@@ -359,7 +366,7 @@ const state = {
     rollbackReleases: null,
     lastCheckedAt: null,
   },
-  loaded: { status: false, providers: false, models: false, modelLimits: false, gateway: false, inject: false, peer: false, startup: false, update: false, logs: false, usage: false },
+  loaded: { status: false, providers: false, models: false, modelLimits: false, gateway: false, inject: false, peer: false, startup: false, update: false, logs: false, usage: false, weixin: false, plugins: false },
 };
 
 const THEME_MODES = new Set(['dark', 'light', 'system']);
@@ -527,7 +534,6 @@ function handleIncomingLog(entry, rerender = renderCurrent) {
   const finalRecord = normalized.final === true || normalized.usageRecord === true;
   if (finalRecord) mergeUsageRecords([normalized]);
   updateUsageBadge();
-  if (finalRecord) renderRuntimeMetrics();
   if (state.view === 'usage') rerender(false, { preserveScrollTop: true });
   // 主页也展示最近请求与今日流量：只在请求终结时重绘一次，不跟着中间日志刷新。
   else if (state.view === 'home' && finalRecord) rerender(false, { preserveScrollTop: true });
@@ -629,6 +635,7 @@ function isModalOpen() {
 async function loadStatus() {
   state.status = await api.getStatus();
   if (state.status && state.status.network) state.network = { ...state.status.network };
+  if (state.status && Array.isArray(state.status.plugins)) state.plugins = state.status.plugins;
   setThemePreference(state.status && state.status.theme);
   state.loaded.status = true;
 }
@@ -693,19 +700,17 @@ async function loadPeer() {
   state.loaded.peer = true;
 }
 
-async function loadQq() {
-  if (typeof api.getQqBot === 'function') state.qq = await api.getQqBot();
-  // 补拉安装进度快照（应用启动前就在装、事件已错过的场景）
-  if (typeof api.getNapCatInstallState === 'function') {
-    const snapshot = await api.getNapCatInstallState().catch(() => null);
-    if (snapshot && snapshot.phase && snapshot.phase !== 'idle') state.napcatInstall = snapshot;
-  }
-  state.loaded.qq = true;
+async function loadWeixin() {
+  if (typeof api.getWeixin === 'function') state.weixin = await api.getWeixin();
+  state.loaded.weixin = true;
 }
 
-async function loadTasks() {
-  if (typeof api.getTasks === 'function') state.tasks = await api.getTasks();
-  state.loaded.tasks = true;
+async function loadPlugins() {
+  if (typeof api.listPlugins === 'function') {
+    const plugins = await api.listPlugins();
+    state.plugins = Array.isArray(plugins) ? plugins : [];
+  }
+  state.loaded.plugins = true;
 }
 
 async function loadLogs() {
@@ -734,7 +739,6 @@ async function loadUsage() {
     state.usageTrend = Array.isArray(trend) ? trend : [];
   }
   state.loaded.usage = true;
-  renderRuntimeMetrics();
 }
 
 /**
@@ -775,6 +779,7 @@ async function tryLoad(loader, label) {
 
 const RELOAD_PLAN = {
   home: [
+    [loadPlugins, '插件列表'],
     [loadProviders, '提供商列表'],
     [loadModels, '模型列表'],
     [loadGateway, '网关状态'],
@@ -805,11 +810,12 @@ const RELOAD_PLAN = {
     [loadPeer, '对等共享状态'],
   ],
   usage: [[loadUsage, '使用量统计'], [loadLogs, '使用量日志']],
-  qq: [
-    [loadQq, 'QQ 远程助手配置'],
-    [loadTasks, '任务列表'],
+  weixin: [
+    [loadPlugins, '插件列表'],
+    [loadWeixin, '微信连接配置'],
     [loadStatus, '全局状态'],
   ],
+  plugins: [[loadPlugins, '插件列表'], [loadStatus, '全局状态']],
 };
 
 async function reload(scope = 'providers', options = {}) {
@@ -854,7 +860,6 @@ async function refreshUsageIncrementally() {
       state.usageTrend = Array.isArray(trend) ? trend : [];
     }
     state.loaded.usage = true;
-    renderRuntimeMetrics();
     if (state.view === 'usage') {
       renderChrome();
       renderCurrent(false, { preserveScrollTop: true });
@@ -907,11 +912,17 @@ const VIEW_META = {
     render: renderUsage,
     needs: ['usage'],
   },
-  qq: {
-    title: 'QQ 远程',
-    sub: 'QQ 接收 Codex 任务通知，私聊命令远程控制本机 Codex',
-    render: renderQq,
-    needs: ['qq', 'tasks', 'status'],
+  plugins: {
+    title: '插件市场',
+    sub: '按需安装、配置和管理可选功能',
+    render: renderPlugins,
+    needs: ['plugins'],
+  },
+  weixin: {
+    title: '微信连接',
+    sub: '通过个人微信连接本机 Codex 会话',
+    render: renderWeixin,
+    needs: ['weixin', 'status'],
   },
   settings: {
     title: '设置',
@@ -923,6 +934,10 @@ const VIEW_META = {
 
 function renderChrome() {
   const s = state.status;
+  const weixinPlugin = state.plugins.find((plugin) => plugin.id === 'weixin');
+  const weixinNav = dom.nav.querySelector('[data-plugin-nav="weixin"]');
+  if (weixinNav) weixinNav.hidden = !!weixinPlugin && !weixinPlugin.installed;
+  if (state.view === 'weixin' && weixinPlugin && !weixinPlugin.installed) state.view = 'plugins';
 
   // 导航
   for (const btn of dom.nav.querySelectorAll('.nav-item')) {
@@ -937,8 +952,10 @@ function renderChrome() {
   const modelBadge = dom.nav.querySelector('[data-badge="models"]');
   const gatewayBadge = dom.nav.querySelector('[data-badge="gateway"]');
   const updateBadge = dom.nav.querySelector('[data-badge="update"]');
+  const pluginsBadge = dom.nav.querySelector('[data-badge="plugins"]');
   setAnimatedText(providerBadge, s ? String(s.providers) : '–');
   setAnimatedText(modelBadge, s ? String(s.models) : '–');
+  setAnimatedText(pluginsBadge, String(state.plugins.filter((plugin) => plugin.installed).length));
   const homeSignal = dom.nav.querySelector('[data-signal="home"]');
   if (homeSignal) {
     const live = !!(s && s.providers > 0 && s.gateway && s.gateway.running && s.inject && s.inject.enabled);
@@ -971,7 +988,6 @@ function renderChrome() {
 
   // 状态栏链路
   renderFlow(s);
-  renderRuntimeMetrics();
   renderThemeControl();
 
   // 版本
@@ -1445,8 +1461,14 @@ async function relaunchChatGpt() {
       // 重启完成后再收一次时间戳：重启过程中若有新写入，新的 ChatGPT 进程已经会读到它。
       state.relaunchNeeded = false;
       observedWriteAt = Math.max(observedWriteAt, Date.now());
-      toast('已重启 ChatGPT 客户端：新的模型清单已加载', 'ok');
-      logLocal('info', '已重启 ChatGPT 客户端并加载新的模型清单');
+      if (res.injected === false) {
+        toast(`ChatGPT 已重启，但输入框用量栏注入失败：${res.injectError || '无法连接调试端口'}`, 'warn', 7000);
+      } else {
+        toast('已重启 ChatGPT 客户端：新的模型清单已加载', 'ok');
+      }
+      logLocal(res.injected === false ? 'warn' : 'info', res.injected === false
+        ? `ChatGPT 已重启，但输入框用量栏注入失败：${res.injectError || '无法连接调试端口'}`
+        : '已重启 ChatGPT 客户端并加载新的模型清单');
       return true;
     } else {
       state.relaunchNeeded = wasNeeded || state.relaunchNeeded;
@@ -1513,46 +1535,6 @@ function renderFlow(s) {
 
   nodes.push(providersNode, sep(gatewayRunning && !!inject?.enabled), gatewayNode, sep(!!inject?.enabled), codexNode);
   dom.flow.replaceChildren(...nodes);
-}
-
-function renderRuntimeMetrics() {
-  if (!dom.runtimeMetrics) return;
-  const contextWindow = state.modelLimits?.contextWindow ?? state.status?.modelLimits?.contextWindow;
-  const metrics = latestUsageIndicators(state, contextWindow);
-  const speed = metrics?.speed == null ? '—' : metrics.speed < 10 ? metrics.speed.toFixed(1) : String(Math.round(metrics.speed));
-  const cacheRate = metrics?.cacheRate == null ? '—' : `${metrics.cacheRate.toFixed(1)}%`;
-  const contextRate = metrics?.contextRate == null ? '—' : `${Math.round(metrics.contextRate)}%`;
-  const estimateNote = metrics?.estimated ? '（Token 用量为网关估算）' : '';
-  const speedDetail = metrics?.speed == null
-    ? '暂无有效的输出 Token / 耗时数据'
-    : `输出速率估算：输出 Token ÷ 网关总耗时（${metrics.output.toLocaleString()} Token / ${metrics.elapsed.toLocaleString()}ms）${estimateNote}`;
-  const cacheDetail = metrics?.cacheRate == null
-    ? '最近请求未提供可计算的缓存 usage'
-    : `最近请求缓存命中：${metrics.cached.toLocaleString()} / ${metrics.input.toLocaleString()} 输入 Token${estimateNote}`;
-  const contextDetail = metrics?.contextRate == null
-    ? '暂无可用的输入 Token 或上下文窗口数据'
-    : `估算上下文占用：最近请求输入 ${metrics.input.toLocaleString()} / 配置窗口 ${metrics.contextWindow.toLocaleString()} Token${estimateNote}`;
-
-  dom.runtimeMetrics.replaceChildren(
-    el('span', {
-      class: 'runtime-metric',
-      title: `${speedDetail}；耗时包含等待上游响应`,
-      attrs: { 'aria-label': `输出速率 ${speed} tok/s` },
-    }, [icon('activity', 13), el('span', { class: 'nums', text: `${speed} tok/s` })]),
-    el('span', {
-      class: 'runtime-metric',
-      title: cacheDetail,
-      attrs: { 'aria-label': `缓存命中 ${cacheRate}` },
-    }, [icon('server', 13), el('span', { class: 'runtime-metric-label', text: '缓存命中' }), el('span', { class: 'nums', text: cacheRate })]),
-    el('span', {
-      class: 'runtime-metric runtime-metric-context',
-      title: `${contextDetail}。该值不是客户端实时上下文读数。`,
-      attrs: { 'aria-label': `估算上下文占用 ${contextRate}` },
-    }, [
-      el('span', { class: 'runtime-context-ring', style: { '--runtime-progress': `${metrics?.contextRate ?? 0}%` }, attrs: { 'aria-hidden': 'true' } }),
-      el('span', { class: 'nums', text: contextRate }),
-    ]),
-  );
 }
 
 function updateUsageBadge(badge = dom.nav?.querySelector('[data-badge="usage"]')) {
@@ -1725,6 +1707,7 @@ function renderCurrent(force = false, options = {}) {
 
 function navigate(view) {
   if (!VIEW_META[view]) return;
+  if (view === 'weixin' && state.plugins.length && !state.plugins.some((plugin) => plugin.id === 'weixin' && plugin.installed)) return;
   if (view === state.view) return;
   const token = ++viewTransitionToken;
   state.view = view;
@@ -1752,8 +1735,8 @@ const LOADER_BY_KEY = {
   usage: [loadUsage, '使用量统计'],
   logs: [loadLogs, '使用量日志'],
   peer: [loadPeer, '对等共享状态'],
-  qq: [loadQq, 'QQ 远程助手配置'],
-  tasks: [loadTasks, '任务列表'],
+  weixin: [loadWeixin, '微信连接配置'],
+  plugins: [loadPlugins, '插件列表'],
 };
 
 const inflight = new Map();
@@ -1842,26 +1825,34 @@ function subscribe() {
     logLocal('warn', `订阅更新事件失败: ${describeError(err)}`);
   }
   try {
-    // 一键安装进度：QQ 页安装卡 + 扫码弹窗的数据源。渲染交给 QQ 页自己刷新
-    // （renderCurrent 的焦点保护会避免打断正在编辑的输入框）。
-    api.onNapCatInstall?.((next) => {
+    // 微信连接状态：主进程每次状态变化都会推送；页面自己的状态轮询会刷新状态卡，
+    // 这里不整页重渲染，避免打断正在编辑的连接设置。
+    api.onWeixinStatus?.((next) => {
       if (!next || typeof next !== 'object') return;
-      state.napcatInstall = next;
-      if (state.view === 'qq') renderCurrent(false, { preserveScrollTop: true });
+      state.weixin = { ...(state.weixin || {}), status: next };
     });
   } catch (err) {
-    logLocal('warn', `订阅安装事件失败: ${describeError(err)}`);
+    logLocal('warn', `订阅微信连接状态失败: ${describeError(err)}`);
   }
   try {
-    // NapCat 拉起状态：主进程每次 phase 变化都会推送，页面开着时即时刷新
-    // 「拉起中…/在线/失败」芯片，不再依赖整页 reload。
-    api.onQqLaunch?.((next) => {
-      if (!next || typeof next !== 'object') return;
-      state.qq = { ...(state.qq || {}), launch: next };
-      if (state.view === 'qq') renderCurrent(false, { preserveScrollTop: true });
+    api.onPluginChange?.((event) => {
+      const next = event && event.plugin;
+      if (next && typeof next === 'object') {
+        state.plugins = state.plugins.some((plugin) => plugin.id === next.id)
+          ? state.plugins.map((plugin) => plugin.id === next.id ? next : plugin)
+          : [...state.plugins, next];
+        if (state.view === 'weixin' && next.id === 'weixin' && !next.installed) state.view = 'plugins';
+        renderChrome();
+        renderCurrent(true, { preserveScrollTop: true });
+      } else {
+        void tryLoad(loadPlugins, '插件列表').then(() => {
+          renderChrome();
+          renderCurrent(true, { preserveScrollTop: true });
+        });
+      }
     });
   } catch (err) {
-    logLocal('warn', `订阅拉起状态事件失败: ${describeError(err)}`);
+    logLocal('warn', `订阅插件状态失败: ${describeError(err)}`);
   }
   try {
     api.onLog((entry) => {
@@ -1964,7 +1955,6 @@ function cacheDom() {
   dom.logToggleCount = document.getElementById('log-toggle-count');
   dom.logAutoscroll = document.getElementById('log-autoscroll');
   dom.flow = document.getElementById('flow');
-  dom.runtimeMetrics = document.getElementById('runtime-metrics');
   dom.themeControl = document.getElementById('theme-control');
   dom.buildTag = document.getElementById('build-tag');
   dom.modalRoot = document.getElementById('modal-root');

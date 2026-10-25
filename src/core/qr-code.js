@@ -1,6 +1,6 @@
 'use strict';
 /**
- * 二维码 → PNG data URL：QQ 登录二维码在 app 弹窗里显示用。
+ * 二维码 → PNG data URL：微信登录二维码在 app 弹窗里显示用。
  * 矩阵生成用 vendored 的 qrcode-generator（MIT，见 vendor/qrcode-generator.js）；
  * PNG 编码手写（1-bit 灰度 + Node 自带 zlib），不引入任何新依赖。
  */

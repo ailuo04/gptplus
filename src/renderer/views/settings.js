@@ -589,7 +589,7 @@ function gatewayCard(ctx, { gateway, codex }) {
     el('div', { class: 'setting' }, [
       el('div', { class: 'setting-main' }, [
         el('div', { class: 'setting-title', text: '访问令牌' }),
-        el('div', { class: 'setting-desc', text: '非空时网关要求 Authorization: Bearer <token>；它会作为 experimental_bearer_token 写进 Codex 配置。' }),
+        el('div', { class: 'setting-desc', text: '非空时网关要求 Authorization: Bearer <token>；Codex 通过本机认证命令读取令牌，令牌不会写入 Codex 配置文件。' }),
       ]),
       el('div', { class: 'setting-ctl' }, [
         el('span', { class: 'keyval mono ellipsis', style: { 'max-width': '230px' }, title: '默认打码', text: tokenText }),

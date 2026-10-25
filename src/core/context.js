@@ -9,18 +9,19 @@ const { createCodexConfig } = require('./codex-config.js');
 const { createProviderClient } = require('./provider-client.js');
 const { createLogStore } = require('./log-store.js');
 const { createUsageStore } = require('./usage-store.js');
+const { createUsageLiveReader } = require('./usage-live.js');
 const { createGateway } = require('./gateway/server.js');
 const { createSystemProxyFetch } = require('./system-proxy.js');
-const { createTaskCenter } = require('./task-center.js');
-const { createQqBot } = require('./qq-bot.js');
-const { createNapCatInstaller } = require('./napcat-install.js');
+const { createWeixinConnect } = require('./weixin-connect.js');
+const { createTaskMonitor } = require('./task-monitor.js');
 const { slugForProvider, orderModels, modelKey } = require('./model-utils.js');
 const { redactDiagnostic } = require('./redact.js');
 const { createRemoteProviders, createRemoteSync, remoteProviderId } = require('./peer-sharing.js');
+const { createPluginManager } = require('./plugin-manager.js');
 
 /**
  * @param {{ onStatus?: (s:any)=>void, onLog?: (e:any)=>void, appVersion?: string,
- *           onQqInstall?: (s:any)=>void, onQqLaunch?: (s:any)=>void,
+ *           onWeixinStatus?: (s:any)=>void,
  *           secretStorage?: { isAvailable?: () => boolean, encrypt: (text:string) => Buffer|Uint8Array,
  *             decrypt: (bytes:Buffer) => string } }} [opts]
  */
@@ -28,8 +29,7 @@ async function createContext(opts = {}) {
   const {
     onStatus = () => {},
     onLog = () => {},
-    onQqInstall = () => {},
-    onQqLaunch = () => {},
+    onWeixinStatus = () => {},
     appVersion = '0.0.0',
     secretStorage = null,
   } = opts;
@@ -47,6 +47,8 @@ async function createContext(opts = {}) {
   logStore.load();
   const usageStore = createUsageStore({ usagePath: paths.USAGE_PATH, trendPath: paths.USAGE_TREND_PATH });
   usageStore.load();
+  const usageLive = createUsageLiveReader({ codexHome: paths.CODEX_HOME });
+  const plugins = createPluginManager({ store });
   // 兼容升级前的混合日志：把旧日志里的终结请求迁移到独立统计文件。
   usageStore.importLogs(logStore.all());
   const listeners = new Set();
@@ -56,7 +58,12 @@ async function createContext(opts = {}) {
     const peerSecrets = (cfg.remoteSync.connections || []).map((connection) => ({
       baseUrl: connection.baseUrl, apiKey: connection.authToken, headers: {},
     }));
-    const full = redactDiagnostic({ at: Date.now(), level: 'info', ...entry }, [...store.providers(), ...peerSecrets]);
+    const weixinSecrets = cfg.weixin && cfg.weixin.token
+      ? [{ baseUrl: cfg.weixin.baseUrl, apiKey: cfg.weixin.token, headers: {} }]
+      : [];
+    const full = redactDiagnostic({ at: Date.now(), level: 'info', ...entry }, [
+      ...store.providers(), ...peerSecrets, ...weixinSecrets,
+    ]);
     logStore.append(full);
     if (full.final === true) usageStore.append(full);
     try {
@@ -73,17 +80,21 @@ async function createContext(opts = {}) {
     }
   }
 
-  // QQ 远程助手：任务中心跟踪网关会话与 codex exec 任务，qq-bot 负责收发消息。
-  const taskCenter = createTaskCenter({ store, log: (e) => log(e) });
-  // NapCat 拉起状态变化经 onQqLaunch 广播（idle/launching/online/failed）。
-  const qqBot = createQqBot({ store, taskCenter, log: (e) => log(e), onEvent: onQqLaunch });
-  // NapCat 一键安装器：下载 QQ/NapCat、静默安装、写配置并拉起（进度经 onQqInstall 广播）。
-  const napcatInstaller = createNapCatInstaller({
+  // 微信连接：iLink 长轮询收发消息，每个联系人映射到独立的 Codex app-server thread。
+  const weixinConnect = createWeixinConnect({
     store,
-    qqBot,
     log: (e) => log(e),
+    onEvent: onWeixinStatus,
+    stateDir: paths.APP_DIR,
     fetchImpl: network,
-    onEvent: onQqInstall,
+    appVersion,
+  });
+  const taskMonitor = createTaskMonitor({
+    log: (e) => log(e),
+    onNotify: (event) => {
+      if (plugins.isActive('weixin')) return weixinConnect.notifyTask(event);
+      return null;
+    },
   });
 
   const gateway = createGateway({
@@ -91,11 +102,10 @@ async function createContext(opts = {}) {
     paths,
     fetch: network,
     log: (e) => log(e),
-    taskObserver: taskCenter,
-    onebot: { handleEvent: (req, res, body) => qqBot.handleWebhook(req, res, body) },
+    usageLive,
+    taskObserver: taskMonitor,
   });
-  qqBot.bindGateway(gateway);
-  taskCenter.start();
+  taskMonitor.start();
 
   function models() {
     const out = [];
@@ -165,6 +175,7 @@ async function createContext(opts = {}) {
       sharing: { enabled: cfg.sharing.enabled, clients: cfg.sharing.clients.length, models: cfg.sharing.models.length },
       remoteSync: { enabled: cfg.remoteSync.enabled, intervalMinutes: cfg.remoteSync.intervalMinutes,
         connections: cfg.remoteSync.connections.length, sources: cfg.remoteSync.sources.length },
+      plugins: plugins.list(),
     };
   }
 
@@ -267,13 +278,14 @@ async function createContext(opts = {}) {
     providerClient,
     network,
     gateway,
-    taskCenter,
-    qqBot,
-    napcatInstaller,
+    weixinConnect,
+    taskMonitor,
     log,
     logs: () => logStore.all(),
     usage: () => usageStore.all(),
     usageTrend: () => usageStore.trend(),
+    usageLive,
+    plugins,
     clearUsage: (mode = 'all') => {
       const preserveTrend = mode === 'details';
       if (mode !== 'all' && !preserveTrend) throw new Error('无效的数据清空模式');

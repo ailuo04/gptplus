@@ -24,6 +24,7 @@ const { createUsageStore } = require(path.join(CORE, 'usage-store.js'));
 const { launchChatGpt } = require(path.join(CORE, 'chatgpt-launch.js'));
 const providerTransfer = require(path.join(CORE, 'provider-transfer.js'));
 const peerSharing = require(path.join(CORE, 'peer-sharing.js'));
+const { createPluginManager } = require(path.join(CORE, 'plugin-manager.js'));
 
 function countMatches(text, re) {
   return (text.match(re) || []).length;
@@ -236,6 +237,40 @@ test('store: 默认值 / provider CRUD / 深拷贝隔离', (t) => {
   assert.equal(typeof token, 'string');
   assert.equal(token.length, 32);
   assert.notEqual(token, store.newGatewayToken());
+});
+
+test('plugin manager: 内置插件可安装、启停、配置和卸载，并保留原有连接配置', (t) => {
+  const dir = tmpDir('plugin-manager');
+  cleanup(t, dir);
+  const configPath = path.join(dir, 'config.json');
+  const store = createStore({ configPath });
+  store.update((draft) => {
+    draft.weixin.token = 'keep-this-token';
+    draft.weixin.workDir = 'C:\\work';
+  });
+
+  const manager = createPluginManager({ store });
+  const initial = manager.list();
+  assert.deepEqual(initial.map((plugin) => plugin.id), ['weixin', 'usage-statusline']);
+  assert.ok(initial.every((plugin) => plugin.installed && plugin.enabled));
+  assert.deepEqual(manager.get('usage-statusline').config.metrics, { speed: true, cache: true, context: true });
+
+  manager.setEnabled('weixin', false);
+  assert.equal(manager.isActive('weixin'), false);
+  manager.setConfig('usage-statusline', { metrics: { speed: false, context: false } });
+  assert.deepEqual(manager.config('usage-statusline').metrics, { speed: false, cache: true, context: false });
+
+  manager.uninstall('weixin');
+  assert.equal(manager.get('weixin').installed, false);
+  manager.install('weixin');
+  assert.equal(manager.get('weixin').enabled, false, '重新安装后需要用户再次启用');
+  assert.equal(store.get().weixin.token, 'keep-this-token');
+  assert.equal(store.get().weixin.workDir, 'C:\\work');
+
+  const reloaded = createPluginManager({ store: createStore({ configPath }) });
+  assert.equal(reloaded.get('weixin').installed, true);
+  assert.equal(reloaded.get('weixin').enabled, false);
+  assert.deepEqual(reloaded.config('usage-statusline').metrics, { speed: false, cache: true, context: false });
 });
 
 test('store: 提供商敏感字段使用系统安全存储落盘，并迁移旧版明文配置', (t) => {
@@ -1148,8 +1183,8 @@ function makeCodex(t, opts = {}) {
   return { dir, codexHome, configPath, catalogPath, backupDir, store, catalog, codex };
 }
 
-test('codex-config: 注入写入必需键/段，用户内容逐字保留', (t) => {
-  const { codex, catalogPath } = makeCodex(t);
+test('codex-config: 注入使用动态认证命令，用户内容逐字保留', (t) => {
+  const { codex, catalogPath, store } = makeCodex(t);
   const res = codex.applyInjection({
     enabled: true,
     catalogPath,
@@ -1167,9 +1202,28 @@ test('codex-config: 注入写入必需键/段，用户内容逐字保留', (t) =
   assert.match(text, /\[model_providers\.gptplus\]/);
   assert.match(text, /base_url\s*=\s*"http:\/\/127\.0\.0\.1:18120\/v1"/);
   assert.match(text, /wire_api\s*=\s*"responses"/);
-  assert.match(text, /requires_openai_auth\s*=\s*false/);
-  assert.match(text, /experimental_bearer_token\s*=\s*"tok-123"/);
+  assert.match(text, /\[model_providers\.gptplus\.auth\]/);
+  assert.match(text, /command\s*=\s*"powershell\.exe"/);
+  assert.match(text, /refresh_interval_ms\s*=\s*0/);
+  assert.doesNotMatch(text, /(?:requires_openai_auth|experimental_bearer_token)\s*=/);
+  assert.ok(!text.includes('tok-123'), '网关令牌不能写入 Codex 配置');
   assert.ok(text.includes(catalogPath.replace(/\\/g, '\\\\')), '路径必须 TOML 转义');
+
+  const auth = codexToml.gatewayAuthCommand(store.configPath);
+  const authResult = spawnSync(auth.command, auth.args, { encoding: 'utf8', windowsHide: true });
+  assert.equal(authResult.status, 0, authResult.stderr);
+  assert.equal(authResult.stdout, 'tok-123', '认证命令只输出当前网关令牌');
+
+  const appConfig = fs.readFileSync(store.configPath);
+  try {
+    fs.writeFileSync(store.configPath, JSON.stringify({ gateway: { token: '' } }));
+    const missingToken = spawnSync(auth.command, auth.args, { encoding: 'utf8', windowsHide: true });
+    assert.notEqual(missingToken.status, 0);
+    assert.equal(missingToken.stdout, '');
+    assert.match(missingToken.stderr, /gpt\+\+ gateway token is empty/);
+  } finally {
+    fs.writeFileSync(store.configPath, appConfig);
+  }
 
   // 用户内容逐字保留
   assert.ok(text.includes('# user comment must survive'));
@@ -1210,6 +1264,34 @@ test('codex-config: 关闭注入后逐字节还原，可反复开关', (t) => {
   assert.match(codex.readText(), /^model = "slug-2"$/m);
   assert.equal(codex.applyInjection({ enabled: false }).changed, true);
   assert.equal(codex.readText(), SAMPLE_TOML);
+});
+
+test('codex-config: 重注入只迁移 gpt++ 旧 token，不触碰 memories 段', (t) => {
+  const toml = [
+    'model_provider = "gptplus"',
+    '',
+    '[memories]',
+    'generate_memories = true',
+    'experimental_bearer_token = "memory-token"',
+    '# >>> gpt++ gateway provider >>>',
+    '',
+    '[model_providers.gptplus]',
+    'name = "gpt++ Gateway"',
+    'base_url = "http://127.0.0.1:18120/v1"',
+    'wire_api = "responses"',
+    'requires_openai_auth = false',
+    'experimental_bearer_token = "old-gateway-token"',
+    '# <<< gpt++ gateway provider <<<',
+    '',
+  ].join('\n');
+  const { codex, catalogPath } = makeCodex(t, { toml });
+  codex.applyInjection({ enabled: true, catalogPath, defaultModel: 'slug-1' });
+  const text = codex.readText();
+
+  assert.match(text, /\[memories\][\s\S]*experimental_bearer_token\s*=\s*"memory-token"/);
+  assert.match(text, /\[model_providers\.gptplus\.auth\]/);
+  assert.doesNotMatch(text, /old-gateway-token/);
+  assert.equal((text.match(/experimental_bearer_token\s*=/g) || []).length, 1);
 });
 
 test('codex-config: 用户原本就有 model_catalog_json 也要能还原', (t) => {
@@ -1911,6 +1993,50 @@ test('ipc: Codex 写入失败必须回滚注入开关，不能留下「界面已
   assert.equal(store.get().inject.enabled, false, '注入开关必须回滚');
   assert.equal(store.get().inject.catalogPath, null, 'catalogPath 不能残留');
   assert.equal(lastWrite.ok, false, 'lastWrite 必须记为失败');
+});
+
+test('微信连接 IPC：保存连接设置后重启仍保留', async (t) => {
+  const { registerIpc } = require(path.join(CORE, 'ipc.js'));
+  const dir = tmpDir('ipc-weixin-connect');
+  cleanup(t, dir);
+  const configPath = path.join(dir, 'config.json');
+  const store = createStore({ configPath });
+  const handlers = new Map();
+  const ctx = {
+    paths: {},
+    store,
+    weixinConnect: {
+      getStatus: () => ({
+        state: 'stopped', message: '微信连接未启动。', accountId: '',
+        lastPeerId: '', lastMessageAtMs: 0, processedMessages: 0, hasToken: false,
+      }),
+    },
+    log: () => {},
+    onLogEvent: () => () => {},
+  };
+  registerIpc({ ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) }, shell: {}, dialog: {}, ctx });
+
+  const saved = await handlers.get('gptplus:weixin:set')({}, {
+    baseUrl: 'https://ilinkai.weixin.qq.com/',
+    token: 'bot-token',
+    accountId: 'bot@im.bot',
+    allowFrom: 'owner@im.wechat',
+    workDir: 'C:\\work',
+    sandbox: 'workspace-write',
+  });
+  assert.equal(saved.baseUrl, 'https://ilinkai.weixin.qq.com');
+  assert.equal(saved.accountId, 'bot@im.bot');
+  assert.equal(saved.allowFrom, 'owner@im.wechat');
+  assert.equal(saved.sandbox, 'workspace-write');
+  assert.equal(saved.status.state, 'stopped');
+  const onDisk = JSON.parse(fs.readFileSync(configPath, 'utf8')).weixin;
+  assert.equal(onDisk.baseUrl, 'https://ilinkai.weixin.qq.com');
+  assert.equal(onDisk.workDir, 'C:\\work');
+  assert.equal(createStore({ configPath }).get().weixin.allowFrom, 'owner@im.wechat');
+  await assert.rejects(
+    () => handlers.get('gptplus:weixin:set')({}, { sandbox: 'unsafe' }),
+    /沙箱权限/,
+  );
 });
 
 test('ipc: 提供商保存或删除导致注入同步失败时必须回滚配置', async (t) => {

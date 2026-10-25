@@ -54,7 +54,13 @@ const { createWindowLifecycle } = require('./window-lifecycle.js');
 const { TRAY_ICON_DATA_URL } = require('./tray-icon.js');
 const { setupAutoUpdater, cleanupInstalledUpdateCache } = require('./updater.js');
 const { autoUpdater } = require('electron-updater');
-const { launchChatGptAndVerify } = require('../core/chatgpt-launch.js');
+const { launchChatGptAndVerify, findChatGptDebugPort } = require('../core/chatgpt-launch.js');
+const {
+  disposeUsageStatusline,
+  launchChatGptWithUsageStatusline,
+  resumeUsageStatusline,
+  stopUsageStatuslineBridge,
+} = require('../core/chatgpt-statusline.js');
 
 const isDev = process.argv.includes('--dev');
 const isQuitRequest = process.argv.includes('--quit');
@@ -224,7 +230,15 @@ async function launchChatGptAtLogin(commandLine = process.argv) {
   try {
     // 日志里必须区分“已请求唤起”和“客户端真的起来了”：登录时没有界面反馈，
     // 只 spawn explorer 成功并不代表 ChatGPT 主窗口出现。
-    const result = await launchChatGptAndVerify({ preferredPath });
+    const usageStatuslineEnabled = ctx?.plugins?.isActive?.('usage-statusline') !== false;
+    const result = ctx?.gateway && usageStatuslineEnabled
+      ? await launchChatGptWithUsageStatusline({
+          ctx,
+          launchOptions: { preferredPath },
+          wrapperDir: path.join(ctx.paths.APP_DIR, 'cdp'),
+          launch: (options) => launchChatGptAndVerify({ preferredPath, ...options }),
+        })
+      : await launchChatGptAndVerify({ preferredPath });
     if (result.ok) {
       ctx?.log?.({
         level: 'info',
@@ -236,6 +250,50 @@ async function launchChatGptAtLogin(commandLine = process.argv) {
     }
   } catch (err) {
     ctx?.log?.({ level: 'warn', msg: `开机自启动 ChatGPT 失败: ${err.message}` });
+  }
+}
+
+async function refreshUsageStatuslineRuntime() {
+  stopUsageStatuslineBridge();
+  let port = null;
+  try {
+    port = await findChatGptDebugPort();
+  } catch {
+    port = null;
+  }
+  if (!port) return;
+  try {
+    await disposeUsageStatusline({ cdpPort: port });
+  } catch (err) {
+    ctx?.log?.({ level: 'warn', msg: `清理 ChatGPT 用量信息栏失败: ${err.message}` });
+  }
+}
+
+async function handlePluginChange(event) {
+  const id = event?.plugin?.id;
+  if (!ctx?.plugins || !id) return;
+
+  if (id === 'weixin') {
+    if (!ctx.plugins.isActive('weixin')) {
+      await ctx.weixinConnect?.stop?.({ persist: false });
+      return;
+    }
+    const cfg = ctx.store?.get?.()?.weixin || {};
+    if (cfg.enabled === true && String(cfg.token || '').trim()) {
+      const result = await ctx.weixinConnect?.autoStart?.();
+      if (result && result.ok === false) ctx.log?.({ level: 'warn', msg: `微信插件自动恢复失败: ${result.error}` });
+    }
+    return;
+  }
+
+  if (id === 'usage-statusline') {
+    await refreshUsageStatuslineRuntime();
+    if (ctx.plugins.isActive('usage-statusline')) {
+      const result = await resumeUsageStatusline({ ctx, timeoutMs: 8000 });
+      if (result && result.ok === false && !result.skipped) {
+        ctx.log?.({ level: 'warn', msg: `用量信息栏插件恢复失败: ${result.error || '未知错误'}` });
+      }
+    }
   }
 }
 
@@ -404,10 +462,17 @@ async function boot() {
   };
   ctx = await createContext({
     onStatus: (s) => broadcast('gptplus:status', s),
-    onQqInstall: (s) => broadcast('gptplus:qqbot:install', s),
-    onQqLaunch: (s) => broadcast('gptplus:qqbot:launch', s),
+    onWeixinStatus: (s) => broadcast('gptplus:weixin:status', s),
     appVersion: app.getVersion(),
     secretStorage,
+  });
+
+  ctx.plugins?.onChange?.((event) => {
+    broadcast('gptplus:plugin:change', event);
+    broadcast('gptplus:status', ctx.status());
+    void handlePluginChange(event).catch((err) => {
+      ctx.log?.({ level: 'warn', msg: `插件运行时切换失败: ${err.message}` });
+    });
   });
 
   // 更新只在收到用户明确操作后下载；启动检测本身只广播可用版本。
@@ -460,13 +525,23 @@ async function boot() {
         at: Date.now(), level: 'error', msg: '网关自动启动失败: ' + err.message,
       });
     } finally {
-      // QQ 助手开启且配置了启动命令时，后台拉起 NapCat（离线才拉，不阻塞启动）。
-      void ctx.qqBot.maybeAutoLaunch();
+      // 微信连接开启且已有登录凭据时自动恢复长轮询；失败只记日志，不阻塞首屏。
+      if (ctx.plugins?.isActive?.('weixin')) {
+        void ctx.weixinConnect.autoStart().then((result) => {
+          if (result && result.ok === false) {
+            ctx.log({ level: 'warn', msg: `微信连接自动启动失败: ${result.error}` });
+          }
+        }).catch((err) => {
+          ctx.log({ level: 'warn', msg: `微信连接自动启动失败: ${err && err.message ? err.message : err}` });
+        });
+      }
       ctx.emitStatus?.();
       refreshTrayMenu();
     }
   })();
-  void gatewayReady.then(() => launchChatGptAtLogin());
+  void gatewayReady
+    .then(() => launchChatGptAtLogin())
+    .then(() => resumeUsageStatusline({ ctx }));
 
   app.on('second-instance', (_event, commandLine) => {
     if (commandLine.includes('--quit')) {
@@ -505,8 +580,10 @@ app.on('before-quit', () => {
   }
   try {
     ctx?.remoteSync?.stop?.();
-    ctx?.taskCenter?.stop?.();
+    ctx?.weixinConnect?.shutdown?.();
+    ctx?.taskMonitor?.stop?.();
     ctx?.gateway?.stopSync?.();
+    stopUsageStatuslineBridge();
   } catch {
     /* 退出阶段尽力而为 */
   }
@@ -517,8 +594,11 @@ process.on('uncaughtException', (err) => {
   const peerSecrets = (cfg.remoteSync?.connections || []).map((connection) => ({
     baseUrl: connection.baseUrl, apiKey: connection.authToken, headers: {},
   }));
+  const weixinSecrets = cfg.weixin && cfg.weixin.token
+    ? [{ baseUrl: cfg.weixin.baseUrl, apiKey: cfg.weixin.token, headers: {} }]
+    : [];
   const diagnostic = require('../core/redact.js').redactDiagnostic(
-    err && err.stack ? err.stack : String(err), [...(cfg.providers || []), ...peerSecrets],
+    err && err.stack ? err.stack : String(err), [...(cfg.providers || []), ...peerSecrets, ...weixinSecrets],
   );
   broadcast('gptplus:log', {
     at: Date.now(), level: 'error', msg: '未捕获异常: ' + diagnostic,

@@ -71,8 +71,10 @@ priority, support_verbosity, truncation_policy, experimental_supported_tools
   只发 delta、末尾 item 的 `content` 为空数组时，客户端 exit 0、token 计数正常、
   但**答案是空的**。文本必须落在 `item.content[].text` 里。
 - SSE 的 `event:` 行可选；JSON 里的 `type` 字段必填且以它为准。
-- 认证：`requires_openai_auth=false` 且无 key → 不带任何认证头；
-  `env_key` 或 `experimental_bearer_token` → `Authorization: Bearer <值>`。
+- 认证：`env_key` / `experimental_bearer_token` 会生成 `Authorization: Bearer <值>`；
+  `auth.command` 可按需取得 bearer token。gpt++ 使用 `auth.command` 从本机配置读取
+  网关令牌，不把令牌写入 Codex 配置，也不与 `requires_openai_auth`、`env_key` 或
+  `experimental_bearer_token` 混用。
 - 模型名：客户端把 body 的 `model` 原样发来，网关可任意改写（客户端不校验回显值）。
 - 工具调用：网关发 `function_call`（arguments 是 JSON 字符串）或 `custom_tool_call`
   （input 是原始字符串）；客户端以 `function_call_output` / `custom_tool_call_output`
@@ -84,7 +86,9 @@ priority, support_verbosity, truncation_policy, experimental_supported_tools
 
 - `~/.gptplus/config.json` 是 App 的唯一数据源（提供商、密钥、网关、注入开关）。
 - `~/.codex/config.toml` 只被增量修改：顶层 `model` / `model_provider` /
-  `model_catalog_json`，加一个带标记注释的 `[model_providers.gptplus]` 段。
+  `model_catalog_json`，加一个带标记注释的 `[model_providers.gptplus]` 段及其
+  `[model_providers.gptplus.auth]` 子段。认证命令从 `~/.gptplus/config.json` 读取当前
+  网关令牌并仅通过标准输出交给 Codex；令牌本身不写入 Codex 配置。
   关闭注入时逐字节还原（原始值记录在 `~/.gptplus/backups/inject-state-*.json`）。
 - 写入前备份到 `~/.gptplus/backups/config.toml.<时间戳>`，保留最近 10 份。
 
@@ -103,6 +107,10 @@ C:\ailuo_own\gpt++\
       store.js                 <- 用户配置读写 ~/.gptplus/config.json（A 负责）
       catalog.js               <- 生成 model_catalog_json（A 负责）
       codex-config.js          <- 读写 ~/.codex/config.toml（A 负责）
+      codex-cli.js             <- Codex CLI 定位（微信连接共用）
+      codex-app-server.js      <- Codex app-server JSON-RPC 客户端
+      weixin-connect.js        <- 微信 iLink 长轮询 / 二维码 / 会话映射
+      task-monitor.js          <- ChatGPT 任务监听与 5 分钟进度通知
       provider-client.js       <- 拉取 /models、连通性测试（A 负责）
       log-store.js             <- 网关日志 JSONL 持久化 + 启动回放（使用量页数据源）
       context.js               <- createContext() 组装所有模块（Lead 负责）
@@ -121,7 +129,7 @@ C:\ailuo_own\gpt++\
       views/providers.js       <- 提供商 CRUD（C 负责）
       views/models.js          <- 模型列表/选择/测试（C 负责）
       views/usage.js           <- 使用量统计（C 负责）
-      views/qq.js              <- QQ 远程助手独立页（C 负责）
+      views/weixin.js          <- 微信连接独立页（C 负责）
       views/settings.js        <- 网关开关、注入开关、端口（C 负责）
   tools/                       <- 逆向/验证脚本（Lead 负责）
   research/                    <- 桌面端机制调研报告
@@ -421,207 +429,184 @@ createGateway({ store, paths, log }) => {
 
 禁止改动范围外文件；跨模块问题通过消息沟通，不改别人的文件。
 
-## 10. QQ 远程助手（任务中心 + OneBot 上报，v1.3.4）
+## 10. 微信连接（iLink + Codex app-server）
 
-目标：在 QQ 上接收 Codex 任务通知（完成/失败/每 N 分钟进度），并通过主人 QQ
-的私聊命令远程控制本机 Codex（列任务、发新任务、插入要求、停止）。
+目标：用个人微信通过微信官方 iLink Bot API 连接本机 Codex；
+每个微信联系人映射到一个独立的 Codex 会话（app-server thread），
+在微信里发消息即可让 Codex 在该联系人的会话里执行并回复。
 
-### 10.1 配置（`config.json` 新增 `qqbot` 块）
+### 10.1 配置（`config.json` 的 `weixin` 块）
 
-```jsonc
+```json
 {
-  "qqbot": {
-    "enabled": false,
-    "apiUrl": "http://127.0.0.1:3000",   // NapCat HTTP 服务器地址
-    "accessToken": "",                    // NapCat 访问令牌（可空）
-    "eventToken": "",                     // 上报校验令牌（可空；非空时 /onebot/event 必须带）
-    "notifyQq": "",                       // 接收通知的 QQ（4-14 位数字）
-    "ownerQq": "",                        // 允许下发命令的 QQ（4-14 位数字）
-    "progressMinutes": 5,                 // 进行中提醒间隔，1-120 分钟
-    "codexPath": "",                      // codex.exe 显式路径（空则自动检测）
-    "workspaceDir": "",                   // 新任务默认工作目录（空则用户主目录）
-    "autoLaunch": false,                  // 开关打开/应用启动时自动拉起 NapCat
-    "launchCommand": "",                  // 拉起命令（可含参数；win 下经 cmd /c 执行，兼容 .bat；空则自动识别）
-    "launchQq": "",                       // 快速登录 QQ（4-14 位数字；作为 -q <QQ> 参数追加）
-    "webuiPort": 0,                       // NapCat WebUI 端口（一键安装写入；0=未写）
-    "webuiToken": ""                      // NapCat WebUI 令牌（一键安装写入，用于 app 内扫码登录）
+  "weixin": {
+    "enabled": false,                         // 连接是否应在启动时自动恢复
+    "baseUrl": "https://ilinkai.weixin.qq.com",// iLink 网关
+    "token": "",                              // 登录凭据（Bearer token，扫码后自动写入）
+    "accountId": "",                          // 机器人账号，形如 xxx@im.bot
+    "allowFrom": "",                          // 允许的微信用户 ID；空/`*` 允许全部，逗号分隔
+    "routeTag": "",                           // SKRouteTag，仅网关要求时填写
+    "workDir": "",                            // 工作目录；空 = 当前用户主目录
+    "model": "",                              // 留空使用 Codex 当前默认模型
+    "sandbox": "read-only",                   // read-only | workspace-write | danger-full-access
+    "codexPath": ""                           // 留空自动查找独立 Codex CLI
   }
 }
 ```
 
-所有键可缺省；`normalizeQqBot` 负责清洗。令牌与 `gateway.token` 一样明文落盘
-（本机回环服务，威胁模型一致）。
+所有键可缺省，`normalizeWeixin` 负责清洗。首次升级时会把旧 `qqbot.workspaceDir`
+与 `qqbot.codexPath` 迁移到 `weixin`，其它 QQ 配置直接丢弃。凭据与 `gateway.token`
+一样明文落盘（仅当前用户可读的 `~/.gptplus`）。
 
-### 10.2 任务中心（`src/core/task-center.js`）
+### 10.2 模块划分
 
-`createTaskCenter({ store, log, now?, spawnImpl? })`，两类任务统一注册表：
+- `src/core/weixin-connect.js`：iLink 客户端、二维码登录、长轮询、消息过滤/去重、
+  状态文件、每联系人 thread 映射、回复分片与失败回复。
+- `src/core/codex-app-server.js`：Codex app-server 的最小 JSON-RPC 客户端
+  （`initialize` → `thread/resume|start` → `turn/start`）。
+- `src/core/codex-cli.js`：CLI 定位：显式配置 > npm 全局独立 CLI > PATH >
+  桌面版托管 CLI > ChatGPT 内置。优先独立 CLI，避免桌面版把 app-server
+  转交给运行中的 ChatGPT 进程导致「停止连接」无法结束服务。
+- `src/core/task-monitor.js`：观察网关上的 ChatGPT 桌面端轮次，产生开始、
+  5 分钟进度、完成/失败/结束事件；微信来源请求由网关过滤。
 
-- **gateway 任务（g_ 前缀）**：由网关观察接口驱动，只能查看/停止。
-  - `turnRequest({body,slug}) -> {turnKey}|null`：turnKey = sha1(instructions
-    前 4000 字符 + 最后一条 user 消息)。同 turnKey 的重试/工具轮回并为一轮任务；
-    手动停止后 90 秒冷却期内同 turnKey 的客户端重试不再重建任务。客户端对话后
-    自动发起的「会话标题生成」请求（"You are a helpful assistant." 开头且要求
-    输出 title JSON，见 `isTitleGenBody`）不建任务、不通知。
-  - `turnResponse({body,slug,ok,status,hasToolCalls,text})`：status 200 且
-    `hasToolCalls=false` -> 任务完成；499 或 stopRequested -> 已停止；其它失败
-    仅标记 failing（客户端可能重试），由 stale sweep 收口（失败 3 分钟 / 空闲
-    10 分钟）。
-  - `requestStarted({turnKey,requestId,abort})` / `requestFinished({requestId})`：
-    注册在途请求的断开句柄，`stopTask` 用它断开上游流。
-- **exec 任务（e_ 前缀）**：`codex exec --json --skip-git-repo-check
-  --sandbox workspace-write <prompt>` 子进程，stdout JSONL 解析（thread_id /
-  agent_message / turn.completed / turn.failed 容错解析）。
-  - `startExecTask({prompt,cwd})`、`followUp(id,text)`（运行中排队，结束后
-    `codex exec resume <session|--last> <text>` 续跑）、`stopTask(id)`
-    （Windows 用 `taskkill /PID <pid> /T /F` 结束进程树）。
-  - codex 解析顺序：配置显式路径 > ChatGPT(MSIX) 内置
-    `<pkg>/app/resources/codex.exe` > npm 全局
-    `@openai/codex-win32-x64/vendor/.../bin/codex.exe` > PATH（.cmd 走 cmd.exe 包装）。
-- `tick()`（30s 定时）：每任务按 `progressMinutes` 发 progress 通知 + stale 清扫；
-  `listTasks() -> {running[], recent[]}`（含 id/kind/title/model/status/startedAt/
-  endedAt/rounds/queued/lastText/lastError）；`stop()` 供应用退出时结束子进程。
-- 事件：`on('notify', ({kind, task}))`，kind ∈ done|failed|stopped|stale|progress；
-  任务中心不发消息，QQ 侧负责格式化与发送。
+### 10.3 iLink 协议
 
-### 10.3 OneBot 接入（`src/core/qq-bot.js` + 网关路由）
+- `GET  ilink/bot/get_bot_qrcode?bot_type=3`：获取登录二维码
+  （`qrcode` + `qrcode_img_content`）。
+- `GET  ilink/bot/get_qrcode_status?qrcode=...`：轮询扫码状态
+  （`wait / scaned / confirmed / expired`）；请求带
+  `iLink-App-ClientVersion: 1`，成功时返回 `bot_token / ilink_bot_id /
+  baseurl / ilink_user_id`。
+- `POST ilink/bot/getupdates`：长轮询，body 为
+  `{ get_updates_buf, base_info: { channel_version } }`；响应携带
+  `msgs / get_updates_buf / longpolling_timeout_ms`。
+- `POST ilink/bot/sendmessage`：回复，`msg` 必须带 `to_user_id`、
+  `client_id`、`message_type=2`、`message_state=2`、`item_list` 与
+  **入站消息里的 `context_token`**；文本按 3800 字符分片，片间 100ms。
+- 图片入站：`item_list[].type=2` 的 `image_item.media.encrypt_query_param`
+  + `aes_key`（或 `image_item.aeskey` hex）→ CDN
+  `novac2c.cdn.weixin.qq.com/c2c/download`，AES-128-ECB 解密；
+  支持最多 4 张、单张 5MB。
+- 图片出站：`POST ilink/bot/getuploadurl`（`filekey/media_type=1/to_user_id/
+  rawsize/rawfilemd5/filesize/aeskey`）→ 响应优先使用 `upload_full_url`
+  （兼容旧 `upload_param`）→ CDN `c2c/upload` 加密上传，
+  取响应头 `x-encrypted-param` → `sendmessage` 的 `image_item`；
+  `aeskey` 传 hex，`media.aes_key` 传 base64(hex ASCII)，`mid_size` 为
+  填充后的密文大小。单张上限 10MB。
+- 请求头：`Authorization: Bearer <token>`、
+  `AuthorizationType: ilink_bot_token`、随机 `X-WECHAT-UIN`；
+  配置了 `routeTag` 时带 `skroutetag`。
+- 状态文件：`~/.gptplus/weixin-connect-state-<account>.json`（无账号时
+  `weixin-connect-state.json`），保存 `getUpdatesBuf`、`threadIds`、
+  `contextTokens` 与最多 512 条 `processedMessageKeys`；原子替换写入。
+- 收消息只处理 `message_type=1 && message_state=2` 且发送者在
+  `allowFrom` 内的文本/语音转写；超过 5 分钟的消息和已处理消息跳过。
+  缺少 `context_token` 的消息只更新状态、不回复。
 
-> 运行形态：OneBot 框架（NapCat / Lagrange.OneBot / LLOneBot 等任一 OneBot 11
-> 兼容端均可，免费开源）与 gpt++ 跑在同一台电脑，全部经 127.0.0.1 本机回环通信，
-> 不需要服务器、公网或任何付费服务。担心风控时用 QQ 小号登录框架，
-> 主号作为 notifyQq/ownerQq 收通知、发命令。
+### 10.4 扫码登录
 
-- 发送：`POST {apiUrl}/send_private_msg`（Bearer accessToken），连通性探测
-  `GET {apiUrl}/get_login_info`；10 秒超时。
-- 自动拉起（`launchNapCat`）：启动命令取 `launchCommand`，留空时
-  `detectNapCatCommand()` 自动识别——候选目录为各盘根/用户目录/桌面/下载/
-  LOCALAPPDATA 下的 `NapCat` 与 `NapCat*` 文件夹及 npm 全局目录，按已知入口名
-  （NapCatWinBootMain.bat > launcher-user.bat > launcher.bat > … > napcat.cmd
-  > NapCat 开头的 bat/cmd/exe 兜底，免管理员的 user 版优先）取第一个命中。
-  spawn 前先 `syncNapCatConfig`：在 `<命令目录>/config/` 下没有 onebot11 配置时
-  写入默认模板（HTTP 服务器 = apiUrl 端口 + accessToken；HTTP 上报 = 本地网关
-  /onebot/event + eventToken；schema 对齐 NapCat 4.x，条目名 gptplus-api /
-  gptplus-report），已有配置只同步这两个自有条目，不碰用户其它设置；NapCat
-  登录后按模板生成 onebot11_<QQ>.json。随后先探测 `get_login_info`，已在线
-  直接复用；离线时 `spawn(cmd.exe /d /s /c, 命令 [-q 快速登录QQ])`
-  （NapCat 核心解析 -q/--qq；detached + unref + windowsHide，独立静默存活，
-  不保留前台控制台），每 2.5 秒轮询一次
-  `get_login_info`，120 秒内上线即成功，成功后按登录账号自动补全空的
-  launchQq/notifyQq/ownerQq（autoLaunch 开且网关启用时顺带 enabled）。
-  并发调用共享同一 Promise（去重）。触发点：应用启动（main.js 网关
-  autoStart 后）、开关打开（ipc qqbot:set 后台）与渲染层「拉起 NapCat」
-  按钮（ipc `qqbot:launch` 前台等待）；按钮只要求能解析到命令，其余两个
-  还要求 `enabled && autoLaunch`。
-- 接收：网关新增 `POST /onebot/event`（在网关令牌校验**之前**，由可选
-  `eventToken` 自行校验：`Authorization: Bearer` / `access-token` /
-  `X-Access-Token` / `?access_token=`）。NapCat 配置「HTTP POST 上报」指向
-  `http://127.0.0.1:<网关端口>/onebot/event`。
-- 只处理 `post_type=message && message_type=private && sender==ownerQq` 的文本
-  与图片（raw_message 或 message 段数组：文本剥 CQ 码，图片取 image 段的
-  图床直链，无直链时退回 NapCat 本地缓存文件）。**机器人只通报、不干预 Codex**：
+渲染层点「扫码登录 / 重新登录」→ IPC `weixin:qr:start` 获取二维码，
+主进程用 `qr-code.js` 转 PNG data URL；弹窗每 1.5 秒调用
+`weixin:qr:status` 轮询。确认后自动写入 `token / accountId / baseUrl /
+routeTag`，并在 `allowFrom` 为空时填入 `ilink_user_id`；界面刷新为已登录。
 
+### 10.5 微信指令
+
+整条消息精确匹配时拦截（也接受 `帮助。`、`/help` 这类写法），不会进入 Codex：
+
+- `帮助` / `指令` / `菜单` / `help` / `?` → 返回指令列表。
+- `新对话` / `新会话` / `清空上下文` / `重置` / `new` / `reset` / `clear` →
+  删除当前联系人的 `threadIds` 映射并回复确认；下一条消息新建 thread。
+- `状态` / `status` / `当前会话` → 返回连接状态、账号、联系人、工作目录、
+  当前模型、沙箱、会话 id 与已处理消息数。
+
+正常提问（例如「帮助我改代码」「新对话 然后画图」）不会命中指令。
+指令不启动 app-server，也不消耗模型调用；由于消息按顺序处理，当前 Codex
+任务结束后才会执行排队中的指令。
+
+### 10.6 ChatGPT 任务通知
+
+- 新增 `src/core/task-monitor.js`，只观察经过本地网关、且不是微信来源的
+  `/v1/responses` 轮次（ChatGPT 桌面端任务）。
+- 新任务首个请求 → 立即发「▶️ ChatGPT 任务开始」；同一个 turnKey 的工具轮
+  只累加轮次，不重复开始。
+- 运行中每 5 分钟发一次「⏳ ChatGPT 任务进行中」（按任务启动时间计算）；
+  任务完成、停止或失败收口后从运行表移除，不再发 5 分钟进度。
+- 最终响应不含工具调用 → 立即「✅ ChatGPT 任务完成」，附带短结果；
+  客户端中断（HTTP 499）→ 立即「🛑 已停止」；失败先等待客户端重试，
+  5 分钟无重试才收口为失败；20 分钟无请求收口为「💤 已结束」。
+- 微信 app-server 启动时追加
+  `-c model_providers.gptplus.http_headers.X-Gptplus-Source=weixin`，
+  网关同时用 `originator: gptplus-weixin` 兜底识别，避免微信自己的对话
+  被当成 ChatGPT 任务反复通知。
+- 通知通过 iLink `sendmessage` 直接发给微信联系人：优先 `allowFrom` 中第一个
+  已有 `context_token` 的联系人；`allowFrom` 为空时用最近联系人。通知不写入
+  任何 Codex thread、不增加 `processedMessages`、不进入 Codex 上下文。
+- 只有走 gpt++ 本地网关的 ChatGPT 任务可被观察；直接使用官方模型或其它
+  不经网关的请求不会产生任务通知。
+
+### 10.7 Codex 会话
+
+- 启动连接时要求 token 与存在的工作目录；`enabled` 置 true 后开始长轮询。
+- 收到某联系人消息：
+  1. 提取文本/语音转写和图片；图片保存到
+     `~/.gptplus/weixin-media/`，以 `file://` URL 随文本作为
+     app-server 的 `input[] = [{type:'text'}, {type:'image'}]` 发送；
+  2. 按 `from_user_id` 从状态文件取已保存的 thread id；
+  3. 调 app-server `thread/resume`；失败则删除映射并 `thread/start`；
+  4. `turn/start` 发送文本/图片（`approvalPolicy: never`，可选 sandbox/model）；
+  5. 收集 `item/completed` 的 `agentMessage` 文本，`turn/completed`
+     或 `thread/status/changed(idle)` 收口；
+  6. 回复末尾追加 `模型 · ctx NN%` 与压缩后的工作目录；
+  7. 模型没有返回文字时回复「Codex 已完成处理，但没有返回文字内容。」。
+- 图片交给模型前，网关对 `x-gptplus-source: weixin` 请求把
+  `weixin-media/` 内白名单中的 `file://` 图片转成 data URL 再转发上游；
+  目录外文件不读取（防止本机任意文件被发送）。
+- 回合结束后扫描工作目录（深度/条目/目录黑名单限制），把本次新写入或修改的
+  图片（png/jpg/jpeg/webp/gif/bmp，最多 3 张、单张 10MB）上传 iLink 并发回
+  微信；只回传工作目录内的图片，需要沙箱可写。
+- 图片会作为用户消息进入该联系人的 Codex 上下文；「帮助」「状态」等指令
+  仍然不进入上下文。
+- app-server 的审批/用户输入/工具调用请求统一拒绝（`decline` / 空答案 /
+  `tool not available on this client`），避免微信侧无人确认而卡住。
+- 单轮超时 600 秒；连接停止时会结束 app-server 进程树。
+- 失败时给联系人回复首行原因（隐藏用户目录、截断 160 字），状态改为
+  `retrying`，下一条消息会重新拉起 app-server。
+- 状态字段：`state`（stopped/starting/running/retrying/stopping/error）、
+  `message`、`accountId`、`lastPeerId`、`lastMessageAtMs`、
+  `processedMessages`、`hasToken`。
+
+### 10.8 IPC / preload
+
+```js
+getWeixin(): Promise<{ ...weixinConfig, status }>;
+getWeixinStatus(): Promise<WeixinStatus>;
+setWeixin(patch): Promise<{ ...weixinConfig, status }>;
+startWeixin(): Promise<{ ok, error?, status }>;
+stopWeixin(): Promise<{ ok, status }>;
+startWeixinQr(patch): Promise<{ qrStatus, qrContent, qrImage, accountId, linkedUserId, hasToken }>;
+getWeixinQrStatus(): Promise<同上>;
+pickWeixinWorkDir(): Promise<string|null>;
+pickWeixinCodex(): Promise<string|null>;
+detectWeixinCodex(): Promise<{ path, source }>;
+openWeixinLink(url): Promise<true>;
+onWeixinStatus(cb): () => void;   // 事件 gptplus:weixin:status
 ```
-帮助 | 任务/列表 | 状态
-模型/model                  // 重新选择回答模型
-新对话/重置                // 清空问答上下文与模型选择
-<任意其它文本或图片>       // 手机问答：首次提问先回模型列表（回序号选择，5 分钟内有效），
-                           // 选定后连续追问直接回答；POST 本地网关 /v1/responses
-                           //（stream:false，Bearer gateway.token，带 X-Gptplus-Qq-Chat: 1
-                           // 标记——网关任务观察据此跳过，聊天不会误报成 Codex 任务），
-                           // 内存态多轮（保留 12 条，闲置 30 分钟或「新对话」清空），
-                           // 不创建/停止/修改任何 Codex 任务
-```
 
-- 图片消息：收到 image 段（或 CQ:image 字符串兜底）立即下载图床直链
-  （30 秒超时；单张 ≤5MB、单条 ≤4 张；类型按响应头/魔数/扩展名识别）转成
-  data URL，随提问以 `input_image` 发给模型（openai/anthropic 适配器均支持）。
-  只发图不配文字时用默认提问「请描述这张图片的内容」；选模型前收到的图片
-  随待答问题暂存，回序号后一起发出（带图消息中的数字不当模型序号）。
-  多轮上下文只保留最近 2 条带图消息的图片，更早的剔除以控制请求体大小；
-  下载/超限失败会以「⚠ 命令执行失败」回复原因。
+- 保存时会校验 baseUrl 为 http(s)、sandbox 枚举；`enabled` 仅由启动/停止控制。
+- 应用启动时若 `weixin.enabled && token`，主进程自动调用 `autoStart()`；
+  退出时 `shutdown()` 停止长轮询与 app-server，但不改写 `enabled`。
+- 渲染层不发起任何网络请求；二维码、状态与文件选择全部经 IPC。
 
-- 通知格式（只留任务名+耗时+结果）：完成（`✅「名」· 耗时\n回答`）、失败
-  （+原因）、停止、已结束（空闲超时）、进行中（耗时+轮数）。
+### 10.9 安全与边界
 
-### 10.4 IPC（preload `window.gptplus`）
-
-```ts
-getQqBot(): Promise<{ enabled, apiUrl, accessToken, eventToken, notifyQq, ownerQq,
-  progressMinutes, codexPath, workspaceDir, autoLaunch, launchCommand, launchQq,
-  launch: { phase: 'idle'|'launching'|'online'|'failed', at, error, account },
-  detectedLaunch: string,               // launchCommand 为空时自动识别到的启动命令（无则 ''）
-  webhookUrl, gatewayRunning, codex: { path, source } | { path:'', error },
-  install: NapCatInstallState }>;       // 一键安装状态快照（见 10.6）
-setQqBot(patch): Promise<同上>;   // 开启时要求 notifyQq 已填、gateway.enabled
-testQqBot(): Promise<{ api: {ok, account?, nickname?, error?}, sent: {ok, error?} }>;
-launchNapCat(): Promise<{ ok, detected?, alreadyRunning?, account?, nickname?, error? }>;
-installNapCat(): Promise<NapCatInstallState>;   // 启动/复用一键安装（并发去重），直到 done/failed 才返回
-getNapCatInstallState(): Promise<NapCatInstallState>;
-onNapCatInstall(cb): () => void;                // 事件 gptplus:qqbot:install，主进程节流推送
-onQqLaunch(cb): () => void;                     // 事件 gptplus:qqbot:launch，拉起状态变化推送
-getTasks(): Promise<{ running: TaskSnapshot[], recent: TaskSnapshot[], at: number }>;
-```
-
-### 10.5 边界与安全
-
-- 网关默认只绑 127.0.0.1，上报路由只暴露给本机 NapCat；若用户改绑 0.0.0.0，
-  必须设置 eventToken（设置页有提示）。
-- 命令只认 ownerQq 的私聊；NapCat 不可达时通知发送失败只记日志，不影响网关。
-- exec 任务继承注入的 `model_provider=gptplus` 配置；注入关闭时 codex 用官方
-  登录态，行为不变。
-
-### 10.6 一键安装（`src/core/napcat-install.js` + `napcat-webui.js` + `qr-code.js`）
-
-QQ 远程页「一键安装」把装 QQ 桌面版 + 装 NapCat + 写配置 + 拉起登录串成一个
-状态机（`createNapCatInstaller({store, qqBot, log, onEvent, fetchImpl, …})`，
-全依赖注入）。安装目录固定 `%LOCALAPPDATA%\NapCat`（detectNapCatCommand 的
-候选目录，自动识别可直接命中）。
-
-阶段（phase）：`prepare → qq-check →（未装 QQ 时）qq-download → qq-install →
-napcat-download → extract → configure → launch → done | failed`。
-
-- **QQ 检测**：注册表 `HKLM\SOFTWARE\WOW6432Node\...\Uninstall\QQ` 的
-  UninstallString 推导 QQ.exe（NapCat launcher 同款逻辑），失败兜底
-  `%ProgramFiles%\Tencent\QQNT\QQ.exe`。
-- **QQ 下载**：官网下载按钮背后的「彩虹配置」端点
-  `cdn-go.cn/qq-web/im.qq.com_new/latest/rainbow/windowsConfig.js` 永远返回
-  最新版直链（取 `ntDownloadX64Url`）；qqdl.gtimg.cn 不可达时换 dldir1.qq.com
-  （同路径换 host）。
-- **QQ 静默安装**：QQNT 安装器是 NSIS，`spawn(setup.exe, ['/S'])`（会弹一次
-  UAC），装完轮询注册表键确认（10 分钟窗口）。
-- **NapCat 下载**：GitHub Releases 的 `NapCat.Shell.zip`（latest 直链，约
-  36MB；失败追加 ghproxy 镜像前缀），流式下载带进度/看门狗（120s 无进度中断）。
-- **解压**：Windows 内置 bsdtar（`System32\tar.exe -xf`），先解压到
-  `<installDir>.new-<hex>` 临时目录、校验 launcher-user.bat 存在后原子替换，
-  避免半成品被自动识别误命中。无新依赖。
-- **configure**：写 store（launchCommand=解压出的 launcher-user.bat、
-  autoLaunch=true）；onebot11 配置仍由 launchNapCat 内的 syncNapCatConfig 写。
-- **launch/登录**：先 launchNapCat（内含 -q 快速登录与 2 分钟在线等待），
-  未上线则进入 WebUI 流程（`napcat-webui.js`）：
-  - 启动 NapCat 前写入 `config/webui.json`（端口 6099 固定、令牌随机生成，
-    port/token 存入 qqbot 配置）；已存在则读回真实值（NapCat 登录后会刷新 token）。
-  - 认证：`POST /api/auth/login {hash: sha256(token+".napcat")}` →
-    `data.Credential`，后续带 `Authorization: Bearer`；401 自动重读 webui.json
-    重认证一次。
-  - `GetQuickLoginListNew` 有历史账号 → `SetQuickLogin` 免扫码；
-    否则 `GetQQLoginQrcode` 取登录 URL，经 `qr-code.js`（vendored
-    qrcode-generator 生成矩阵 + 手写 1-bit PNG 编码，Node zlib）转 PNG
-    data URL，随事件推送 → 渲染层弹扫码窗（qrImage 变化才重开弹窗，
-    其余进度只更新弹窗文案：waiting_qrcode 提示扫码，qrcode_scanned 提示手机确认，
-    initializing 提示登录初始化；`loginError` 原样展示，过期时调用
-    `RefreshQRcode` 并等待新二维码 URL）。
-  - 轮询 `apiTest`（OneBot get_login_info）为最终登录判据；WebUI 的
-    `qrLoginAccepted` / `coreReady` 用于展示确认与初始化阶段，但不会代替
-    OneBot 在线验证。只有上线后才 `markLaunchOnline` 并 `adoptLoginAccount`
-    自动补全 launchQq/notifyQq/ownerQq；超时或 NapCat 返回登录错误均置
-    `failed`，不会把未登录状态报告为成功。NapCat 以 detached + unref +
-    windowsHide 启动，stdin/stdout/stderr 均忽略，不保留前台控制台。
-
-事件 `{phase, percent, detail, error, account, qrImage, loginPhase, at}`
-经 `onEvent` → main.js broadcast `gptplus:qqbot:install`；主进程节流
-（phase/detail/loginPhase/qrImage 变化或 percent ≥1 才推）。任何阶段失败置
-`failed`（error 带原因，界面可重试），不写 store。
-
-拉起状态 `{phase: 'idle'|'launching'|'online'|'failed', at, error, account}`
-的每次跃迁都经 qq-bot `setLaunch` 单一入口 → `onEvent` → main.js broadcast
-`gptplus:qqbot:launch`（phase/account/error 都没变不重复推）；渲染层订阅后
-实时刷新拉起芯片（「拉起中…/在线/失败」），不再依赖整页 reload。
+- 只处理 `allowFrom` 白名单联系人的消息；白名单为空表示允许全部（与
+  Codex++ 一致），界面已明确提示。
+- 微信连接不使用网关的 `/onebot/event`，也不需要公网或额外端口。
+- 图片内联只接受微信来源请求、只读取 `~/.gptplus/weixin-media/` 内的普通文件，
+  拒绝符号链接、目录、超大文件和其它本地路径。
+- 图片回传只扫描设置的工作目录，跳过 `.git`、`node_modules`、`.gptplus` 等
+  目录，不读取系统目录或用户主目录中的无关图片。
+- 微信凭据、状态文件与 Codex 配置都只保存在当前用户的 `~/.gptplus` /
+  `~/.codex`，不写入安装包或日志（日志只记状态与错误原因）。

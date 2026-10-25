@@ -10,6 +10,7 @@ const {
   parseTasklistPids,
   listChatGptPids,
   killChatGpt,
+  findChatGptDebugPort,
 } = require('../src/core/chatgpt-launch.js');
 
 function launcher(options = {}) {
@@ -385,6 +386,30 @@ test('开机自启动校验同样使用配置里实际 exe 的进程名', async 
   ]);
 });
 
+test('开机自启动将 CDP 端口和包装器目录传给 ChatGPT 启动器', async () => {
+  let running = [];
+  let launchOptions = null;
+  const result = await launchChatGptAndVerify({
+    executablePath: 'C:\\Apps\\ChatGPT.exe',
+    cdpPort: 9334,
+    wrapperDir: 'C:\\gptplus\\cdp',
+    launch: async (options) => {
+      launchOptions = options;
+      running = [303];
+      return { ok: true, exe: 'C:\\Apps\\ChatGPT.exe' };
+    },
+    listPids: async () => running.slice(),
+    sleep: async () => {},
+    pollMs: 0,
+    launchTimeoutMs: 0,
+    attempts: 1,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(launchOptions.cdpPort, 9334);
+  assert.equal(launchOptions.wrapperDir, 'C:\\gptplus\\cdp');
+});
+
 // ============================================================
 // 开机自启动：应用入口调用成功之外，还要确认进程真的出现
 // ============================================================
@@ -543,4 +568,17 @@ test('开机自启动的启动错误会保留并在重试后返回', async () =>
   };
   assert.deepEqual(await launchChatGptAndVerify(options), { ok: false, error: 'spawn failed' });
   assert.equal(attempts, 2);
+});
+
+test('findChatGptDebugPort extracts the debug port from the running client command line', async () => {
+  const calls = [];
+  const execText = async (command, args) => {
+    calls.push({ command, args });
+    return '"C:\Apps\ChatGPT.exe" --remote-debugging-port=9444 --remote-allow-origins=http://127.0.0.1:9444';
+  };
+  assert.equal(await findChatGptDebugPort({ execText }), 9444);
+  assert.equal(calls[0].command, 'powershell.exe');
+  assert.match(calls[0].args.join(' '), /remote-debugging-port/);
+  assert.equal(await findChatGptDebugPort({ execText: async () => '' }), null);
+  assert.equal(await findChatGptDebugPort({ execText: async () => '--remote-debugging-port=0' }), null);
 });

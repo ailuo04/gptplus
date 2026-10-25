@@ -2195,39 +2195,6 @@ html.is-theme-switching .logs {
 .flow-node .flow-val { color: var(--fg); font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 11.5px; }
 .flow-node .flow-summary { color: var(--fg-dim); font-size: 11.5px; }
 .flow-node .flow-val.is-dim { color: var(--fg-faint); }
-.runtime-metrics {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: clamp(8px, 1.5vw, 18px);
-  min-width: 0;
-  flex: 0 1 auto;
-  color: var(--fg-dim);
-}
-.runtime-metric {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  min-width: 0;
-  flex: 0 0 auto;
-  white-space: nowrap;
-  font-size: 11.5px;
-  font-variant-numeric: tabular-nums;
-}
-.runtime-metric > .icon { color: var(--fg-faint); }
-.runtime-metric-context { gap: 6px; }
-.runtime-context-ring {
-  width: 14px;
-  height: 14px;
-  flex: 0 0 14px;
-  border-radius: 50%;
-  background: conic-gradient(var(--accent) var(--runtime-progress, 0%), var(--line-strong) 0);
-  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 1px));
-  mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 1px));
-  transform: rotate(-90deg);
-}
-.runtime-metric .nums { color: var(--fg); }
-.runtime-metric-label { color: var(--fg-dim); }
 .flow-node.is-codex {
   --flow-color: var(--codex);
   --flow-line: var(--codex-line);
@@ -3208,9 +3175,6 @@ html.is-theme-switching .logs {
   .flow-provider, .flow-sep { display: none; }
   .flow { gap: 12px; }
   .flow-node { flex: 0 0 auto; gap: 5px; }
-  .runtime-metrics { gap: 10px; }
-  .runtime-metric { gap: 4px; font-size: 10.5px; }
-  .runtime-metric-label { display: none; }
   .statusbar { padding: 0 10px; gap: 8px; }
   .statusbar-right { gap: 6px; }
   #build-tag { display: none; }
@@ -3268,34 +3232,105 @@ html.is-theme-switching .logs {
   .usage-heatmap-frame { min-width: 0; }
 }
 
-/* ============ QQ 远程助手 ============ */
-.qq-webhook-row { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
-.qq-webhook-url { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg-faint); padding: 6px 0; }
-.qq-setup { margin-top: var(--sp-2); line-height: 1.6; }
-.qq-actions { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; margin-top: var(--sp-3); }
-.qq-tasks-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); margin-top: var(--sp-4); }
-.qq-task-list { display: flex; flex-direction: column; gap: var(--sp-2); margin-top: var(--sp-2); }
-.qq-task-gap { margin-top: var(--sp-2); }
-.qq-task-row { display: flex; align-items: flex-start; gap: var(--sp-2); padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; min-width: 0; }
-.qq-task-badge { flex: 0 0 auto; line-height: 1.4; }
-.qq-task-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
-.qq-task-meta { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
-.qq-task-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.qq-test-line { margin-top: var(--sp-1); }
-.qq-task-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* ============ 微信连接 ============ */
+.weixin-status-card .weixin-status-body { padding: var(--sp-4); }
+.weixin-status-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--sp-4); flex-wrap: wrap; }
+.weixin-status-primary { display: flex; align-items: flex-start; gap: var(--sp-3); min-width: 0; }
+.weixin-status-icon {
+  width: 44px; height: 44px; flex: 0 0 auto; display: grid; place-items: center;
+  border-radius: 12px; border: 1px solid var(--accent-line);
+  background: var(--accent-soft); color: var(--accent-hi);
+}
+.weixin-status-copy { min-width: 0; }
+.weixin-status-title-row { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+.weixin-status-title { margin: 0; font-size: var(--fs-h2); font-weight: 650; letter-spacing: 0; color: var(--fg); }
+.weixin-status-message { margin-top: 3px; }
+.weixin-actions { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+.weixin-status-head .weixin-actions { justify-content: flex-end; }
+.weixin-meta {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0;
+  margin-top: var(--sp-4); padding-top: var(--sp-3); border-top: 1px solid var(--line);
+}
+.weixin-meta-cell {
+  min-width: 0; display: flex; flex-direction: column; gap: 4px;
+  padding: 0 var(--sp-3); border-left: 1px solid var(--line);
+}
+.weixin-meta-cell:first-child { border-left: 0; padding-left: 0; }
+.weixin-meta-label { font-size: var(--fs-meta); color: var(--fg-faint); }
+.weixin-meta-value {
+  font-size: 13px; color: var(--fg); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.weixin-form { display: flex; flex-direction: column; gap: var(--sp-4); }
+.weixin-form-section { display: flex; flex-direction: column; gap: var(--sp-2); }
+.weixin-form-section + .weixin-form-section { border-top: 1px solid var(--line); padding-top: var(--sp-3); }
+.weixin-form-section-title { display: flex; align-items: center; gap: var(--sp-2); color: var(--fg-dim); font-size: var(--fs-meta); }
+.weixin-form-section-title .icon { color: var(--fg-faint); }
+.weixin-form-fields { display: flex; flex-direction: column; gap: var(--sp-3); }
+.weixin-input-row, .weixin-path-row { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; flex-wrap: wrap; }
+.weixin-input-row .input, .weixin-path-row .input { flex: 1 1 240px; min-width: 0; }
+.weixin-icon-btn { width: 34px; padding: 0; flex: 0 0 auto; }
+.weixin-save-row { margin-top: var(--sp-1); }
+.weixin-command-hint { margin-top: var(--sp-3); }
+.weixin-qr-modal { width: min(400px, calc(100vw - 48px)); }
+.weixin-qr-body { display: flex; flex-direction: column; align-items: center; gap: var(--sp-2); }
+.weixin-qr-status { font-weight: 600; text-align: center; }
+.weixin-qr-img { width: 240px; height: 240px; display: block; background: #fff; border-radius: 10px; padding: 8px; }
+.weixin-qr-link { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg-faint); font-size: 11.5px; }
 
-/* ---- 一键安装 ---- */
-.qq-install { display: flex; flex-direction: column; gap: var(--sp-2); }
-/* 就绪态：状态 chip + 重新安装按钮收到「运行状态」卡头部右上角 */
-.qq-head-install { margin-left: auto; display: flex; align-items: center; gap: var(--sp-2); flex-shrink: 0; }
-.qq-install-head { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; min-width: 0; }
-.qq-install-head .hint { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 160px; min-width: 0; }
-.qq-install-bar { height: 6px; border-radius: 999px; background: var(--line); overflow: hidden; }
-.qq-install-fill { height: 100%; border-radius: 999px; background: var(--accent); transition: width 0.3s ease; }
-.qq-install-error { color: var(--fg-faint); }
+@media (max-width: 700px) {
+  .weixin-meta { grid-template-columns: 1fr; gap: var(--sp-2); }
+  .weixin-meta-cell { border-left: 0; padding: 0; }
+  .weixin-status-head { flex-direction: column; }
+  .weixin-status-head .weixin-actions { justify-content: flex-start; }
+}
 
-/* ---- QQ 扫码登录弹窗 ---- */
-.modal-qr { width: min(320px, calc(100vw - 48px)); }
-.qq-qr-body { display: flex; flex-direction: column; align-items: center; gap: var(--sp-3); }
-.qq-qr-status { font-weight: 600; text-align: center; }
-.qq-qr-img { width: 220px; height: 220px; display: block; background: #fff; border-radius: 10px; padding: 8px; }
+/* ============ 插件市场 ============ */
+*[hidden] { display: none !important; }
+.plugins-intro {
+  display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-4);
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: linear-gradient(135deg, var(--bg-panel-2), var(--bg-panel));
+}
+.plugins-intro-mark {
+  display: grid; place-items: center; width: 38px; height: 38px; flex: 0 0 38px;
+  border: 1px solid var(--accent-line); border-radius: 9px;
+  background: var(--accent-soft); color: var(--accent-hi);
+}
+.plugins-intro-copy { min-width: 0; }
+.plugins-intro-copy h2 { margin: 0; font-size: var(--fs-h2); font-weight: 650; color: var(--fg); }
+.plugins-intro-copy p { margin: 5px 0 0; color: var(--fg-dim); font-size: var(--fs-body); line-height: 1.55; }
+.plugin-market-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-3); margin-top: var(--sp-3); }
+.plugin-card { min-width: 0; display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg-panel); overflow: hidden; }
+.plugin-card-head { display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-4); }
+.plugin-card-mark { display: grid; place-items: center; width: 42px; height: 42px; flex: 0 0 42px; border: 1px solid var(--line-strong); border-radius: 10px; color: var(--accent-hi); background: var(--bg-inset); }
+.plugin-card-title { min-width: 0; flex: 1 1 auto; }
+.plugin-card-title-row { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; flex-wrap: wrap; }
+.plugin-card-title-row h2 { min-width: 0; margin: 0; color: var(--fg); font-size: 15px; font-weight: 650; letter-spacing: 0; }
+.plugin-card-meta { display: flex; gap: var(--sp-2); margin-top: 5px; color: var(--fg-faint); font-size: var(--fs-meta); flex-wrap: wrap; }
+.plugin-toggle { flex: 0 0 36px; margin-top: 2px; }
+.plugin-card-body { display: flex; flex-direction: column; gap: 5px; min-height: 104px; padding: 0 var(--sp-4) var(--sp-3); }
+.plugin-card-description { margin: 0; color: var(--fg-dim); font-size: var(--fs-body); line-height: 1.55; }
+.plugin-card-detail { margin: 0; color: var(--fg-faint); font-size: var(--fs-meta); line-height: 1.55; }
+.plugin-card-foot { display: flex; align-items: center; gap: var(--sp-3); justify-content: space-between; padding: var(--sp-3) var(--sp-4); border-top: 1px solid var(--line); background: var(--bg-inset); }
+.plugin-card-actions { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; justify-content: flex-end; }
+.plugin-config-modal { width: min(520px, calc(100vw - 48px)); }
+.plugin-config-body { display: flex; flex-direction: column; gap: var(--sp-3); }
+.plugin-config-options { display: flex; flex-direction: column; gap: 8px; }
+.plugin-config-option { display: flex; align-items: flex-start; gap: 10px; padding: 10px 11px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--bg-inset); cursor: pointer; }
+.plugin-config-option:hover { border-color: var(--accent-line); background: var(--bg-hover); }
+.plugin-config-option input { margin: 2px 0 0; accent-color: var(--accent); }
+.plugin-config-option-copy { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.plugin-config-option-copy strong { color: var(--fg); font-size: var(--fs-body); font-weight: 650; }
+
+@media (max-width: 900px) {
+  .plugin-market-grid { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 700px) {
+  .plugins-intro { padding: var(--sp-3); }
+  .plugin-card-head { padding: var(--sp-3); }
+  .plugin-card-body { padding: 0 var(--sp-3) var(--sp-3); min-height: 0; }
+  .plugin-card-foot { align-items: flex-start; flex-direction: column; padding: var(--sp-3); }
+  .plugin-card-actions { width: 100%; justify-content: flex-start; }
+}

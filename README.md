@@ -19,7 +19,8 @@ ChatGPT 桌面端内置 OpenAI 的 Codex 引擎，它的模型清单由配置里
 
 1. 把你在界面上配好的模型写成一份符合引擎 schema 的目录 JSON；
 2. 在 `~/.codex/config.toml` 顶部写入 `model` / `model_provider` / `model_catalog_json`
-   三个顶层键，并追加一个指向本地网关的 `[model_providers.gptplus]` 段；
+   三个顶层键，并追加一个指向本地网关的 `[model_providers.gptplus]` 段；网关令牌
+   通过 `auth.command` 按需读取，不写进 Codex 配置；
 3. 起一个本地网关，按模型 slug 把请求路由到真正的提供商。
 
 改完重启 ChatGPT 客户端即可在选择器里看到。
@@ -41,6 +42,8 @@ npm start                   # 启动 gpt++
    也可以单独删除某个模型；删掉最后一个启用模型时会自动还原官方模型并关闭注入。
 3. 点「重启 ChatGPT 客户端」，然后在对话框的模型选择器里选择你的模型。
 4. 左侧底部开启「开机自启动」后，可选择「仅 gpt++」或「gpt++ + ChatGPT」；选择组合启动时，Windows 登录后会在网关启动检查完成后通过系统应用入口唤起 ChatGPT 主窗口。已启用的旧版登录项会自动迁移，无需重新开关自启动。
+5. **插件市场** → 按需安装、启用和配置随 gpt++ 发布的功能。目前提供「微信连接」和「ChatGPT 用量信息栏」：用量信息栏会在 ChatGPT 输入框下方显示生成速度、缓存命中率和上下文占用，可在插件卡片里单独配置要显示的指标。
+6. **微信连接** → 扫码登录个人微信后，每个微信联系人会映射到独立的 Codex 会话：在微信里直接发消息，由本机 Codex 在设定的工作目录里处理并回复。连接使用微信官方 iLink Bot API 长轮询，不需要公网 IP；可配置联系人白名单、工作目录、模型与沙箱权限。微信里发送「帮助」查看指令；发送「新对话」清空当前联系人的上下文，发送「状态」查看连接信息。也可以直接发送图片（带文字说明即可让 Codex 查看/修改），本次回合在工作目录中新生成或修改的图片会自动回传微信（最多 3 张，需要工作目录可写）。ChatGPT 任务开始/完成会即时通知，运行中每 5 分钟提醒一次；通知直接发到微信，不进入 Codex 上下文。
 
 ## 打包给别人安装
 
@@ -111,7 +114,7 @@ git push origin v1.1.0
 ## 开发
 
 ```powershell
-npm test                    # 三套单测（core / gateway / renderer），用例数以运行结果为准
+npm test                    # 全部单测（core / gateway / renderer / 微信连接 / app-server）
 npm run test:core           # 逐套跑更稳
 npm run test:gateway
 npm run test:renderer

@@ -1,16 +1,21 @@
 'use strict';
 // 终局验证：真实客户端 → 成品网关(src/core/gateway) → 假上游提供商。
 // 三种场景：纯文本、工具调用往返、鉴权失败。
-// 全程隔离在 probe/final 下，不碰用户的 ~/.codex 与 ~/.gptplus。
+// 全程隔离在系统临时目录，不碰用户的 ~/.codex 与 ~/.gptplus。
 // 用法: node tools/verify-final.cjs
 const fs = require('node:fs');
 const http = require('node:http');
+const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 
-const CODEX = 'C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.930.2377.0_x64__2p2nqsd0c76g0\\app\\resources\\codex.exe';
+const CODEX = process.env.CODEX_CLI_PATH
+  || 'C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.930.2377.0_x64__2p2nqsd0c76g0\\app\\resources\\codex.exe';
 const ROOT = path.resolve(__dirname, '..');
-const sandbox = path.join(ROOT, 'probe', 'final');
+const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'gptplus-verify-final-'));
+process.once('exit', () => {
+  try { fs.rmSync(sandbox, { recursive: true, force: true }); } catch { /* best effort */ }
+});
 const codexHome = path.join(sandbox, 'codex-home');
 const catalogPath = path.join(sandbox, 'model-catalog.json');
 const GW_PORT = 18140;
@@ -23,7 +28,6 @@ const check = (name, ok, detail) => {
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-fs.rmSync(sandbox, { recursive: true, force: true });
 fs.mkdirSync(codexHome, { recursive: true });
 
 // ---------------------------------------------------------------- 假上游提供商

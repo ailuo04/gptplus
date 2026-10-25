@@ -10,8 +10,12 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { pathToFileURL } = require('node:url');
 
-const { createGateway } = require('../src/core/gateway/server.js');
+const { createGateway, inlineWeixinImageUrls, isWeixinGatewayRequest } = require('../src/core/gateway/server.js');
 const { pipeResponsesSse } = require('../src/core/gateway/responses.js');
 const { slugify, parseSlug, createRouter } = require('../src/core/gateway/router.js');
 const openaiAdapter = require('../src/core/gateway/adapters/openai.js');
@@ -157,9 +161,9 @@ const SAMPLE_PROVIDER = {
   ],
 };
 
-async function withGateway({ providers = [SAMPLE_PROVIDER], gatewayPatch = {}, logs = [] } = {}) {
+async function withGateway({ providers = [SAMPLE_PROVIDER], gatewayPatch = {}, logs = [], taskObserver = null, paths = null } = {}) {
   const store = makeStore(providers, gatewayPatch);
-  const gw = createGateway({ store, log: (entry) => logs.push(entry) });
+  const gw = createGateway({ store, log: (entry) => logs.push(entry), taskObserver, paths });
   const started = await gw.start({ port: 0, host: '127.0.0.1', token: gatewayPatch.token ?? '' });
   return { gw, store, logs, port: started.port, base: started.url };
 }
@@ -437,6 +441,35 @@ test('token 非空时必须是 Authorization: Bearer <token>，否则 401', asyn
     assert.equal((await ctx.gw.probe()).ok, true);
   } finally {
     await ctx.gw.stop();
+  }
+});
+
+test('live thread usage endpoint requires the gateway token and allows the injected statusline origin', async () => {
+  const usageLive = { read: (id) => ({ status: 'ok', session_id: id, events: [{ input_tokens: 4 }] }) };
+  const store = makeStore([], { token: 'usage-secret' });
+  const gw = createGateway({ store, usageLive });
+  const started = await gw.start({ port: 0, host: '127.0.0.1', token: 'usage-secret' });
+  try {
+    const url = `http://127.0.0.1:${started.port}/thread-usage-live`;
+    const denied = await postJson(url, { session_id: 'thread_12345678' });
+    assert.equal(denied.status, 401);
+
+    const allowed = await fetch(url, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer usage-secret', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: 'thread_12345678' }),
+    });
+    assert.equal(allowed.status, 200);
+    assert.equal(allowed.headers.get('access-control-allow-origin'), '*');
+    assert.deepEqual(await allowed.json(), {
+      status: 'ok', session_id: 'thread_12345678', events: [{ input_tokens: 4 }],
+    });
+
+    const preflight = await fetch(url, { method: 'OPTIONS' });
+    assert.equal(preflight.status, 204);
+    assert.equal(preflight.headers.get('access-control-allow-methods'), 'POST, OPTIONS');
+  } finally {
+    await gw.stop();
   }
 });
 
@@ -2106,5 +2139,183 @@ test('502 且报错提到可选参数时优先兼容重试（总共只重发一�
   } finally {
     await ctx.gw.stop();
     await upstream.close();
+  }
+});
+
+test('gateway: ChatGPT 请求转交任务监听，微信来源请求被跳过', async (t) => {
+  const upstream = await startMockUpstream((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'chatcmpl-task',
+      object: 'chat.completion',
+      created: 1,
+      model: 'gpt-6.1-sol',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 },
+    }));
+  });
+  t.after(() => upstream.close());
+
+  const events = { turns: [], started: [], responses: [], finished: [] };
+  const taskObserver = {
+    turnRequest: ({ body, slug }) => {
+      events.turns.push({ body, slug });
+      return { turnKey: 'turn-1' };
+    },
+    requestStarted: (info) => events.started.push(info),
+    turnResponse: (info) => events.responses.push(info),
+    requestFinished: (info) => events.finished.push(info),
+  };
+  const ctx = await withGateway({
+    providers: [{ ...SAMPLE_PROVIDER, baseUrl: `${upstream.url}/v1` }],
+    taskObserver,
+  });
+  try {
+    const payload = {
+      model: 'p_ab12cd__gpt-6.1-sol',
+      stream: false,
+      instructions: 'You are Codex.',
+      input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: '修一下登录' }] }],
+    };
+    let res = await fetch(`http://127.0.0.1:${ctx.port}/v1/responses`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(events.turns.length, 1);
+    assert.equal(events.started.length, 1);
+    assert.equal(events.started[0].turnKey, 'turn-1');
+    assert.equal(events.responses.length, 1);
+    assert.equal(events.responses[0].status, 200);
+    assert.equal(events.responses[0].hasToolCalls, false);
+    assert.equal(events.finished.length, 1);
+
+    res = await fetch(`http://127.0.0.1:${ctx.port}/v1/responses`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Gptplus-Source': 'weixin' },
+      body: JSON.stringify(payload),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(events.turns.length, 1, '微信来源请求不能算 ChatGPT 任务');
+    assert.equal(events.finished.length, 1);
+
+    res = await fetch(`http://127.0.0.1:${ctx.port}/v1/responses`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', originator: 'gptplus-weixin' },
+      body: JSON.stringify(payload),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(events.turns.length, 1, 'originator 兜底也要跳过微信请求');
+  } finally {
+    await ctx.gw.stop();
+  }
+});
+
+test('gateway: 只把微信媒体目录内的 file:// 图片内联为 data URL', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gptplus-gateway-image-'));
+  try {
+    const media = path.join(dir, 'weixin-media');
+    fs.mkdirSync(media);
+    const inside = path.join(media, 'a.png');
+    const outside = path.join(dir, 'secret.png');
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl1sAAAAASUVORK5CYII=', 'base64');
+    fs.writeFileSync(inside, png);
+    fs.writeFileSync(outside, png);
+
+    const fileUrl = pathToFileURL(inside).href;
+    const body = {
+      input: [{
+        type: 'message', role: 'user', content: [
+          { type: 'input_text', text: '看看这张图' },
+          { type: 'input_image', image_url: fileUrl, detail: 'auto' },
+        ],
+      }],
+    };
+    assert.equal(inlineWeixinImageUrls(body, media), 1);
+    assert.match(body.input[0].content[1].image_url, /^data:image\/png;base64,/);
+
+    const objectBody = {
+      input: [{
+        type: 'message', role: 'user', content: [
+          { type: 'image_url', image_url: { url: fileUrl } },
+        ],
+      }],
+    };
+    assert.equal(inlineWeixinImageUrls(objectBody, media), 1);
+    assert.match(objectBody.input[0].content[0].image_url.url, /^data:image\/png;base64,/);
+
+    const outsideBody = {
+      input: [{
+        type: 'message', role: 'user', content: [
+          { type: 'input_image', image_url: pathToFileURL(outside).href },
+        ],
+      }],
+    };
+    const outsideUrl = outsideBody.input[0].content[0].image_url;
+    assert.equal(inlineWeixinImageUrls(outsideBody, media), 0);
+    assert.equal(outsideBody.input[0].content[0].image_url, outsideUrl, '媒体目录外文件不能读取');
+
+    assert.equal(isWeixinGatewayRequest({ headers: { 'x-gptplus-source': 'weixin' } }), true);
+    assert.equal(isWeixinGatewayRequest({ headers: { originator: 'gptplus-weixin' } }), true);
+    assert.equal(isWeixinGatewayRequest({ headers: { originator: 'ChatGPT' } }), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('gateway: 微信请求中的本地图片在转发前内联，普通请求保持原样', async (t) => {
+  const upstream = await startMockUpstream((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'chatcmpl-image', object: 'chat.completion', created: 1, model: 'gpt-6.1-sol',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 },
+    }));
+  });
+  t.after(() => upstream.close());
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gptplus-inline-http-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const media = path.join(dir, 'weixin-media');
+  fs.mkdirSync(media);
+  const file = path.join(media, 'a.png');
+  fs.writeFileSync(file, Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl1sAAAAASUVORK5CYII=', 'base64'));
+  const fileUrl = pathToFileURL(file).href;
+  const ctx = await withGateway({
+    providers: [{ ...SAMPLE_PROVIDER, baseUrl: `${upstream.url}/v1` }],
+    paths: { APP_DIR: dir },
+  });
+  try {
+    const payload = {
+      model: 'p_ab12cd__gpt-6.1-sol',
+      stream: false,
+      instructions: 'You are Codex.',
+      input: [{
+        type: 'message', role: 'user', content: [
+          { type: 'input_text', text: '看看这张图' },
+          { type: 'input_image', image_url: fileUrl, detail: 'auto' },
+        ],
+      }],
+    };
+    let res = await fetch(`http://127.0.0.1:${ctx.port}/v1/responses`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Gptplus-Source': 'weixin' },
+      body: JSON.stringify(payload),
+    });
+    assert.equal(res.status, 200);
+    const weixinBody = upstream.requests[0].body;
+    assert.match(JSON.stringify(weixinBody), /data:image\/png;base64,/);
+    assert.doesNotMatch(JSON.stringify(weixinBody), /file:\/\//, '微信请求不应把本地路径透传给上游');
+
+    res = await fetch(`http://127.0.0.1:${ctx.port}/v1/responses`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    assert.equal(res.status, 200);
+    const plainBody = upstream.requests[1].body;
+    assert.match(JSON.stringify(plainBody), /file:\/\//, '非微信请求不能读取本地文件，应保持 file URL 原样');
+  } finally {
+    await ctx.gw.stop();
   }
 });

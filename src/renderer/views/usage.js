@@ -116,29 +116,6 @@ function completedRows(state) {
     .sort((a, b) => Number(b.at || 0) - Number(a.at || 0));
 }
 
-/** 最近一次成功请求的轻量状态栏指标；上下文占比仅是 usage 对配置窗口的估算。 */
-export function latestUsageIndicators(state, contextWindow) {
-  const entry = completedRows(state).find((row) => isSuccessStatus(row.status) && row.tokens);
-  if (!entry) return null;
-
-  const { input, cached, output } = tokenMetrics(entry);
-  const elapsed = Number(entry.ms) || 0;
-  const windowSize = Number(contextWindow);
-  return {
-    speed: elapsed > 0 && output > 0 ? (output * 1000) / elapsed : null,
-    cacheRate: cacheHitRate(entry),
-    contextRate: input > 0 && Number.isFinite(windowSize) && windowSize > 0
-      ? Math.min(100, (input / windowSize) * 100)
-      : null,
-    input,
-    cached,
-    output,
-    elapsed,
-    estimated: entry.estimatedUsage === true,
-    contextWindow: Number.isFinite(windowSize) && windowSize > 0 ? windowSize : null,
-  };
-}
-
 export function usageRows(state, now = Date.now()) {
   const start = rangeStart(viewState.range, now);
   return completedRows(state).filter((entry) => Number(entry.at) >= start);

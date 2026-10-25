@@ -1,6 +1,8 @@
 'use strict';
 
 const path = require('node:path');
+const fs = require('node:fs');
+const os = require('node:os');
 const { spawn } = require('node:child_process');
 const {
   resolveChatGptExe,
@@ -16,6 +18,81 @@ const DEFAULT_LAUNCH_TIMEOUT_MS = 15000;
 const DEFAULT_TASKLIST_TIMEOUT_MS = 4000;
 const DEFAULT_TASKKILL_TIMEOUT_MS = 8000;
 
+function powershellLiteral(value) {
+  const text = String(value || '');
+  if (!text || /[\r\n\0]/.test(text)) throw new Error('ChatGPT 启动参数包含非法字符');
+  return text.replace(/'/g, "''");
+}
+
+function batchPathLiteral(value) {
+  const text = String(value || '');
+  if (!text || /[\r\n\0"]/.test(text)) throw new Error('ChatGPT 路径包含无法写入启动脚本的字符');
+  return text.replace(/%/g, '%%');
+}
+
+function buildCdpWrapper(exe, port) {
+  const executable = batchPathLiteral(exe);
+  return [
+    '@echo off',
+    'setlocal',
+    `start "" /b "${executable}" --remote-debugging-port=${port} --remote-allow-origins=http://127.0.0.1:${port}`,
+    'endlocal',
+    '',
+  ].join('\r\n');
+}
+
+function packageCdpCommand(appId, wrapperPath) {
+  const [family, application] = String(appId || '').split('!');
+  if (!family || !application) throw new Error('ChatGPT 应用入口无效');
+  const wrapper = powershellLiteral(wrapperPath);
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    `$created = Invoke-CommandInDesktopPackage -PackageFamilyName '${powershellLiteral(family)}' -AppId '${powershellLiteral(application)}' -Command 'cmd.exe' -Args '/d /c \"${wrapper}\"' -PreventBreakaway`,
+    'if ($created -and $created.Id) { Write-Output ("PID=" + $created.Id) }',
+  ].join('; ');
+}
+
+function runCommand(command, args, { spawnImpl = spawn, timeoutMs = 30000 } = {}) {
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawnImpl(command, args, { windowsHide: true, stdio: 'ignore' });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { child.kill(); } catch { /* ignore */ }
+      reject(new Error(`${command} 执行超时`));
+    }, timeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    const finish = (error, code = 0) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else if (code !== 0) reject(new Error(`${command} 执行失败（退出码 ${code}）`));
+      else resolve();
+    };
+    child.once('error', (error) => finish(error));
+    child.once('close', (code) => finish(null, code == null ? 0 : code));
+  });
+}
+
+async function launchPackagedWithCdp(exe, appId, port, options = {}) {
+  const wrapperDir = options.wrapperDir || path.join(os.tmpdir(), 'gptplus-cdp');
+  fs.mkdirSync(wrapperDir, { recursive: true });
+  const wrapperPath = path.join(wrapperDir, `chatgpt-${port}.cmd`);
+  fs.writeFileSync(wrapperPath, buildCdpWrapper(exe, port), 'utf8');
+  const script = packageCdpCommand(appId, wrapperPath);
+  await runCommand('powershell.exe', [
+    '-NoProfile', '-NonInteractive', '-Command', script,
+  ], { spawnImpl: options.spawnImpl, timeoutMs: options.activationTimeoutMs || 30000 });
+}
+
 /** 从实际可执行文件路径推导进程镜像名，兼容手动指定或改名的 ChatGPT.exe。 */
 function imageNameFromPath(filePath) {
   const name = path.win32.basename(String(filePath || '').trim());
@@ -25,7 +102,8 @@ function imageNameFromPath(filePath) {
 /**
  * 启动 ChatGPT 客户端。这里不结束已有进程，Windows 的单实例机制会把启动请求交给现有客户端。
  * @param {{ preferredPath?: string|null, resolveExe?: Function, resolveAppId?: Function,
- *           resolvedAppId?: string|null, spawnImpl?: Function, retryDelayMs?: number }} options
+ *           resolvedAppId?: string|null, spawnImpl?: Function, retryDelayMs?: number,
+ *           cdpPort?: number, wrapperDir?: string }} options
  * @returns {Promise<{ok:boolean, exe?:string, appId?:string, error?:string}>}
  */
 async function launchChatGpt(options = {}) {
@@ -36,6 +114,7 @@ async function launchChatGpt(options = {}) {
   if (!exe) return { ok: false, error: '找不到 ChatGPT.exe' };
 
   const packaged = !!packageFamilyFromPath(exe);
+  const cdpPort = Number.isInteger(options.cdpPort) && options.cdpPort > 0 ? options.cdpPort : null;
   const retryDelayMs = Number.isFinite(options.retryDelayMs) ? options.retryDelayMs : 300;
 
   const start = (command, args, windowsHide, cwd) => new Promise((resolve, reject) => {
@@ -73,8 +152,12 @@ async function launchChatGpt(options = {}) {
 
   if (appId) {
     try {
+      if (cdpPort && packaged) {
+        await launchPackagedWithCdp(exe, appId, cdpPort, options);
+        return { ok: true, exe, appId, cdpPort };
+      }
       await start('explorer.exe', [`shell:AppsFolder\\${appId}`], true);
-      return { ok: true, exe, appId };
+      return { ok: true, exe, appId, ...(cdpPort ? { cdpPort } : {}) };
     } catch (err) {
       // 包安装场景不能退回直接运行 exe：那会丢掉应用身份，正是“文档图标”的来源。
       if (packaged) return { ok: false, error: err.message };
@@ -87,8 +170,11 @@ async function launchChatGpt(options = {}) {
   }
 
   try {
-    await start(exe, [], false, path.win32.dirname(exe));
-    return { ok: true, exe };
+    const args = cdpPort
+      ? [`--remote-debugging-port=${cdpPort}`, `--remote-allow-origins=http://127.0.0.1:${cdpPort}`]
+      : [];
+    await start(exe, args, false, path.win32.dirname(exe));
+    return { ok: true, exe, ...(cdpPort ? { cdpPort } : {}) };
   } catch (err) {
     return { ok: false, error: err.message };
   }
@@ -126,6 +212,30 @@ async function listChatGptPids(options = {}) {
     DEFAULT_TASKLIST_TIMEOUT_MS,
   );
   return parseTasklistPids(raw, imageName);
+}
+
+/**
+ * 从正在运行的 ChatGPT 主进程命令行里找出调试端口。
+ * gpt++ 通过带 --remote-debugging-port 的启动脚本拉起客户端，重启 gpt++ 后靠它重新接上状态栏。
+ * @param {{execText?: Function, imageName?: string}} [options]
+ * @returns {Promise<number|null>} 端口；未运行、未开放调试端口或查询失败时为 null
+ */
+async function findChatGptDebugPort(options = {}) {
+  const run = options.execText || execText;
+  const imageName = String(options.imageName || CHATGPT_IMAGE).replace(/'/g, "''");
+  const query = [
+    `Get-CimInstance Win32_Process -Filter "name='${imageName}'"`,
+    "Where-Object { $_.CommandLine -match '--remote-debugging-port=\\d+' }",
+    'Select-Object -First 1 -ExpandProperty CommandLine',
+  ].join(' | ');
+  const raw = await run(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-Command', query],
+    DEFAULT_TASKLIST_TIMEOUT_MS,
+  );
+  const match = /--remote-debugging-port=(\d{1,5})/.exec(String(raw || ''));
+  const port = match ? Number(match[1]) : 0;
+  return Number.isInteger(port) && port > 0 && port <= 65535 ? port : null;
 }
 
 /**
@@ -242,6 +352,9 @@ async function relaunchChatGpt(options = {}) {
     resolveExe: async () => exe,
     resolveAppId,
     spawnImpl: options.spawnImpl,
+    cdpPort: options.cdpPort,
+    wrapperDir: options.wrapperDir,
+    activationTimeoutMs: options.activationTimeoutMs,
     ...(packaged ? { resolvedAppId } : {}),
   });
   if (!launched || !launched.ok) {
@@ -279,6 +392,9 @@ async function relaunchChatGpt(options = {}) {
  *   pollMs?: number,
  *   launchTimeoutMs?: number,
  *   retryDelayMs?: number,
+ *   cdpPort?: number,
+ *   wrapperDir?: string,
+ *   activationTimeoutMs?: number,
  *   attempts?: number,
  * }} [options]
  * @returns {Promise<{ok:boolean, exe?:string, pid?:number, error?:string}>}
@@ -326,6 +442,9 @@ async function launchChatGptAndVerify(options = {}) {
       resolveExe: async () => exe,
       resolveAppId: options.resolveAppId,
       spawnImpl: options.spawnImpl,
+      cdpPort: options.cdpPort,
+      wrapperDir: options.wrapperDir,
+      activationTimeoutMs: options.activationTimeoutMs,
     });
     if (!launched || !launched.ok) {
       lastError = (launched && launched.error) || lastError;
@@ -355,4 +474,5 @@ module.exports = {
   parseTasklistPids,
   listChatGptPids,
   killChatGpt,
+  findChatGptDebugPort,
 };

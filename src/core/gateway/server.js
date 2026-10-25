@@ -6,13 +6,10 @@
  *   GET  /healthz          -> { ok:true, providers:<n>, models:<n> }
  *   GET  /v1/models        -> { object:'list', data:[{id:<slug>, object:'model', owned_by:<providerName>}] }
  *   POST /v1/responses     -> Responses 契约（流式 SSE / 非流式 JSON）
- *   POST /onebot/event     -> QQ 远程助手的事件上报（转发给 deps.onebot，见下）
  *   OPTIONS *              -> 204（方便浏览器里调试）
  *
  * 认证：store.gateway.token（或 start() 传入的 token）非空时，要求
  *       `Authorization: Bearer <token>`，不匹配返回 401。
- *       /onebot/event 例外：NapCat 上报不带网关令牌，改由 qq-bot 校验
- *       可选的 eventToken（Bearer / access_token）。
  *
  * 设计：server.js 只做「HTTP + 认证 + 路由 + 日志 + 生命周期」；
  *       Responses 事件契约在 responses.js，上游协议在 adapters/*。
@@ -21,16 +18,14 @@
  * 签名（spec 第 8 节末）：
  *   createGateway({ store, paths, log }) => { start, stop, stopSync, getState,
  *                                             autoStart, probe, on }
- *   额外可选依赖（不进契约，测试/调试用）：deps.fetch —— 替换 globalThis.fetch；
- *   deps.taskObserver —— 任务中心（QQ 远程助手）的观察接口：
- *       turnRequest({body,slug}) -> {turnKey}|null
- *       requestStarted({turnKey,requestId,abort}) / requestFinished({requestId})
- *       turnResponse({body,slug,ok,status,hasToolCalls,text})
- *   deps.onebot.handleEvent(req,res,body) —— /onebot/event 的处理器。
+ *   额外可选依赖（不进契约，测试/调试用）：deps.fetch —— 替换 globalThis.fetch。
  *   `paths` 为签名兼容而接收，网关不直接落盘（日志走 log 回调与内存环形缓冲）。
  */
 const http = require('node:http');
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+const { fileURLToPath } = require('node:url');
 
 const { createRouter } = require('./router.js');
 const { createSystemProxyFetch } = require('../system-proxy.js');
@@ -90,11 +85,97 @@ function describeListenError(err, port) {
 }
 
 /** 创建本地网关，并让默认上游请求自动跟随 Windows 系统代理。 */
+function isWeixinGatewayRequest(req) {
+  const source = String((req.headers && req.headers['x-gptplus-source']) || '').trim().toLowerCase();
+  if (source === 'weixin') return true;
+  return /^gptplus-weixin\b/i.test(String((req.headers && req.headers.originator) || ''));
+}
+
+const MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024;
+
+function imageMimeForFile(filePath, buffer) {
+  if (buffer.length >= 8 && buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) {
+    return 'image/png';
+  }
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return 'image/jpeg';
+  if (buffer.length >= 3 && buffer.subarray(0, 3).toString('ascii') === 'GIF') return 'image/gif';
+  if (buffer.length >= 12 && buffer.subarray(0, 4).toString('ascii') === 'RIFF'
+    && buffer.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+  if (buffer.length >= 2 && buffer[0] === 0x42 && buffer[1] === 0x4d) return 'image/bmp';
+  const ext = path.extname(String(filePath || '')).toLowerCase();
+  if (ext === '.png') return 'image/png';
+  if (ext === '.gif') return 'image/gif';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.bmp') return 'image/bmp';
+  return 'image/jpeg';
+}
+
+/** 只允许把微信媒体目录内的 file:// 图片转成 data URL，避免读取任意本地文件。 */
+function localWeixinImageDataUrl(fileUrl, mediaRoot) {
+  let filePath;
+  try {
+    filePath = fileURLToPath(fileUrl);
+  } catch {
+    return null;
+  }
+  const root = path.resolve(mediaRoot);
+  const target = path.resolve(filePath);
+  const relative = path.relative(root, target);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return null;
+  let stat;
+  try { stat = fs.lstatSync(target); } catch { return null; }
+  if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_INLINE_IMAGE_BYTES) return null;
+  let buffer;
+  try { buffer = fs.readFileSync(target); } catch { return null; }
+  return `data:${imageMimeForFile(target, buffer)};base64,${buffer.toString('base64')}`;
+}
+
 /**
- * @param {{ store:any, paths?:any, log?:(e:any)=>void, fetch?:typeof fetch }} deps
+ * 微信 app-server 把本地图片作为 file:// URL 放进 turn 输入；
+ * 上游模型无法访问本机路径，因此在网关内按白名单目录转成 data URL。
+ * @returns {number} 转换的图片数量
+ */
+function inlineWeixinImageUrls(body, mediaRoot) {
+  if (!body || !Array.isArray(body.input) || !mediaRoot) return 0;
+  let count = 0;
+  for (const item of body.input) {
+    if (!item || item.type !== 'message' || !Array.isArray(item.content)) continue;
+    for (const part of item.content) {
+      if (!part || (part.type !== 'input_image' && part.type !== 'image_url')) continue;
+      let fileUrl = '';
+      if (part.type === 'input_image') {
+        if (typeof part.image_url === 'string') fileUrl = part.image_url;
+        else if (part.image_url && typeof part.image_url.url === 'string') fileUrl = part.image_url.url;
+      }
+      if (part.type === 'image_url') {
+        if (typeof part.image_url === 'string') fileUrl = part.image_url;
+        else if (part.image_url && typeof part.image_url.url === 'string') fileUrl = part.image_url.url;
+      }
+      if (!/^file:/i.test(fileUrl)) continue;
+      const dataUrl = localWeixinImageDataUrl(fileUrl, mediaRoot);
+      if (!dataUrl) continue;
+      if (typeof part.image_url === 'string') part.image_url = dataUrl;
+      else part.image_url.url = dataUrl;
+      count += 1;
+    }
+  }
+  return count;
+}
+
+/**
+ * @param {{ store:any, paths?:any, log?:(e:any)=>void, fetch?:typeof fetch,
+ *            usageLive?: { read: (sessionId:string) => any },
+ *            taskObserver?: { turnRequest?:Function, requestStarted?:Function,
+ *              requestFinished?:Function, turnResponse?:Function } }} deps
  */
 function createGateway(deps = {}) {
-  const { store, log: externalLog, taskObserver = null, onebot = null } = deps;
+  const {
+    store,
+    paths = null,
+    log: externalLog,
+    usageLive = null,
+    taskObserver = null,
+  } = deps;
   const requestTimeoutMs = Number.isFinite(Number(deps.requestTimeoutMs)) && Number(deps.requestTimeoutMs) > 0
     ? Number(deps.requestTimeoutMs) : REQUEST_TIMEOUT_MS;
   // deps.fetch 是契约外的测试注入点：null/undefined 表示用全局 fetch，
@@ -392,33 +473,14 @@ function createGateway(deps = {}) {
     const method = (req.method || 'GET').toUpperCase();
 
     if (method === 'OPTIONS') {
-      res.writeHead(204, {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      });
+      if (path === '/thread-usage-live') {
+        res.writeHead(204, {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        });
+      } else res.writeHead(204);
       res.end();
-      return;
-    }
-
-    if (path === '/onebot/event' && method === 'POST') {
-      if (!onebot || typeof onebot.handleEvent !== 'function') {
-        sendError(res, 404, `not found: ${method} ${path}`, 'invalid_request_error');
-        return;
-      }
-      let eventBody;
-      try {
-        eventBody = await readJsonBody(req, 1024 * 1024);
-      } catch (err) {
-        sendJson(res, err.statusCode || 400, { error: { message: err.message } });
-        return;
-      }
-      try {
-        await onebot.handleEvent(req, res, eventBody);
-      } catch (err) {
-        logEntry({ level: 'error', msg: `处理 OneBot 事件失败: ${err && err.message}` });
-        if (!res.writableEnded && !res.headersSent) sendJson(res, 500, { error: { message: '事件处理失败' } });
-      }
       return;
     }
 
@@ -452,6 +514,27 @@ function createGateway(deps = {}) {
     if (path === '/healthz' && method === 'GET') {
       const counts = router.counts();
       sendJson(res, 200, { ok: true, providers: counts.providers, models: counts.models });
+      return;
+    }
+
+    if (path === '/thread-usage-live' && method === 'POST') {
+      // Only the injected local status line needs CORS; the snapshot remains bearer-protected.
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      if (!usageLive || typeof usageLive.read !== 'function') {
+        sendJson(res, 503, { status: 'unavailable', message: '本机会话用量读取器未就绪', events: [] });
+        return;
+      }
+      let body;
+      try {
+        body = await readJsonBody(req, 64 * 1024);
+      } catch (err) {
+        sendJson(res, err.statusCode || 400, { status: 'failed', message: err.message, events: [] });
+        return;
+      }
+      const snapshot = usageLive.read(body?.session_id);
+      sendJson(res, snapshot?.status === 'ok' ? 200 : 404, snapshot || {
+        status: 'unavailable', message: '本机会话用量不可用', events: [],
+      });
       return;
     }
 
@@ -521,6 +604,11 @@ function createGateway(deps = {}) {
       return;
     }
 
+    if (isWeixinGatewayRequest(req) && paths && paths.APP_DIR) {
+      const count = inlineWeixinImageUrls(body, path.join(paths.APP_DIR, 'weixin-media'));
+      if (count) logEntry({ level: 'info', msg: `微信图片已内联: ${count} 张` });
+    }
+
     const requestedModel = body && body.model != null ? String(body.model) : '';
     const route = peerRequest ? router.resolveLocalModelId(requestedModel) : router.resolve(requestedModel);
     const slug = peerRequest && route.ok ? route.slug : requestedModel;
@@ -560,11 +648,10 @@ function createGateway(deps = {}) {
     };
     logEntry({ level: 'info', msg: `开始请求 ${slug}`, ...baseLog, status: 0 });
 
-    // 任务观察（QQ 远程助手）：peer 请求是别的 gpt++ 实例的流量，不跟踪；
-    // QQ 手机问答自带 X-Gptplus-Qq-Chat 标记，也不算 Codex 任务（否则每轮聊天都会触发假任务通知）。
-    const qqChat = String(req.headers['x-gptplus-qq-chat'] || '') === '1';
+    const observeTask = !peerRequest && !isWeixinGatewayRequest(req)
+      && !!taskObserver && taskObserver.turnRequest !== undefined;
     let turnInfo = null;
-    if (!peerRequest && !qqChat && taskObserver && typeof taskObserver.turnRequest === 'function') {
+    if (observeTask && typeof taskObserver.turnRequest === 'function') {
       try {
         turnInfo = taskObserver.turnRequest({ body, slug }) || null;
       } catch {
@@ -574,7 +661,7 @@ function createGateway(deps = {}) {
         taskObserver.requestStarted({
           turnKey: turnInfo.turnKey,
           requestId: baseLog.requestId,
-          abort: () => controller.abort(new Error('QQ 远程停止任务')),
+          abort: () => controller.abort(new Error('任务通知停止')),
         });
       }
     }
@@ -596,7 +683,7 @@ function createGateway(deps = {}) {
         final: true,
         ms: entry.ms ?? Date.now() - started,
       });
-      if (!peerRequest && !qqChat && taskObserver && typeof taskObserver.turnResponse === 'function') {
+      if (observeTask && typeof taskObserver.turnResponse === 'function') {
         try {
           taskObserver.turnResponse({
             body,
@@ -607,7 +694,7 @@ function createGateway(deps = {}) {
             text: observed.text,
           });
         } catch {
-          /* 观察失败不影响网关 */
+          /* 任务观察失败不影响网关 */
         }
       }
       return final;
@@ -888,12 +975,8 @@ function createGateway(deps = {}) {
     } finally {
       clearTimeout(timer);
       res.removeListener('close', onClose);
-      if (!peerRequest && taskObserver && typeof taskObserver.requestFinished === 'function') {
-        try {
-          taskObserver.requestFinished({ requestId: baseLog.requestId });
-        } catch {
-          /* ignore */
-        }
+      if (observeTask && typeof taskObserver.requestFinished === 'function') {
+        try { taskObserver.requestFinished({ requestId: baseLog.requestId }); } catch { /* ignore */ }
       }
     }
   }
@@ -925,4 +1008,10 @@ function createGateway(deps = {}) {
   };
 }
 
-module.exports = { createGateway, RING_SIZE, DEFAULT_PORT };
+module.exports = {
+  createGateway,
+  inlineWeixinImageUrls,
+  isWeixinGatewayRequest,
+  RING_SIZE,
+  DEFAULT_PORT,
+};

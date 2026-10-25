@@ -83,17 +83,27 @@ contextBridge.exposeInMainWorld('gptplus', {
   restoreRemoteModel: (patch) => invoke('gptplus:remote:model:restore', patch),
   setRemoteModelLabel: (patch) => invoke('gptplus:remote:model:label:set', patch),
 
-  // QQ 远程助手（OneBot/NapCat 收发，任务中心查询）
-  getQqBot: () => invoke('gptplus:qqbot:get'),
-  getQqLaunchState: () => invoke('gptplus:qqbot:launch:state'),
-  setQqBot: (patch) => invoke('gptplus:qqbot:set', patch),
-  testQqBot: () => invoke('gptplus:qqbot:test'),
-  launchNapCat: () => invoke('gptplus:qqbot:login'),
-  installNapCat: () => invoke('gptplus:qqbot:install'),
-  getNapCatInstallState: () => invoke('gptplus:qqbot:install:state'),
-  onNapCatInstall: (cb) => subscribe('gptplus:qqbot:install', cb),
-  onQqLaunch: (cb) => subscribe('gptplus:qqbot:launch', cb),
-  getTasks: () => invoke('gptplus:tasks:get'),
+  // 微信连接（iLink 长轮询 + 每联系人独立 Codex 会话）
+  getWeixin: () => invoke('gptplus:weixin:get'),
+  getWeixinStatus: () => invoke('gptplus:weixin:status'),
+  setWeixin: (patch) => invoke('gptplus:weixin:set', patch),
+  startWeixin: () => invoke('gptplus:weixin:start'),
+  stopWeixin: () => invoke('gptplus:weixin:stop'),
+  startWeixinQr: (patch) => invoke('gptplus:weixin:qr:start', patch),
+  getWeixinQrStatus: () => invoke('gptplus:weixin:qr:status'),
+  pickWeixinWorkDir: () => invoke('gptplus:weixin:pick-workdir'),
+  pickWeixinCodex: () => invoke('gptplus:weixin:pick-codex'),
+  detectWeixinCodex: () => invoke('gptplus:weixin:detect-codex'),
+  openWeixinLink: (url) => invoke('gptplus:weixin:open-link', url),
+  onWeixinStatus: (cb) => subscribe('gptplus:weixin:status', cb),
+
+  // 插件市场与插件生命周期
+  listPlugins: () => invoke('gptplus:plugin:list'),
+  installPlugin: (id) => invoke('gptplus:plugin:install', id),
+  uninstallPlugin: (id) => invoke('gptplus:plugin:uninstall', id),
+  setPluginEnabled: (patch) => invoke('gptplus:plugin:enabled:set', patch),
+  setPluginConfig: (patch) => invoke('gptplus:plugin:config:set', patch),
+  onPluginChange: (cb) => subscribe('gptplus:plugin:change', cb),
 
   // 模型与网关
   listModels: () => invoke('gptplus:models:list'),

@@ -24,7 +24,6 @@ const PROVIDER_ID = 'gptplus';
 const PROVIDER_NAME = 'gpt++ Gateway';
 const DEFAULT_PORT = 18120;
 const DEFAULT_HOST = '127.0.0.1';
-const FALLBACK_TOKEN = 'gptplus-local';
 const BACKUP_KEEP = 10;
 
 const SECTION_BEGIN = '# >>> gpt++ gateway provider >>>';
@@ -190,6 +189,18 @@ function tomlString(value) {
   );
 }
 
+function gatewayAuthCommand(configPath) {
+  const quotedPath = String(configPath || '').replace(/'/g, "''");
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    `$raw=[System.IO.File]::ReadAllText('${quotedPath}'); $config=ConvertFrom-Json -InputObject $raw -ErrorAction Stop; $token=[string]$config.gateway.token; if ([string]::IsNullOrWhiteSpace($token)) { throw 'gpt++ gateway token is empty' }; [Console]::Out.Write($token)`,
+  ].join('; ');
+  return {
+    command: 'powershell.exe',
+    args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
+  };
+}
+
 /** 端口必须是 1..65535 的整数，否则回落 */
 function normalizePort(value, fallback) {
   const n = Number(value);
@@ -249,6 +260,7 @@ function createCodexConfig({ store, catalog, paths } = {}) {
   const codexConfigPath = p.CODEX_CONFIG_PATH || fallback.CODEX_CONFIG_PATH;
   const backupDir = p.BACKUP_DIR || fallback.BACKUP_DIR;
   const defaultCatalogPath = p.CATALOG_PATH || fallback.CATALOG_PATH;
+  const appConfigPath = p.CONFIG_PATH || store?.configPath || fallback.CONFIG_PATH;
 
   function readText() {
     try {
@@ -363,8 +375,7 @@ function createCodexConfig({ store, catalog, paths } = {}) {
     const g = cfg && cfg.gateway && typeof cfg.gateway === 'object' ? cfg.gateway : {};
     const port = normalizePort(override.port, normalizePort(g.port, DEFAULT_PORT));
     const host = normalizeHost(override.host, normalizeHost(g.host, DEFAULT_HOST));
-    const token = typeof g.token === 'string' && g.token ? g.token : FALLBACK_TOKEN;
-    return { port, host, token };
+    return { port, host };
   }
 
   function isInjected() {
@@ -563,6 +574,7 @@ function createCodexConfig({ store, catalog, paths } = {}) {
     // 末尾追加网关 provider 段（整块带标记，可精确删除）；
     // 端口/host 跟随 store（用户可在设置页改端口），显式传入优先
     const gw = gatewayInfo({ port, host });
+    const auth = gatewayAuthCommand(appConfigPath);
     const section = [
       SECTION_BEGIN,
       '',
@@ -570,8 +582,10 @@ function createCodexConfig({ store, catalog, paths } = {}) {
       `name = ${tomlString(PROVIDER_NAME)}`,
       `base_url = ${tomlString(`http://${gw.host}:${gw.port}/v1`)}`,
       'wire_api = "responses"',
-      'requires_openai_auth = false',
-      `experimental_bearer_token = ${tomlString(gw.token)}`,
+      '[model_providers.gptplus.auth]',
+      `command = ${tomlString(auth.command)}`,
+      `args = [${auth.args.map(tomlString).join(', ')}]`,
+      'refresh_interval_ms = 0',
       SECTION_END,
     ];
     let fixEol = false;
@@ -626,5 +640,8 @@ module.exports = {
   SECTION_BEGIN,
   SECTION_END,
   // 仅供测试/排障使用的纯函数
-  _internal: { splitKeepEol, tableHeaderIndices, topLevelKey, tomlString, normalizePort, normalizeHost },
+  _internal: {
+    splitKeepEol, tableHeaderIndices, topLevelKey, tomlString, normalizePort, normalizeHost,
+    gatewayAuthCommand,
+  },
 };

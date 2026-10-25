@@ -31,7 +31,7 @@ const APP = path.join(RENDERER, 'app.js');
 const HTML = path.join(RENDERER, 'index.html');
 const CSS = path.join(RENDERER, 'styles.css');
 
-const VIEW_FILES = ['home.js', 'providers.js', 'models.js', 'usage.js', 'settings.js', 'qq.js'];
+const VIEW_FILES = ['home.js', 'providers.js', 'models.js', 'usage.js', 'plugins.js', 'settings.js', 'weixin.js'];
 const JS_FILES = ['app.js', ...VIEW_FILES.map((f) => path.join('views', f))];
 
 function read(file) {
@@ -137,7 +137,7 @@ test('app.js 引用的每个 DOM id 都存在于 index.html', () => {
 test('导航项与 app.js 的视图表一一对应', () => {
   const html = read(HTML);
   const navViews = [...html.matchAll(/data-view="([^"]+)"/g)].map((m) => m[1]).sort();
-  assert.deepEqual(navViews, ['home', 'models', 'providers', 'qq', 'settings', 'usage'], '导航视图应与页面实现一致');
+  assert.deepEqual(navViews, ['home', 'models', 'plugins', 'providers', 'settings', 'usage', 'weixin'], '导航视图应与页面实现一致');
 
   const src = read(APP);
   const metaBlock = src.slice(src.indexOf('const VIEW_META'), src.indexOf('function renderChrome'));
@@ -224,45 +224,13 @@ test('主题三态快捷控件位于底部状态栏，不重复出现在设置�
   assert.doesNotMatch(settingsSrc, /themeCard|saveTheme|themeBusy/, '设置页不应再渲染旧的主题卡片');
 });
 
-test('底部状态栏展示最近请求的速度、缓存命中率和上下文占用', async () => {
+test('gpt++ 不在自身底部重复展示 ChatGPT 用量指标', () => {
   const html = read(HTML);
   const appSrc = read(APP);
   const cssSrc = read(CSS);
-  assert.match(html, /id="flow"><\/div>\s*<div class="runtime-metrics" id="runtime-metrics"/, '指标应位于现有链路和状态栏右侧控件之间');
-  assert.match(appSrc, /function renderRuntimeMetrics\(\)/, '全局状态栏应有独立指标渲染器');
-  assert.match(appSrc, /输出速率估算：输出 Token ÷ 网关总耗时/, 'tok/s 必须标明是基于总耗时估算');
-  assert.match(appSrc, /该值不是客户端实时上下文读数/, '上下文占比必须说明不是客户端实时读数');
-  assert.match(cssSrc, /\.runtime-metrics\s*\{[^}]*display:\s*flex/s, '指标组应保持单行布局');
-
-  const tmp = copyRendererToTemp();
-  try {
-    const usage = await import(pathToFileURL(path.join(tmp, 'views', 'usage.js')).href);
-    const context = usage.latestUsageIndicators({
-      usage: [
-        {
-          at: 20,
-          providerId: 'p_demo',
-          model: 'p_demo__m',
-          status: 200,
-          ms: 2500,
-          final: true,
-          tokens: { input_tokens: 1000, input_tokens_details: { cached_tokens: 128 }, output_tokens: 500, total_tokens: 1500 },
-        },
-      ],
-    }, 10000);
-    assert.equal(context.speed, 200, '输出速度应按输出 Token / 总耗时换算');
-    assert.equal(context.cacheRate, 12.8, '缓存命中率应使用最近请求的缓存输入比例');
-    assert.equal(context.contextRate, 10, '上下文占用应按输入 Token / 配置窗口估算');
-
-    const noCache = usage.latestUsageIndicators({
-      usage: [{ at: 30, providerId: 'p_demo', model: 'p_demo__m', status: 200, ms: 1000, final: true, tokens: { input_tokens: 100, output_tokens: 10 } }],
-    }, 1000);
-    assert.equal(noCache.cacheRate, null, '上游没有缓存 usage 时不能编造命中率');
-    assert.equal(noCache.contextRate, 10);
-    assert.equal(usage.latestUsageIndicators({ usage: [] }, 1000), null, '没有成功请求时返回空指标');
-  } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
-  }
+  assert.doesNotMatch(html, /id="runtime-metrics"/);
+  assert.doesNotMatch(appSrc, /function renderRuntimeMetrics\(\)/);
+  assert.doesNotMatch(cssSrc, /\.runtime-metrics\s*\{/);
 });
 
 // ============================================================
@@ -309,7 +277,7 @@ test('views/*.js 导出的每个符号都被 app.js import 使用', () => {
 test('app.js 从 views 导入的每个符号都真实存在且被调用', () => {
   const appSrc = read(APP);
   const viewImports = importsOf(appSrc).filter((i) => i.from.startsWith('./views/'));
-  assert.equal(viewImports.length, VIEW_FILES.length, 'app.js 应分别 import 三个视图');
+  assert.equal(viewImports.length, VIEW_FILES.length, 'app.js 应分别 import 所有视图');
 
   for (const imp of viewImports) {
     const target = path.join(RENDERER, imp.from);
@@ -331,8 +299,9 @@ test('视图渲染函数的签名统一为 (root, ctx, actions)', () => {
     ['providers.js', 'renderProviders'],
     ['models.js', 'renderModels'],
     ['usage.js', 'renderUsage'],
+    ['plugins.js', 'renderPlugins'],
     ['settings.js', 'renderSettings'],
-    ['qq.js', 'renderQq'],
+    ['weixin.js', 'renderWeixin'],
   ];
   const appSrc = read(APP);
   for (const [file, fn] of expected) {
@@ -621,7 +590,7 @@ test('渲染层模块可以在无 DOM 环境下 import（顶层无副作用）',
       if (rel === 'views/home.js') assert.equal(typeof mod.renderHome, 'function');
       if (rel === 'views/models.js') assert.equal(typeof mod.renderModels, 'function');
       if (rel === 'views/settings.js') assert.equal(typeof mod.renderSettings, 'function');
-      if (rel === 'views/qq.js') assert.equal(typeof mod.renderQq, 'function');
+      if (rel === 'views/weixin.js') assert.equal(typeof mod.renderWeixin, 'function');
     }
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -3153,6 +3122,273 @@ test('模型页：默认模型标注只跟着真正写进配置的 slug', async 
     const btn = findNodes(offRow[0], (n) => n.tagName === 'BUTTON' && n.textContent.includes('设为默认'))[0];
     assert.ok(btn, '停用模型行应有设为默认按钮（禁用态）');
     assert.equal(btn.disabled, true, '停用模型不能设为默认，按钮必须禁用而不是静默改值');
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('插件市场：展示两个内置插件并支持配置、启停与卸载入口', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const pluginsMod = await import(pathToFileURL(path.join(tmp, 'views', 'plugins.js')).href);
+    installFakeDom();
+    const state = fixtureState({
+      view: 'plugins',
+      plugins: [
+        { id: 'weixin', name: '微信连接', version: '1.0.0', category: '连接', icon: 'wechat', description: '微信描述', detail: '微信详情', builtIn: true, configurable: true, installed: true, enabled: true, active: true, config: {} },
+        { id: 'usage-statusline', name: 'ChatGPT 用量信息栏', version: '1.0.0', category: '效率', icon: 'activity', description: '用量描述', detail: '用量详情', builtIn: true, configurable: true, installed: true, enabled: true, active: true, config: { metrics: { speed: true, cache: true, context: true } } },
+      ],
+    });
+    const calls = [];
+    const ctx = makeCtx(appMod, state, calls);
+    ctx.api.setPluginEnabled = async (patch) => {
+      calls.push(['setPluginEnabled', patch]);
+      const plugin = state.plugins.find((item) => item.id === patch.id);
+      const next = { ...plugin, enabled: patch.enabled, active: patch.enabled };
+      state.plugins = state.plugins.map((item) => item.id === patch.id ? next : item);
+      return next;
+    };
+    ctx.api.uninstallPlugin = async (id) => {
+      calls.push(['uninstallPlugin', id]);
+      const plugin = state.plugins.find((item) => item.id === id);
+      const next = { ...plugin, installed: false, enabled: false, active: false };
+      state.plugins = state.plugins.map((item) => item.id === id ? next : item);
+      return next;
+    };
+    ctx.api.installPlugin = async (id) => {
+      calls.push(['installPlugin', id]);
+      const plugin = state.plugins.find((item) => item.id === id);
+      const next = { ...plugin, installed: true, enabled: false, active: false };
+      state.plugins = state.plugins.map((item) => item.id === id ? next : item);
+      return next;
+    };
+    ctx.api.setPluginConfig = async (patch) => {
+      calls.push(['setPluginConfig', patch]);
+      const plugin = state.plugins.find((item) => item.id === patch.id);
+      const next = { ...plugin, config: patch.config };
+      state.plugins = state.plugins.map((item) => item.id === patch.id ? next : item);
+      return next;
+    };
+
+    const root = new FakeNode('main');
+    pluginsMod.renderPlugins(root, ctx, new FakeNode('div'));
+    assert.match(root.allText(), /微信连接/);
+    assert.match(root.allText(), /ChatGPT 用量信息栏/);
+    assert.match(root.allText(), /已启用/);
+    assert.match(root.allText(), /配置/);
+    assert.match(root.allText(), /卸载/);
+
+    const configButtons = root.findTag('button').filter((node) => node.textContent.includes('配置'));
+    const usageConfig = configButtons.at(-1);
+    assert.ok(usageConfig, '用量插件应有配置入口');
+    usageConfig.listeners.click[0]();
+    const modal = calls.find((entry) => entry[0] === 'openModal')?.[1];
+    assert.ok(modal, '配置入口应打开弹窗');
+    assert.match(modal.allText(), /生成速度/);
+    assert.match(modal.allText(), /缓存命中率/);
+    assert.match(modal.allText(), /上下文占用/);
+
+    const uninstall = root.findTag('button').find((node) => node.textContent.includes('卸载'));
+    assert.ok(uninstall, '已安装插件应有卸载入口');
+    await uninstall.listeners.click[0]();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(calls.some((entry) => entry[0] === 'uninstallPlugin' && entry[1] === 'weixin'));
+
+    state.plugins = state.plugins.map((plugin) => plugin.id === 'weixin'
+      ? { ...plugin, installed: false, enabled: false, active: false }
+      : plugin);
+    const root2 = new FakeNode('main');
+    pluginsMod.renderPlugins(root2, ctx, new FakeNode('div'));
+    const install = root2.findTag('button').find((node) => node.textContent.includes('安装'));
+    assert.ok(install, '未安装插件应有安装入口');
+    await install.listeners.click[0]();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(calls.some((entry) => entry[0] === 'installPlugin' && entry[1] === 'weixin'));
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('微信连接页：状态、连接设置与扫码入口渲染完整', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const weixinMod = await import(pathToFileURL(path.join(tmp, 'views', 'weixin.js')).href);
+    installFakeDom();
+    const state = fixtureState({
+      view: 'weixin',
+      weixin: {
+        enabled: false,
+        baseUrl: 'https://ilinkai.weixin.qq.com',
+        token: 'secret-token',
+        accountId: 'bot@im.bot',
+        allowFrom: 'owner@im.wechat',
+        routeTag: '',
+        workDir: 'C:\work',
+        model: '',
+        sandbox: 'read-only',
+        codexPath: '',
+        status: {
+          state: 'stopped', message: '微信连接未启动。', accountId: 'bot@im.bot',
+          lastPeerId: '', lastMessageAtMs: 0, processedMessages: 0, hasToken: true,
+        },
+      },
+    });
+    const ctx = makeCtx(appMod, state);
+    ctx.api.getWeixinStatus = async () => state.weixin.status;
+    const root = new FakeNode('main');
+    const actions = new FakeNode('div');
+    weixinMod.renderWeixin(root, ctx, actions);
+    const text = root.allText();
+    assert.match(text, /个人微信连接/, '页面应有个人微信连接状态卡');
+    assert.match(text, /连接设置/, '页面应有连接设置卡');
+    assert.match(text, /每个微信联系人会映射到独立的 Codex 会话/, '必须说明联系人独立会话');
+    assert.match(text, /iLink API 地址/, '账号区应有 iLink API 地址');
+    assert.match(text, /允许的微信用户 ID/, '账号区应有联系人白名单');
+    assert.match(text, /SKRouteTag/, '账号区应有路由标签');
+    assert.match(text, /重新登录/, '已有 token 时按钮应为重新登录');
+    assert.match(text, /已处理消息/, '状态卡应有已处理消息统计');
+    assert.match(text, /最近联系人/, '状态卡应有最近联系人统计');
+    assert.match(text, /发送「帮助」查看指令/, '页面应提示微信指令入口');
+    assert.match(text, /发送「新对话」清空/, '页面应提示新对话指令');
+    assert.match(text, /图片可直接发给 Codex/, '页面应提示图片输入');
+    assert.match(text, /图片会自动回传/, '页面应提示图片回传');
+    assert.match(actions.allText(), /刷新状态/, '顶部应有状态刷新入口');
+    const passwordInput = root.findTag('input').find((n) => n.attributes.type === 'password');
+    assert.ok(passwordInput, '登录凭据默认应为密码框');
+    assert.equal(passwordInput.value, 'secret-token', '凭据应可编辑');
+    assert.equal(text.includes('secret-token'), false, '凭据明文不能出现在页面文本里');
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('微信连接页：点重新登录会打开二维码弹窗并可关闭', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const weixinMod = await import(pathToFileURL(path.join(tmp, 'views', 'weixin.js')).href);
+    installFakeDom();
+    const state = fixtureState({
+      view: 'weixin',
+      weixin: {
+        enabled: false,
+        baseUrl: 'https://ilinkai.weixin.qq.com',
+        token: 'secret-token',
+        accountId: 'bot@im.bot',
+        allowFrom: '',
+        routeTag: '',
+        workDir: 'C:\work',
+        model: '',
+        sandbox: 'read-only',
+        codexPath: '',
+        status: {
+          state: 'stopped', message: '微信连接未启动。', accountId: 'bot@im.bot',
+          lastPeerId: '', lastMessageAtMs: 0, processedMessages: 0, hasToken: true,
+        },
+      },
+    });
+    const ctx = makeCtx(appMod, state);
+    ctx.api.startWeixinQr = async (patch) => {
+      ctx._calls.push(['startWeixinQr', patch]);
+      return {
+        qrStatus: 'wait',
+        qrContent: 'https://example.test/login',
+        qrImage: 'data:image/png;base64,AAA',
+        accountId: '',
+        linkedUserId: '',
+        hasToken: false,
+      };
+    };
+    ctx.api.getWeixinQrStatus = async () => ({ qrStatus: 'wait' });
+    const root = new FakeNode('main');
+    weixinMod.renderWeixin(root, ctx, new FakeNode('div'));
+    const loginButton = root.findTag('button').find((n) => n.textContent.includes('重新登录'));
+    assert.ok(loginButton, '状态卡应有重新登录按钮');
+    for (const handler of loginButton.listeners.click || []) await handler({ target: loginButton });
+    const startCall = ctx._calls.find((c) => c[0] === 'startWeixinQr');
+    assert.ok(startCall, '点击重新登录应请求二维码');
+    const modalCall = ctx._calls.find((c) => c[0] === 'openModal');
+    assert.ok(modalCall, '拿到二维码后应打开弹窗');
+    const modal = modalCall[1];
+    assert.match(modal.allText(), /微信扫码登录/, '弹窗标题');
+    assert.match(modal.allText(), /等待扫码/, '弹窗状态');
+    const img = modal.findTag('img')[0];
+    assert.equal(img.getAttribute('src'), 'data:image/png;base64,AAA');
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('微信连接页：启动/停止会调用主进程并刷新状态卡', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const weixinMod = await import(pathToFileURL(path.join(tmp, 'views', 'weixin.js')).href);
+    installFakeDom();
+    const state = fixtureState({
+      view: 'weixin',
+      weixin: {
+        enabled: false,
+        baseUrl: 'https://ilinkai.weixin.qq.com',
+        token: 'secret-token',
+        accountId: 'bot@im.bot',
+        allowFrom: '',
+        routeTag: '',
+        workDir: 'C:\work',
+        model: '',
+        sandbox: 'read-only',
+        codexPath: '',
+        status: {
+          state: 'stopped', message: '微信连接未启动。', accountId: 'bot@im.bot',
+          lastPeerId: '', lastMessageAtMs: 0, processedMessages: 0, hasToken: true,
+        },
+      },
+    });
+    const ctx = makeCtx(appMod, state);
+    const runningStatus = {
+      state: 'running', message: '微信连接正在运行。', accountId: 'bot@im.bot',
+      lastPeerId: 'owner@im.wechat', lastMessageAtMs: Date.now(), processedMessages: 3, hasToken: true,
+    };
+    ctx.api.startWeixin = async () => {
+      ctx._calls.push(['startWeixin']);
+      state.weixin = { ...state.weixin, status: runningStatus };
+      return { ok: true, status: runningStatus };
+    };
+    ctx.api.stopWeixin = async () => {
+      ctx._calls.push(['stopWeixin']);
+      const stopped = { ...runningStatus, state: 'stopped', message: '微信连接已停止。' };
+      state.weixin = { ...state.weixin, status: stopped };
+      return { ok: true, status: stopped };
+    };
+    const root = new FakeNode('main');
+    weixinMod.renderWeixin(root, ctx, new FakeNode('div'));
+    const startButton = root.findTag('button').find((n) => n.textContent.includes('启动'));
+    assert.ok(startButton, '应有启动按钮');
+    for (const handler of startButton.listeners.click || []) await handler({ target: startButton });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.ok(ctx._calls.some((c) => c[0] === 'startWeixin'), '点击启动应调用 startWeixin');
+    assert.match(root.allText(), /运行中/, '状态卡应刷新为运行中');
+    assert.match(root.allText(), /owner@im\.wechat/, '状态卡应显示最近联系人');
+    const stopButton = root.findTag('button').find((n) => n.textContent.includes('停止'));
+    assert.ok(stopButton, '运行中应显示停止按钮');
+    for (const handler of stopButton.listeners.click || []) await handler({ target: stopButton });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.ok(ctx._calls.some((c) => c[0] === 'stopWeixin'), '点击停止应调用 stopWeixin');
+    assert.match(root.allText(), /已停止/, '状态卡应刷新为已停止');
   } finally {
     delete globalThis.document;
     delete globalThis.window;

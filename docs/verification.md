@@ -95,7 +95,7 @@ priority, support_verbosity, truncation_policy, experimental_supported_tools
 | `base_url` 的 host 硬编码、端口不跟随设置 | `verify-picker.cjs` 断言 | 跟随 `store.gateway.host/port`，并支持显式覆盖 + host/port 归一化 |
 | 模型页渲染出字面量 `null` | Electron 冒烟截图肉眼发现 | `replaceChildren(...[...].filter(Boolean))` |
 | 空目录会写出 `{"models":[]}` 并静默回退 | 调研结论 + `context.js` 加固 | `syncInjection` 拒绝写出空目录并保留上一份 |
-| `experimental_bearer_token` 与 `env_key` 的取值差异 | `research/codex-gateway-protocol.md` | 配置按实测字段写 |
+| Codex provider 静态 bearer 字段 | Codex 官方配置参考 | 改用 `auth.command` 从 gpt++ 本机配置按需读取令牌 |
 | `npm test` 在 Node 26 下裸目录不展开 | 实跑 | 改为 `node --test --test-concurrency=1 "test/**/*.test.js"` |
 | `SseWriter.end()` 未 `res.end()` 导致挂住 | gateway 单测 | 已修 |
 
