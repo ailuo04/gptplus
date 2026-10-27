@@ -1695,7 +1695,7 @@ test('主页：三段接线、今日流量与注入开关都来自真实状态',
   }
 });
 
-test('主页最近请求展示实际发给上游的思考强度，旧记录不伪造档位', async () => {
+test('主页最近请求把英文思考强度放在独立列，旧记录不伪造档位', async () => {
   const tmp = copyRendererToTemp();
   try {
     const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
@@ -1713,13 +1713,28 @@ test('主页最近请求展示实际发给上游的思考强度，旧记录不�
     const root = new FakeNode('main');
     homeMod.renderHome(root, makeCtx(appMod, state), new FakeNode('div'));
 
-    const lines = findNodes(root, (n) => String(n.className || '').split(/\s+/).includes('home-recent-provider'));
-    assert.equal(lines.length, 3, '三条最近请求都应渲染渠道行');
-    assert.match(lines[0].textContent, /思考 高/, '应显示适配器映射后实际上游档位');
-    assert.match(lines[0].getAttribute('title'), /实际发给上游的思考强度：高/);
-    assert.match(lines[0].getAttribute('title'), /ChatGPT 请求：中/);
-    assert.match(lines[1].textContent, /思考 默认/, '没有显式档位时应说明上游使用默认值');
-    assert.doesNotMatch(lines[2].textContent, /思考/, '缺少档位字段的旧记录不能猜测');
+    const rows = findNodes(root, (n) => String(n.className || '').split(/\s+/).includes('home-recent-row'));
+    assert.equal(rows.length, 3, '三条最近请求都应渲染请求行');
+    assert.deepEqual(
+      rows[0].children.map((child) => String(child.className || '').split(/\s+/)[0]),
+      ['home-recent-time', 'home-recent-main', 'home-recent-effort', 'home-recent-ms', 'chip'],
+      '思考强度必须位于模型与耗时之间，耗时列不能错位',
+    );
+
+    const cells = findNodes(root, (n) => String(n.className || '').split(/\s+/).includes('home-recent-effort'));
+    assert.equal(cells.length, 3, '三条最近请求都应保留思考强度列');
+    const values = cells.map((cell) => {
+      const value = findNodes(cell, (n) => String(n.className || '').split(/\s+/).includes('home-recent-effort-value'))[0];
+      return value ? value.textContent : '';
+    });
+    assert.deepEqual(values, ['high', 'default', ''], '档位应显示英文值，旧记录不猜测');
+    const keys = findNodes(cells[0], (n) => String(n.className || '').split(/\s+/).includes('home-recent-effort-key'));
+    assert.equal(keys[0].textContent, 'effort', '思考强度标签应使用英文');
+    assert.match(cells[0].getAttribute('title'), /Reasoning effort sent upstream: high/);
+    assert.match(cells[0].getAttribute('title'), /ChatGPT requested: medium/);
+
+    const providers = findNodes(root, (n) => String(n.className || '').split(/\s+/).includes('home-recent-provider'));
+    assert.deepEqual(providers.map((n) => n.textContent), ['梦幻API', '梦幻API', '梦幻API'], '渠道行不再混入思考强度');
   } finally {
     delete globalThis.document;
     delete globalThis.window;

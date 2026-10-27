@@ -15,14 +15,14 @@ const RELAUNCH_TITLE = '结束并重新启动 ChatGPT.exe，让它重新读取�
 const RELAUNCH_CONFIRM_TITLE = '再次点击确认：立即结束并重新启动 ChatGPT.exe';
 const RELAUNCH_BUSY_TITLE = '正在结束旧的 ChatGPT 进程并重新启动，请稍候';
 const REASONING_LABELS = {
-  none: '关闭',
-  minimal: '极低',
-  low: '低',
-  medium: '中',
-  high: '高',
-  xhigh: '超高',
-  max: '最高',
-  ultra: '极限',
+  none: 'off',
+  minimal: 'minimal',
+  low: 'low',
+  medium: 'medium',
+  high: 'high',
+  xhigh: 'xhigh',
+  max: 'max',
+  ultra: 'ultra',
 };
 
 function reasoningLabel(value) {
@@ -374,20 +374,21 @@ function recentCard(ctx) {
       const model = String(row.upstreamModel || row.model || '').split('__').at(-1);
       const provider = String(row.providerName || row.providerId || '未知渠道');
       const effortKnown = Object.prototype.hasOwnProperty.call(row, 'reasoningEffort');
-      const effort = row.reasoningEffort ? reasoningLabel(row.reasoningEffort) : (effortKnown ? '默认' : '');
+      const effort = row.reasoningEffort ? reasoningLabel(row.reasoningEffort) : (effortKnown ? 'default' : '');
       const requested = row.reasoningEffortRequested ? reasoningLabel(row.reasoningEffortRequested) : '';
       const effortTitle = effortKnown
-        ? `实际发给上游的思考强度：${effort}${requested && requested !== effort ? `（ChatGPT 请求：${requested}）` : ''}`
+        ? `Reasoning effort sent upstream: ${effort}${requested && requested !== effort ? ` (ChatGPT requested: ${requested})` : ''}`
         : '';
       return el('div', { class: 'home-recent-row' }, [
         el('span', { class: 'home-recent-time mono', text: fmt.clock(row.at) }),
         el('div', { class: 'home-recent-main' }, [
           el('span', { class: 'home-recent-model ellipsis', text: model || provider }),
-          el('span', { class: 'home-recent-provider ellipsis', title: effortTitle || provider }, [
-            el('span', { text: provider }),
-            effort ? el('span', { class: 'home-recent-effort', text: ` · 思考 ${effort}` }) : null,
-          ]),
+          el('span', { class: 'home-recent-provider ellipsis', title: provider, text: provider }),
         ]),
+        el('span', { class: 'home-recent-effort', title: effortTitle }, effort ? [
+          el('span', { class: 'home-recent-effort-key', text: 'effort' }),
+          el('span', { class: 'home-recent-effort-value', text: effort }),
+        ] : []),
         el('span', { class: 'home-recent-ms mono', text: row.ms ? fmt.dur(row.ms) : '—' }),
         el('span', {
           class: 'chip ' + (ok ? 'chip-ok' : 'chip-err'),
