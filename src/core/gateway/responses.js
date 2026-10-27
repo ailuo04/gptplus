@@ -117,15 +117,16 @@ function normalizeUsage(raw) {
 }
 
 /**
- * 生成速度（tok/s）：输出 Token / 首段可见输出之后的耗时。
- * 分母排除首 Token 等待和思考阶段；拿不到首段计时时才退回整请求耗时。
+ * 生成速度（tok/s）：输出 Token / 首个输出片段之后的耗时。
+ * 首个输出片段包括思考、正文和工具参数，因此思考 Token 与思考耗时使用
+ * 同一个时间窗口；拿不到首个输出计时时才退回整请求耗时。
  */
-function generationSpeed(rawUsage, elapsedMs, firstTextMs) {
+function generationSpeed(rawUsage, elapsedMs, firstOutputMs) {
   const usage = normalizeUsage(rawUsage);
   const output = usage ? usage.output_tokens : 0;
   const totalMs = Number(elapsedMs);
   if (!(output > 0) || !(totalMs > 0)) return null;
-  const first = Number(firstTextMs);
+  const first = Number(firstOutputMs);
   const activeMs = Number.isFinite(first) && first > 0 && first < totalMs ? totalMs - first : totalMs;
   if (!(activeMs >= 50)) return null;
   return output / (activeMs / 1000);
@@ -787,11 +788,14 @@ async function readBodyText(upstream, limit = 64 * 1024) {
  * 转发是字节级的：encrypted reasoning、原生事件序列等不经过重建，客户端看到
  * 的就是上游发出的原文。同时旁路解析完整帧，仅用于网关日志（usage / response
  * id / 失败事件）；解析出任何问题都不影响转发本身。
+ * 收到终点帧（completed/failed/incomplete/cancelled/error）后立即停止读取上游：
+ * 客户端通常看到终点事件就关闭连接，继续等上游 EOF 会把正常完成误记成 499。
  *
  * @param {{body: AsyncIterable<Uint8Array>}} upstream fetch 响应
  * @param {import('node:http').ServerResponse} res SSE 头已写出的响应
  * @param {{usage: any, responseId: string|null, events: number,
- *          completed: boolean, failed: {message: string}|null}} out 调用方创建的结果袋；中途抛错时
+ *          completed: boolean, terminal: boolean, failed: {message: string}|null,
+ *          firstOutputAt: number|null, firstTextAt: number|null}} out 调用方创建的结果袋；中途抛错时
  *   调用方仍能读到已解析到的字段（sendResponsesFailure 要用 responseId）
  */
 async function pipeResponsesSse(upstream, res, out) {
@@ -841,25 +845,41 @@ async function pipeResponsesSse(upstream, res, out) {
     }
     out.events += 1;
     const type = json?.type || evt;
-    if (!out.firstTextAt && (
-      (type === 'response.output_text.delta' && typeof json?.delta === 'string' && json.delta)
-      || (type === 'response.output_text.done' && typeof json?.text === 'string' && json.text)
-      || (type === 'response.function_call_arguments.delta' && typeof json?.delta === 'string' && json.delta)
-      || (type === 'response.output_item.added'
-        && (json?.item?.type === 'function_call' || json?.item?.type === 'custom_tool_call'))
-    )) out.firstTextAt = Date.now();
+    const textDelta = type === 'response.output_text.delta'
+      && typeof json?.delta === 'string' && json.delta;
+    const textDone = type === 'response.output_text.done'
+      && typeof json?.text === 'string' && json.text;
+    const reasoningDelta = (type === 'response.reasoning_summary_text.delta'
+      || type === 'response.reasoning_text.delta')
+      && typeof json?.delta === 'string' && json.delta;
+    const toolDelta = (type === 'response.function_call_arguments.delta'
+      || type === 'response.custom_tool_call_input.delta')
+      && typeof json?.delta === 'string' && json.delta;
+    const toolAdded = type === 'response.output_item.added'
+      && (json?.item?.type === 'function_call' || json?.item?.type === 'custom_tool_call');
+    // 首个输出片段：思考、正文、工具参数都要算。思考 Token 已经计入 usage.output_tokens，
+    // 分母必须从思考开始时起算，否则 tok/s 会虚高。
+    if (!out.firstOutputAt && (textDelta || reasoningDelta || toolDelta || toolAdded)) {
+      out.firstOutputAt = Date.now();
+    }
+    if (!out.firstTextAt && (textDelta || textDone || toolDelta || toolAdded)) {
+      out.firstTextAt = Date.now();
+    }
     if (type === 'response.created' || type === 'response.in_progress') {
       if (!out.responseId && json?.response?.id) out.responseId = json.response.id;
     } else if (type === 'response.completed' || type === 'response.incomplete' || type === 'response.cancelled') {
       out.completed = true;
+      out.terminal = true;
       out.usage = json?.response?.usage || null;
       out.outputText = extractResponseText(json?.response?.output);
       out.toolCalls = countLoopToolItems(json?.response?.output);
     } else if (type === 'response.failed') {
       const err = json?.response?.error;
       out.failed = { message: (err && err.message) || '上游返回 response.failed' };
+      out.terminal = true;
     } else if (type === 'error') {
       out.failed = { message: json?.message || '上游返回 error 事件' };
+      out.terminal = true;
     }
   };
   const handleLine = (rawLine) => {
@@ -877,22 +897,30 @@ async function pipeResponsesSse(upstream, res, out) {
   };
   for await (const chunk of upstream.body) {
     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    if (!write(buf)) return;
+    const delivered = write(buf);
     buffer += decoder.decode(buf, { stream: true });
     let index;
     while ((index = buffer.indexOf('\n')) !== -1) {
       handleLine(buffer.slice(0, index));
       buffer = buffer.slice(index + 1);
+      // 终点帧已经完整转发，上游后续是否保持连接与客户端无关。
+      if (out.terminal) break;
     }
+    if (out.terminal) break;
+    // 客户端已断开时不再继续读；但刚拿到的这一块仍要解析，
+    // 否则同一块里的 response.completed 会被漏掉并误记成 499。
+    if (!delivered) return;
   }
-  buffer += decoder.decode();
-  while (buffer.includes('\n')) {
-    const index = buffer.indexOf('\n');
-    handleLine(buffer.slice(0, index));
-    buffer = buffer.slice(index + 1);
+  if (!out.terminal) {
+    buffer += decoder.decode();
+    while (buffer.includes('\n')) {
+      const index = buffer.indexOf('\n');
+      handleLine(buffer.slice(0, index));
+      buffer = buffer.slice(index + 1);
+    }
+    if (buffer) handleLine(buffer); // 尾帧可能没有结束空行
+    handleFrame();
   }
-  if (buffer) handleLine(buffer); // 尾帧可能没有结束空行
-  handleFrame();
 }
 
 /** 从原生 Responses 完成响应中提取可用于 usage 兜底估算的文本。 */

@@ -62,10 +62,11 @@ test('协议归一化保留图片、系统约束、工具历史及原始 thinkin
   assert.throws(() => normalizeRequest({ messages: [], tools: [{ type: 'web_search_20250305', name: 'web_search' }] }, 'anthropic'), /服务端/);
 });
 
-test('生成速度按首段可见文本后的耗时计算，不把思考等待算进分母', () => {
+test('生成速度按首个输出片段后的耗时计算，思考阶段计入分母', () => {
   const usage = { output_tokens: 2308, input_tokens: 1, total_tokens: 2309 };
   assert.equal(Math.round(generationSpeed(usage, 79811, 71680)), 284);
   assert.equal(Math.round(generationSpeed(usage, 10000, 9000)), 2308);
+  assert.equal(Math.round(generationSpeed(usage, 10000, 2000)), 289);
   assert.equal(generationSpeed(usage, 10000, 9980), null);
   assert.equal(generationSpeed({ output_tokens: 0 }, 10000, 0), null);
 });
@@ -116,9 +117,10 @@ test('gateway: 单次请求记录首段文本时间与速度，并可由 thread-
   assert.equal(response.status, 200, response.text);
   const final = logs.filter((entry) => entry.final === true).at(-1);
   assert.equal(final.sessionId, 'thread_speed_12345678');
+  assert.ok(final.firstOutputMs >= 150, `firstOutputMs=${final.firstOutputMs}`);
   assert.ok(final.firstTextMs >= 150, `firstTextMs=${final.firstTextMs}`);
   assert.ok(final.speed > 100 && final.speed < 400, `speed=${final.speed}`);
-  assert.ok(Math.abs(final.speed - 60 / ((final.ms - final.firstTextMs) / 1000)) < 1e-6);
+  assert.ok(Math.abs(final.speed - 60 / ((final.ms - final.firstOutputMs) / 1000)) < 1e-6);
 
   const live = await postJson(`http://127.0.0.1:${new URL(base).port}/thread-usage-live`, { session_id: 'thread_speed_12345678' });
   assert.equal(live.status, 200, live.text);
@@ -126,6 +128,45 @@ test('gateway: 单次请求记录首段文本时间与速度，并可由 thread-
   assert.equal(snapshot.request.outputTokens, 60);
   assert.equal(snapshot.request.speed, final.speed);
   assert.equal(gw.getRequestSpeed('thread_speed_12345678').speed, final.speed);
+});
+
+test('gateway: 思考片段先于正文时，速度从思考开始计时', async (t) => {
+  const upstream = await startMockUpstream((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
+    const send = (value) => res.write(`data: ${JSON.stringify(value)}\n\n`);
+    send({ choices: [{ index: 0, delta: { role: 'assistant' } }] });
+    setTimeout(() => {
+      send({ choices: [{ index: 0, delta: { reasoning_content: 'thinking' } }] });
+      setTimeout(() => {
+        send({ choices: [{ index: 0, delta: { content: 'hello' } }] });
+        setTimeout(() => {
+          send({
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 60, total_tokens: 70 },
+          });
+          res.write('data: [DONE]\n\n');
+          res.end();
+        }, 150);
+      }, 200);
+    }, 100);
+  });
+  t.after(() => upstream.close());
+  const provider = { ...SAMPLE_PROVIDER, baseUrl: `${upstream.url}/v1` };
+  const { gw, base, logs } = await withGateway({ providers: [provider] });
+  t.after(() => gw.stop());
+
+  const response = await postJson(`${base}/responses`, {
+    model: 'p_ab12cd__gpt-6.1-sol',
+    input: 'hi',
+    stream: true,
+    prompt_cache_key: 'thread_reasoning_speed_1',
+  });
+  assert.equal(response.status, 200, response.text);
+  const final = logs.filter((entry) => entry.final === true).at(-1);
+  assert.ok(final.firstOutputMs >= 50, `firstOutputMs=${final.firstOutputMs}`);
+  assert.ok(final.firstTextMs > final.firstOutputMs, `firstTextMs=${final.firstTextMs} firstOutputMs=${final.firstOutputMs}`);
+  assert.ok(Math.abs(final.speed - 60 / ((final.ms - final.firstOutputMs) / 1000)) < 1e-6);
+  assert.ok(final.speed < 60 / ((final.ms - final.firstTextMs) / 1000), '速度不应只按可见正文计时');
 });
 
 test('转换适配器拒绝坏 JSON、无终结事件及无效非流式响应', async () => {
@@ -990,7 +1031,8 @@ test('真实 codex 流量形状（probe/live-traffic.jsonl）：顶层键、deve
     enabled: true,
     models: [{ id: 'gpt-6.1-sol', label: 'GPT-6.1 Sol', enabled: true }],
   };
-  const ctx = await withGateway({ providers: [provider] });
+  const logs = [];
+  const ctx = await withGateway({ providers: [provider], logs });
   try {
     const res = await postJson(`http://127.0.0.1:${ctx.port}/v1/responses`, REAL_BODY);
     assert.equal(res.status, 200);
@@ -1016,6 +1058,9 @@ test('真实 codex 流量形状（probe/live-traffic.jsonl）：顶层键、deve
     const completed = frames.find((f) => f.json && f.json.type === 'response.completed').json;
     assert.equal(completed.response.usage.input_tokens > 0, true);
     assert.equal(completed.response.usage.total_tokens > 0, true);
+    const final = logs.find((entry) => entry.final === true);
+    assert.equal(final.reasoningEffort, 'medium', '日志应记录实际发给上游的 reasoning_effort');
+    assert.equal(final.reasoningEffortRequested, 'medium');
   } finally {
     await ctx.gw.stop();
     await upstream.close();
@@ -1343,6 +1388,46 @@ test('anthropic 适配器：DeepSeek effort 与缓存用量字段正确映射', 
   assert.equal(parsed.usage.input_tokens, 100869, '非流式响应也要合并缓存命中与未命中输入');
   assert.equal(parsed.usage.cache_read_input_tokens, 93600);
   assert.equal(parsed.usage.total_tokens, 101640);
+});
+
+test('网关日志记录 Anthropic 适配器映射后实际发给上游的思考强度', async () => {
+  const seen = [];
+  const upstream = await startMockUpstream((req, res, body) => {
+    seen.push(body);
+    assert.equal(body.model, 'deepseek-v4.1-flash');
+    assert.deepEqual(body.thinking, { type: 'enabled' });
+    assert.deepEqual(body.output_config, { effort: 'high' });
+    writeAnthropicSse(res, [
+      { type: 'message_start', message: { id: 'msg_effort', usage: { input_tokens: 3, output_tokens: 0 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } },
+      { type: 'message_stop' },
+    ]);
+  });
+  const provider = {
+    id: 'p_effort01', name: 'DeepSeek 中转', baseUrl: `${upstream.url}/v1`, apiKey: 'k', api: 'anthropic',
+    headers: {}, enabled: true, models: [{ id: 'deepseek-v4.1-flash', label: 'DeepSeek V4.1 Flash', enabled: true, reasoning: true }],
+  };
+  const logs = [];
+  const ctx = await withGateway({ providers: [provider], logs });
+  try {
+    const response = await postJson(`http://127.0.0.1:${ctx.port}/v1/responses`, {
+      model: 'p_effort01__deepseek-v4.1-flash',
+      input: 'hi',
+      reasoning: { effort: 'medium' },
+      stream: true,
+    });
+    assert.equal(response.status, 200, response.text);
+    assert.equal(seen.length, 1);
+    const final = logs.find((entry) => entry.final === true);
+    assert.equal(final.reasoningEffort, 'high', '必须记录适配器实际发出的 high，而不是客户端请求的 medium');
+    assert.equal(final.reasoningEffortRequested, 'medium');
+  } finally {
+    await ctx.gw.stop();
+    await upstream.close();
+  }
 });
 
 test('Anthropic thinking signature survives Responses output and the next DeepSeek turn', async () => {
@@ -2274,6 +2359,31 @@ test('responses SSE 透传：客户端断开后不再写入或消费上游', asy
   assert.equal(yielded, 1, '客户端不可写时应停止读取上游');
 });
 
+test('responses 透传：客户端断开时同一块里的终点帧仍会被解析', async () => {
+  const upstream = {
+    body: {
+      async *[Symbol.asyncIterator]() {
+        yield Buffer.from(
+          'data: {"type":"response.created"}\n\n' +
+          'data: {"type":"response.completed","response":{"id":"r1","output":[],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}\n\n',
+        );
+        throw new Error('客户端断开后不应继续读取上游');
+      },
+    },
+  };
+  const res = {
+    destroyed: true,
+    writableEnded: false,
+    on() {},
+    write() { throw new Error('write after disconnect'); },
+  };
+  const out = { events: 0, firstTextAt: null };
+  await assert.doesNotReject(() => pipeResponsesSse(upstream, res, out));
+  assert.equal(out.completed, true);
+  assert.equal(out.terminal, true);
+  assert.equal(out.usage.total_tokens, 5);
+});
+
 test('responses 透传：首个可见文本 delta 记录 firstTextAt', async () => {
   async function* body() {
     yield Buffer.from('data: {"type":"response.output_text.delta","delta":"hi"}\n\n');
@@ -2287,11 +2397,59 @@ test('responses 透传：首个可见文本 delta 记录 firstTextAt', async () 
     write(chunk) { chunks.push(chunk); },
     end() {},
   };
-  const out = { events: 0, firstTextAt: null };
+  const out = { events: 0, firstOutputAt: null, firstTextAt: null };
   await pipeResponsesSse({ body: body() }, res, out);
+  assert.equal(typeof out.firstOutputAt, 'number');
   assert.equal(typeof out.firstTextAt, 'number');
   assert.ok(out.firstTextAt > 0);
   assert.equal(chunks.length > 0, true);
+});
+
+test('responses 透传：思考 delta 也记录 firstOutputAt', async () => {
+  async function* body() {
+    yield Buffer.from('data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}\n\n');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    yield Buffer.from('data: {"type":"response.output_text.delta","delta":"hi"}\n\n');
+    yield Buffer.from('data: {"type":"response.completed","response":{"id":"r1","output":[],"usage":{}}}\n\n');
+  }
+  const res = {
+    destroyed: false,
+    writableEnded: false,
+    on() {},
+    write() {},
+    end() {},
+  };
+  const out = { events: 0, firstOutputAt: null, firstTextAt: null };
+  await pipeResponsesSse({ body: body() }, res, out);
+  assert.equal(typeof out.firstOutputAt, 'number');
+  assert.equal(typeof out.firstTextAt, 'number');
+  assert.ok(out.firstOutputAt < out.firstTextAt, `firstOutputAt=${out.firstOutputAt} firstTextAt=${out.firstTextAt}`);
+});
+
+test('responses 透传：终点事件后立即停止消费上游', async () => {
+  let pulls = 0;
+  async function* body() {
+    pulls += 1;
+    yield Buffer.from('data: {"type":"response.created"}\n\n');
+    pulls += 1;
+    yield Buffer.from('data: {"type":"response.completed","response":{"id":"r1","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n');
+    pulls += 1;
+    yield Buffer.from('data: {"type":"response.output_text.delta","delta":"late"}\n\n');
+  }
+  const chunks = [];
+  const res = {
+    destroyed: false,
+    writableEnded: false,
+    on() {},
+    write(chunk) { chunks.push(chunk); },
+    end() {},
+  };
+  const out = { events: 0, firstTextAt: null };
+  await pipeResponsesSse({ body: body() }, res, out);
+  assert.equal(out.completed, true);
+  assert.equal(out.terminal, true);
+  assert.equal(pulls, 2, '终点事件后不应再拉取上游数据');
+  assert.equal(chunks.join('').includes('late'), false);
 });
 
 test('responses.js：SSE 解析容忍 event 名、多行 data、CRLF 与心跳注释', async () => {
@@ -2533,6 +2691,68 @@ test('gateway: responses 透传（流式）逐字节转发，只改写 model，�
     assert.equal(done.status, 200);
     assert.equal(done.tokens && done.tokens.total_tokens, 12);
     assert.ok(done.events >= 4);
+  } finally {
+    await ctx.gw.stop();
+    await upstream.close();
+  }
+});
+
+test('gateway: responses 透传终点事件后主动收尾，客户端随之关闭不记 499', async () => {
+  const upstream = await startMockUpstream((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
+    res.write('event: response.created\ndata: ' + JSON.stringify({
+      type: 'response.created', response: { id: 'resp_done', status: 'in_progress' },
+    }) + '\n\n');
+    res.write('event: response.completed\ndata: ' + JSON.stringify({
+      type: 'response.completed',
+      response: { id: 'resp_done', status: 'completed', output: [], usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 } },
+    }) + '\n\n');
+    // 模拟上游发完终点后仍保持 SSE 连接：网关不应等它关闭。
+    setTimeout(() => { if (!res.writableEnded) res.end(); }, 3000);
+  });
+  const provider = {
+    id: 'p_resp01',
+    name: '原生 Responses',
+    baseUrl: upstream.url + '/v1',
+    apiKey: 'sk-resp',
+    api: 'responses',
+    headers: {},
+    enabled: true,
+    models: [{ id: 'gpt-6.1-sol', label: 'sol', enabled: true }],
+  };
+  const logs = [];
+  const ctx = await withGateway({ providers: [provider], logs });
+  try {
+    const started = Date.now();
+    await new Promise((resolve) => {
+      const client = http.request(`http://127.0.0.1:${ctx.port}/v1/responses`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      client.on('response', (res) => {
+        res.setEncoding('utf8');
+        let responseText = '';
+        res.on('data', (chunk) => {
+          responseText += chunk;
+          if (!responseText.includes('response.completed')) return;
+          client.destroy(); // 模拟 Codex 收到终点后立即关闭连接
+          resolve();
+        });
+      });
+      client.on('error', () => {});
+      client.end(JSON.stringify({ model: 'p_resp01__gpt-6.1-sol', input: '你好', stream: true }));
+    });
+
+    let final = null;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      final = logs.find((entry) => entry.final === true);
+      if (final) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(final, '应有终结记录');
+    assert.equal(final.status, 200);
+    assert.equal(final.tokens.total_tokens, 15);
+    assert.ok(Date.now() - started < 2000, '不应等待上游连接关闭');
   } finally {
     await ctx.gw.stop();
     await upstream.close();

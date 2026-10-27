@@ -14,6 +14,21 @@ const RELAUNCH_BUSY_TEXT = '重启中…';
 const RELAUNCH_TITLE = '结束并重新启动 ChatGPT.exe，让它重新读取模型清单';
 const RELAUNCH_CONFIRM_TITLE = '再次点击确认：立即结束并重新启动 ChatGPT.exe';
 const RELAUNCH_BUSY_TITLE = '正在结束旧的 ChatGPT 进程并重新启动，请稍候';
+const REASONING_LABELS = {
+  none: '关闭',
+  minimal: '极低',
+  low: '低',
+  medium: '中',
+  high: '高',
+  xhigh: '超高',
+  max: '最高',
+  ultra: '极限',
+};
+
+function reasoningLabel(value) {
+  const key = String(value || '').toLowerCase();
+  return REASONING_LABELS[key] || key;
+}
 /** 重启进行中（含确认后的 IPC 往返），阻止重复点击。 */
 let relaunchBusy = false;
 /** 距离真正执行重启还差一次确认。 */
@@ -358,11 +373,20 @@ function recentCard(ctx) {
       const ok = Number(row.status) >= 200 && Number(row.status) < 300;
       const model = String(row.upstreamModel || row.model || '').split('__').at(-1);
       const provider = String(row.providerName || row.providerId || '未知渠道');
+      const effortKnown = Object.prototype.hasOwnProperty.call(row, 'reasoningEffort');
+      const effort = row.reasoningEffort ? reasoningLabel(row.reasoningEffort) : (effortKnown ? '默认' : '');
+      const requested = row.reasoningEffortRequested ? reasoningLabel(row.reasoningEffortRequested) : '';
+      const effortTitle = effortKnown
+        ? `实际发给上游的思考强度：${effort}${requested && requested !== effort ? `（ChatGPT 请求：${requested}）` : ''}`
+        : '';
       return el('div', { class: 'home-recent-row' }, [
         el('span', { class: 'home-recent-time mono', text: fmt.clock(row.at) }),
         el('div', { class: 'home-recent-main' }, [
           el('span', { class: 'home-recent-model ellipsis', text: model || provider }),
-          el('span', { class: 'home-recent-provider ellipsis', text: provider }),
+          el('span', { class: 'home-recent-provider ellipsis', title: effortTitle || provider }, [
+            el('span', { text: provider }),
+            effort ? el('span', { class: 'home-recent-effort', text: ` · 思考 ${effort}` }) : null,
+          ]),
         ]),
         el('span', { class: 'home-recent-ms mono', text: row.ms ? fmt.dur(row.ms) : '—' }),
         el('span', {

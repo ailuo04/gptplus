@@ -66,6 +66,39 @@ const UPSTREAM_TRANSIENT_RETRY_DELAY_MS = 250;
 /** 上游 400 且报错提到这些参数时，去掉可选参数重试一次（老中转的兼容姿势）。 */
 const COMPAT_TRIGGER = /stream_options|prompt_cache_key|cache_control|reasoning_effort|output_config|thinking|max_tokens|tool_choice|parallel_tool_calls|temperature|unknown|unsupported|not supported/i;
 
+/**
+ * 读取最终发给上游的思考档位。
+ *
+ * 必须从适配器已经构建好的 payload 里取，而不是直接读 body.reasoning.effort：
+ * Anthropic 会把 medium 映射成 high；兼容重试或上游不收该字段时也可能根本没发。
+ * 返回 null 表示这次请求没有携带显式档位，由上游使用默认值。
+ */
+function effectiveReasoningEffort(built, body) {
+  if (!built) return undefined;
+  const payload = built.payload && typeof built.payload === 'object' ? built.payload : null;
+  if (payload) {
+    if (typeof payload.reasoning_effort === 'string' && payload.reasoning_effort.trim()) {
+      return payload.reasoning_effort.trim().toLowerCase();
+    }
+    const outputEffort = payload.output_config?.effort;
+    if (typeof outputEffort === 'string' && outputEffort.trim()) {
+      return outputEffort.trim().toLowerCase();
+    }
+    if (payload.thinking && typeof payload.thinking === 'object' && payload.thinking.type === 'disabled') {
+      return 'none';
+    }
+    const nested = payload.reasoning?.effort;
+    if (typeof nested === 'string' && nested.trim()) return nested.trim().toLowerCase();
+    return null;
+  }
+  // 对等端与 Responses 透传都是把请求体原样转发，body 就是最终上游载荷。
+  if (built.passthrough) {
+    const direct = body?.reasoning?.effort;
+    if (typeof direct === 'string' && direct.trim()) return direct.trim().toLowerCase();
+  }
+  return null;
+}
+
 function isTransientUpstreamStatus(status) {
   return status === 502 || status === 503 || status === 504;
 }
@@ -267,6 +300,7 @@ function createGateway(deps = {}) {
         speed,
         at: entry.at,
         ms: entry.ms,
+        firstOutputMs: entry.firstOutputMs,
         firstTextMs: entry.firstTextMs,
         outputTokens: tokens?.output_tokens || 0,
         model: entry.upstreamModel || entry.model || '',
@@ -671,11 +705,16 @@ function createGateway(deps = {}) {
     const timer = setTimeout(() => controller.abort(new Error('上游响应超时')), requestTimeoutMs);
     if (typeof timer.unref === 'function') timer.unref();
     let clientGone = false;
+    let pipe = null;
+    let stream = null;
+    let built = null;
     const onClose = () => {
-      if (!res.writableEnded) {
-        clientGone = true;
-        controller.abort(new Error('客户端中断'));
-      }
+      if (res.writableEnded) return;
+      // 透传上游已经把终点事件（response.completed/failed/incomplete）交给客户端后，
+      // 客户端收到终点就关闭连接属于正常收尾，不能记成 499。
+      if (pipe?.terminal) return;
+      clientGone = true;
+      controller.abort(new Error('客户端中断'));
     };
     res.on('close', onClose);
 
@@ -690,6 +729,9 @@ function createGateway(deps = {}) {
       upstreamModel: route.modelId,
       ...(sessionId ? { sessionId } : {}),
     };
+    const requestedEffort = typeof body?.reasoning?.effort === 'string' && body.reasoning.effort.trim()
+      ? body.reasoning.effort.trim().toLowerCase()
+      : null;
     logEntry({ level: 'info', msg: `开始请求 ${slug}`, ...baseLog, status: 0 });
 
     const observeTask = !peerRequest && !isWeixinGatewayRequest(req)
@@ -710,23 +752,25 @@ function createGateway(deps = {}) {
       }
     }
     let sawToolCall = false;
+    let firstOutputAt = null;
     let firstTextAt = null;
     const observed = { hasToolCalls: false, text: '' };
 
     let finalLogged = false;
-    let pipe = null;
-    let stream = null;
 
     // 所有已进入上游处理的请求都必须有且只有一条终结记录，避免统计漏项或重复计数。
     const logFinal = (entry = {}) => {
       if (finalLogged) return null;
       finalLogged = true;
       const ms = entry.ms ?? Date.now() - started;
-      const speed = entry.speed ?? generationSpeed(entry.tokens, ms, entry.firstTextMs);
+      const speed = entry.speed ?? generationSpeed(entry.tokens, ms, entry.firstOutputMs);
+      const sentEffort = effectiveReasoningEffort(built, body);
       const final = logEntry({
         level: 'info',
         ...baseLog,
         ...entry,
+        ...(sentEffort !== undefined ? { reasoningEffort: sentEffort } : {}),
+        ...(requestedEffort ? { reasoningEffortRequested: requestedEffort } : {}),
         ...(speed ? { speed } : {}),
         final: true,
         ms,
@@ -750,9 +794,16 @@ function createGateway(deps = {}) {
 
     // 客户端提前断开时，尽量保留上游已经返回的 usage 和缓存字段。
     const partialUsage = () => {
+      const firstOutputMs = firstOutputAt
+        ? firstOutputAt - started
+        : (pipe?.firstOutputAt ? pipe.firstOutputAt - started : undefined);
       const firstTextMs = firstTextAt
         ? firstTextAt - started
         : (pipe?.firstTextAt ? pipe.firstTextAt - started : undefined);
+      const timings = {
+        ...(firstOutputMs ? { firstOutputMs } : {}),
+        ...(firstTextMs ? { firstTextMs } : {}),
+      };
       if (stream) {
         const tokens = stream.usage || estimateUsage(body, stream.text);
         return {
@@ -760,7 +811,7 @@ function createGateway(deps = {}) {
           cacheUsageAvailable: stream.cacheUsageAvailable,
           estimatedUsage: stream.usageEstimated || !stream.usage || undefined,
           events: stream.emittedTypes.length,
-          ...(firstTextMs ? { firstTextMs } : {}),
+          ...timings,
         };
       }
       if (pipe) {
@@ -769,18 +820,50 @@ function createGateway(deps = {}) {
           cacheUsageAvailable: hasCacheUsage(pipe.usage),
           estimatedUsage: !pipe.usage || undefined,
           events: pipe.events,
-          ...(firstTextMs ? { firstTextMs } : {}),
+          ...timings,
         };
       }
       return {};
     };
 
+    // 客户端先断开、但上游的终点事件已经进入缓冲区时，透传循环往往还能读到
+    // response.completed；这时是正常完成，不能因为 close 事件先发生就记成 499。
+    const finalizeClientGone = () => {
+      const usage = partialUsage();
+      if (pipe?.completed) {
+        observed.hasToolCalls = (pipe.toolCalls || 0) > 0;
+        observed.text = pipe.outputText || observed.text;
+        return logFinal({
+          level: 'info',
+          msg: `完成 ${slug} -> ${route.modelId} (${Date.now() - started}ms)`,
+          status: 200,
+          ...usage,
+        });
+      }
+      if (pipe?.failed) {
+        return logFinal({
+          level: 'error',
+          msg: `上游返回失败事件: ${pipe.failed.message}`,
+          status: 502,
+          ...usage,
+        });
+      }
+      return logFinal({
+        level: 'warn',
+        msg: `客户端中断: ${slug}`,
+        status: 499,
+        ...usage,
+      });
+    };
+
     try {
-      let { upstream } = await callUpstream(
+      const firstAttempt = await callUpstream(
         adapter,
         { provider, modelId: route.modelId, body, stream: wantStream, compat: false },
         controller.signal,
       );
+      let upstream = firstAttempt.upstream;
+      built = firstAttempt.built;
       logEntry({ level: 'info', msg: `上游返回 HTTP ${upstream.status}`, ...baseLog, status: upstream.status });
 
       if (!upstream.ok) {
@@ -811,6 +894,7 @@ function createGateway(deps = {}) {
             controller.signal,
           );
           upstream = compatAttempt.upstream;
+          built = compatAttempt.built;
           if (!upstream.ok) {
             const text = await readBodyText(upstream);
             throw Object.assign(
@@ -832,6 +916,7 @@ function createGateway(deps = {}) {
             controller.signal,
           );
           upstream = retryAttempt.upstream;
+          built = retryAttempt.built;
           if (!upstream.ok) {
             const retryText = await readBodyText(upstream);
             throw Object.assign(
@@ -901,7 +986,7 @@ function createGateway(deps = {}) {
       // 透传模式：上游报文逐字节转发，不做内部事件重建（见 adapters/responses.js）；
       // pipe 只收集日志要用的信息（usage / responseId / 失败事件 / 工具调用数）。
       pipe = adapter.passthrough
-        ? { usage: null, outputText: '', responseId: null, events: 0, completed: false, failed: null, toolCalls: 0, firstTextAt: null }
+        ? { usage: null, outputText: '', responseId: null, events: 0, completed: false, terminal: false, failed: null, toolCalls: 0, firstOutputAt: null, firstTextAt: null }
         : null;
       stream = adapter.passthrough ? null : createOutputStream(protocol, res, { model: slug, ...outputOptions }) || new ResponsesStream({ res, model: slug });
       if (stream) stream.start();
@@ -913,10 +998,12 @@ function createGateway(deps = {}) {
           for await (const event of adapter.translate(upstream)) {
             switch (event.type) {
               case 'text':
+                if (!firstOutputAt) firstOutputAt = Date.now();
                 if (!firstTextAt) firstTextAt = Date.now();
                 stream.textDelta(event.delta);
                 break;
               case 'reasoning':
+                if (!firstOutputAt) firstOutputAt = Date.now();
                 stream.reasoningDelta(event.delta);
                 break;
               case 'reasoning_signature':
@@ -930,10 +1017,12 @@ function createGateway(deps = {}) {
                 break;
               case 'tool_start':
                 sawToolCall = true;
+                if (!firstOutputAt) firstOutputAt = Date.now();
                 if (!firstTextAt) firstTextAt = Date.now();
                 stream.toolStart({ key: event.key ?? 0, id: event.id, name: event.name });
                 break;
               case 'tool_args':
+                if (!firstOutputAt) firstOutputAt = Date.now();
                 if (!firstTextAt) firstTextAt = Date.now();
                 stream.toolArgsDelta({ key: event.key ?? 0, delta: event.delta });
                 break;
@@ -949,12 +1038,7 @@ function createGateway(deps = {}) {
           }
         }
         if (clientGone) {
-          logFinal({
-            level: 'warn',
-            msg: `客户端中断: ${slug}`,
-            status: 499,
-            ...partialUsage(),
-          });
+          finalizeClientGone();
           return;
         }
         if (adapter.passthrough) {
@@ -990,6 +1074,7 @@ function createGateway(deps = {}) {
             cacheUsageAvailable: hasCacheUsage(pipe.usage),
             estimatedUsage: !pipe.usage || undefined,
             events: pipe.events,
+            firstOutputMs: pipe.firstOutputAt ? pipe.firstOutputAt - started : undefined,
             firstTextMs: pipe.firstTextAt ? pipe.firstTextAt - started : undefined,
           });
           if (!res.writableEnded) res.end();
@@ -1006,20 +1091,16 @@ function createGateway(deps = {}) {
           cacheUsageAvailable: stream.cacheUsageAvailable,
           estimatedUsage: stream.usageEstimated || undefined,
           events: stream.emittedTypes.length,
+          firstOutputMs: firstOutputAt ? firstOutputAt - started : undefined,
           firstTextMs: firstTextAt ? firstTextAt - started : undefined,
         });
       } catch (err) {
         err.message = redactDiagnostic(err.message, [provider]);
-        logEntry({ level: 'error', msg: `请求异常: ${err && err.message ? err.message : err}`, ...baseLog, status: 502, ms: Date.now() - started, clientGone });
         if (clientGone) {
-          logFinal({
-            level: 'warn',
-            msg: `客户端中断: ${slug}`,
-            status: 499,
-            ...partialUsage(),
-          });
+          finalizeClientGone();
           return;
         }
+        logEntry({ level: 'error', msg: `请求异常: ${err && err.message ? err.message : err}`, ...baseLog, status: 502, ms: Date.now() - started });
         logFinal({
           level: 'error',
           msg: `流式转发失败: ${err.message}`,
@@ -1035,12 +1116,7 @@ function createGateway(deps = {}) {
     } catch (err) {
       err.message = redactDiagnostic(err.message, [provider]);
       if (clientGone) {
-        logFinal({
-          level: 'warn',
-          msg: `客户端中断: ${slug}`,
-          status: 499,
-          ...partialUsage(),
-        });
+        finalizeClientGone();
         return;
       }
       if (res.writableEnded) return;

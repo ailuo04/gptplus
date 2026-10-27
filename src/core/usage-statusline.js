@@ -191,7 +191,7 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
     const time = Date.parse(latest.t);
     const requestSpeed = Number(request?.speed);
     const requestAt = Number(request?.at);
-    // 网关按「单次响应输出 / 首段可见文本后的耗时」计算，和原生速度口径一致；
+    // 网关按「整轮输出 Token / 首个输出片段后的耗时」计算，思考阶段也计入；
     // rollout 事件间隔包含工具执行时间，只作为没有网关数据时的兜底。
     const useRequest = Number.isFinite(requestSpeed) && requestSpeed > 0
       && (!Number.isFinite(time) || !Number.isFinite(requestAt) || requestAt >= time - STALE_MS);

@@ -1695,6 +1695,39 @@ test('主页：三段接线、今日流量与注入开关都来自真实状态',
   }
 });
 
+test('主页最近请求展示实际发给上游的思考强度，旧记录不伪造档位', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const homeMod = await import(pathToFileURL(path.join(tmp, 'views', 'home.js')).href);
+    installFakeDom();
+    const now = Date.now();
+    const base = { providerId: 'p_demo0001', providerName: '梦幻API', model: 'a__m', status: 200, ms: 120 };
+    const state = fixtureState({
+      logs: [
+        { ...base, at: now, reasoningEffort: 'high', reasoningEffortRequested: 'medium' },
+        { ...base, at: now - 1, reasoningEffort: null, reasoningEffortRequested: 'medium' },
+        { ...base, at: now - 2 },
+      ],
+    });
+    const root = new FakeNode('main');
+    homeMod.renderHome(root, makeCtx(appMod, state), new FakeNode('div'));
+
+    const lines = findNodes(root, (n) => String(n.className || '').split(/\s+/).includes('home-recent-provider'));
+    assert.equal(lines.length, 3, '三条最近请求都应渲染渠道行');
+    assert.match(lines[0].textContent, /思考 高/, '应显示适配器映射后实际上游档位');
+    assert.match(lines[0].getAttribute('title'), /实际发给上游的思考强度：高/);
+    assert.match(lines[0].getAttribute('title'), /ChatGPT 请求：中/);
+    assert.match(lines[1].textContent, /思考 默认/, '没有显式档位时应说明上游使用默认值');
+    assert.doesNotMatch(lines[2].textContent, /思考/, '缺少档位字段的旧记录不能猜测');
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test('主页对等共享入口打开配置弹窗，两个开关分别保存', async () => {
   assert.match(read(APP), /home:[\s\S]*?needs: \[[^\]]*'peer'/, '主页加载依赖中必须包含对等共享快照');
   const tmp = copyRendererToTemp();
