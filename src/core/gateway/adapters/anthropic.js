@@ -10,13 +10,100 @@
  * 认证：Anthropic 用 `x-api-key` + `anthropic-version`（不是 Bearer）。
  *       provider.headers 里的自定义头优先，可用来覆盖 anthropic-version 或加
  *       `anthropic-beta`。
- * 已知差异（非阻塞）：Anthropic 的 system 是顶层参数、消息角色只有 user/assistant，
- * 所以 codex 的 developer/system 消息会被折叠进 system 字段。
+ * Anthropic 标准 Messages 将 system/developer 折叠到顶层 system；支持历史 system
+ * 更新的 DeepSeek Flash 则保留其在 messages 中的位置。
  */
 const { joinApiUrl, parseSse, toolParameters } = require('../responses.js');
 
 const DEFAULT_MAX_TOKENS = 8192;
 const ANTHROPIC_VERSION = '2023-06-01';
+const DEEPSEEK_EFFORT = {
+  minimal: 'low',
+  low: 'low',
+  medium: 'high',
+  high: 'high',
+  xhigh: 'high',
+  max: 'max',
+  ultra: 'max',
+};
+
+function toDeepSeekEffort(effort) {
+  if (typeof effort !== 'string') return undefined;
+  const value = effort.toLowerCase();
+  return Object.prototype.hasOwnProperty.call(DEEPSEEK_EFFORT, value) ? DEEPSEEK_EFFORT[value] : undefined;
+}
+
+function supportsInHistorySystem(modelId) {
+  return /deepseek.*flash/i.test(String(modelId || ''));
+}
+
+function flattenTools(tools, out = []) {
+  for (const tool of Array.isArray(tools) ? tools : []) {
+    if (!tool || typeof tool !== 'object') continue;
+    if (tool.type === 'namespace' && Array.isArray(tool.tools)) flattenTools(tool.tools, out);
+    else out.push(tool);
+  }
+  return out;
+}
+
+function toolName(tool) {
+  if (typeof tool === 'string') return tool;
+  return tool?.name || tool?.function?.name || '';
+}
+
+function usageNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function firstUsageNumber(...values) {
+  for (const value of values) {
+    const number = usageNumber(value);
+    if (number !== null) return number;
+  }
+  return null;
+}
+
+function normalizeUsageCounts(usage, previous = {}) {
+  const cachedInputTokens = firstUsageNumber(
+    usage?.prompt_cache_hit_tokens,
+    usage?.cache_read_input_tokens,
+  ) ?? previous.cachedInputTokens ?? 0;
+  const uncachedInputTokens = firstUsageNumber(
+    usage?.prompt_cache_miss_tokens,
+    usage?.input_tokens,
+  ) ?? previous.uncachedInputTokens ?? 0;
+  const cacheCreationInputTokens = usageNumber(usage?.cache_creation_input_tokens)
+    ?? previous.cacheCreationInputTokens ?? 0;
+  const outputTokens = usageNumber(usage?.output_tokens) ?? previous.outputTokens ?? 0;
+
+  return {
+    inputTokens: uncachedInputTokens + cachedInputTokens + cacheCreationInputTokens,
+    uncachedInputTokens,
+    outputTokens,
+    cachedInputTokens,
+    cacheCreationInputTokens,
+  };
+}
+
+function usageEvent(usage, previous) {
+  const counts = normalizeUsageCounts(usage, previous);
+  return {
+    counts,
+    event: {
+      type: 'usage',
+      usage: {
+        ...usage,
+        input_tokens: counts.inputTokens,
+        output_tokens: counts.outputTokens,
+        total_tokens: counts.inputTokens + counts.outputTokens,
+        cache_read_input_tokens: counts.cachedInputTokens,
+        cache_creation_input_tokens: counts.cacheCreationInputTokens,
+      },
+    },
+  };
+}
 
 function hasHeader(headers, name) {
   const lower = name.toLowerCase();
@@ -55,17 +142,19 @@ function textOf(content) {
 }
 
 /** Responses content -> Anthropic content blocks。 */
-function contentToBlocks(content, role) {
+function contentToBlocks(content) {
   if (typeof content === 'string') return [{ type: 'text', text: content }];
   if (!Array.isArray(content)) return [];
   const blocks = [];
-  const textType = role === 'assistant' ? 'text' : 'text';
   for (const part of content) {
     if (typeof part === 'string') {
-      blocks.push({ type: textType, text: part });
+      blocks.push({ type: 'text', text: part });
       continue;
     }
     if (!part) continue;
+    if (['input_audio', 'input_video', 'input_file'].includes(part.type)) {
+      throw Object.assign(new Error(`Anthropic Messages 转换不支持 ${part.type}`), { statusCode: 400 });
+    }
     if (part.type === 'input_image' || part.type === 'image_url') {
       const image = part.image_url;
       const url = (image && typeof image === 'object' ? image.url : image) || part.url || '';
@@ -81,18 +170,30 @@ function contentToBlocks(content, role) {
       continue;
     }
     const text = part.text ?? part.refusal;
-    if (typeof text === 'string' && text) blocks.push({ type: textType, text });
+    if (typeof text === 'string' && text) blocks.push({ type: 'text', text });
   }
   return blocks;
 }
 
 function parseJsonObject(text) {
+  if (text && typeof text === 'object' && !Array.isArray(text)) return text;
   if (typeof text !== 'string' || !text.trim()) return {};
   try {
     const parsed = JSON.parse(text);
-    return parsed && typeof parsed === 'object' ? parsed : {};
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
   } catch {
-    return {};
+    // Keep malformed historical tool input visible as a request error rather than losing it.
+  }
+  throw Object.assign(new Error('Responses function_call.arguments 必须是有效的 JSON 对象'), { statusCode: 400 });
+}
+
+function stringifyToolOutput(output) {
+  if (typeof output === 'string') return output;
+  if (output == null) return '';
+  try {
+    return JSON.stringify(output);
+  } catch {
+    return String(output);
   }
 }
 
@@ -107,7 +208,7 @@ function pushMessage(messages, role, content) {
   messages.push({ role, content });
 }
 
-function toAnthropicMessages(body) {
+function toAnthropicMessages(body, { systemInHistory = false } = {}) {
   const systemParts = [];
   const messages = [];
   if (body && typeof body.instructions === 'string' && body.instructions.trim()) {
@@ -124,14 +225,21 @@ function toAnthropicMessages(body) {
     if (!item || typeof item !== 'object') continue;
     const type = item.type || (item.role ? 'message' : '');
     switch (type) {
-      case 'message': {
-        const role = item.role === 'assistant' ? 'assistant' : 'user';
-        const blocks = contentToBlocks(item.content, role);
+      case 'message':
+      case 'agent_message': {
+        const blocks = contentToBlocks(item.content);
         if (item.role === 'system' || item.role === 'developer') {
-          const text = textOf(item.content);
-          if (text) systemParts.push(text);
+          if (!blocks.length) break;
+          if (systemInHistory) messages.push({ role: 'system', content: blocks });
+          else {
+            const text = textOf(item.content);
+            if (text) systemParts.push(text);
+          }
           break;
         }
+        const role = type === 'agent_message' || item.role === 'assistant' || item.role === 'agent'
+          ? 'assistant'
+          : 'user';
         pushMessage(messages, role, blocks);
         break;
       }
@@ -146,12 +254,13 @@ function toAnthropicMessages(body) {
         break;
       }
       case 'custom_tool_call': {
+        const input = typeof item.input === 'string' ? item.input : JSON.stringify(item.input ?? '');
         pushMessage(messages, 'assistant', [
           {
             type: 'tool_use',
             id: item.call_id || item.id || `toolu_${Math.random().toString(16).slice(2, 10)}`,
             name: item.name || 'custom_tool',
-            input: { input: item.input ?? '' },
+            input: { input },
           },
         ]);
         break;
@@ -160,16 +269,30 @@ function toAnthropicMessages(body) {
       case 'custom_tool_call_output': {
         const callId = item.call_id || item.id;
         if (!callId) break;
-        const text = typeof item.output === 'string' ? item.output : JSON.stringify(item.output ?? '');
+        const text = stringifyToolOutput(item.output);
         pushMessage(messages, 'user', [
-          { type: 'tool_result', tool_use_id: callId, content: text || '(空)' },
+          { type: 'tool_result', tool_use_id: callId, content: text },
         ]);
         break;
       }
       case 'reasoning':
+        if (typeof item.encrypted_content === 'string' && item.encrypted_content) {
+          const thinking = textOf(item.summary) || textOf(item.content);
+          if (thinking) {
+            pushMessage(messages, 'assistant', [{
+              type: 'thinking',
+              thinking,
+              signature: item.encrypted_content,
+            }]);
+          }
+        }
+        break;
+      case 'additional_tools':
+        // Lite-mode tool definitions are extracted separately and do not become conversation text.
+        break;
       case 'local_shell_call':
       default:
-        // reasoning 不回灌；local_shell_call 无对应结构，丢弃。
+        // Anthropic has no equivalent for client-side shell, search, or bookkeeping items.
         break;
     }
   }
@@ -179,7 +302,7 @@ function toAnthropicMessages(body) {
 function toAnthropicTools(tools, { cache = false } = {}) {
   if (!Array.isArray(tools)) return null;
   const out = [];
-  for (const tool of tools) {
+  for (const tool of flattenTools(tools)) {
     if (!tool || typeof tool !== 'object') continue;
     if (tool.type === 'function' && tool.name) {
       out.push({
@@ -209,25 +332,52 @@ function toAnthropicTools(tools, { cache = false } = {}) {
   return out.length ? out : null;
 }
 
-function toAnthropicToolChoice(choice) {
+function toAnthropicToolChoice(choice, { deepseek = false, parallel = true } = {}) {
   if (!choice) return undefined;
   if (typeof choice === 'string') {
-    if (choice === 'none') return { type: 'auto' }; // Anthropic 没有 none，退化为 auto
-    if (choice === 'required') return { type: 'any' };
-    return { type: 'auto' };
+    if (choice === 'none') return { type: 'none' };
+    if (choice === 'required') return { type: 'any', ...(!parallel ? { disable_parallel_tool_use: true } : {}) };
+    return { type: 'auto', ...(!parallel ? { disable_parallel_tool_use: true } : {}) };
   }
+  if (choice.type === 'none') return { type: 'none' };
   if (choice.type === 'function' || choice.type === 'custom') {
     const name = choice.name || choice.function?.name;
-    return name ? { type: 'tool', name } : { type: 'auto' };
+    return name
+      ? { type: 'tool', name, ...(!parallel ? { disable_parallel_tool_use: true } : {}) }
+      : { type: 'auto', ...(!parallel ? { disable_parallel_tool_use: true } : {}) };
   }
-  if (choice.type === 'required' || choice.type === 'any') return { type: 'any' };
-  return { type: 'auto' };
+  if (choice.type === 'allowed_tools') {
+    const mode = choice.mode === 'required' ? 'any' : 'auto';
+    return { type: mode, ...(!parallel ? { disable_parallel_tool_use: true } : {}) };
+  }
+  if (choice.type === 'required' || choice.type === 'any') {
+    return { type: 'any', ...(!parallel ? { disable_parallel_tool_use: true } : {}) };
+  }
+  return { type: 'auto', ...(!parallel ? { disable_parallel_tool_use: true } : {}) };
 }
 
 function buildRequest({ provider, modelId, body = {}, stream = true, compat = false }) {
-  const { system, messages } = toAnthropicMessages(body);
+  const deepseek = /deepseek/i.test(modelId);
+  const { system, messages } = toAnthropicMessages(body, {
+    systemInHistory: deepseek && supportsInHistorySystem(modelId),
+  });
   const maxOut = Number(body.max_output_tokens ?? body.max_tokens);
-  const tools = toAnthropicTools(body.tools, { cache: !compat });
+  const inputTools = (Array.isArray(body.input) ? body.input : [])
+    .filter((item) => item?.type === 'additional_tools' && Array.isArray(item.tools))
+    .flatMap((item) => item.tools);
+  const requestedTools = flattenTools([...(Array.isArray(body.tools) ? body.tools : []), ...inputTools]);
+  const choice = body.tool_choice;
+  const allowedNames = choice?.type === 'allowed_tools' && Array.isArray(choice.tools)
+    ? choice.tools.map(toolName).filter(Boolean)
+    : null;
+  const filteredTools = allowedNames !== null
+    ? requestedTools.filter((tool) => allowedNames.includes(toolName(tool)))
+    : requestedTools;
+  const toolChoiceNone = choice === 'none' || choice?.type === 'none' || (allowedNames !== null && !allowedNames.length);
+  const tools = toAnthropicTools(
+    toolChoiceNone && !deepseek ? [] : filteredTools,
+    { cache: !compat },
+  );
   const payload = {
     model: modelId,
     max_tokens: Number.isFinite(maxOut) && maxOut > 0 ? Math.floor(maxOut) : DEFAULT_MAX_TOKENS,
@@ -242,12 +392,35 @@ function buildRequest({ provider, modelId, body = {}, stream = true, compat = fa
   }
   if (tools) {
     payload.tools = tools;
-    if (!compat) {
-      const choice = toAnthropicToolChoice(body.tool_choice);
-      if (choice) payload.tool_choice = choice;
+    const toolChoice = toAnthropicToolChoice(choice || (body.parallel_tool_calls === false ? 'auto' : undefined), {
+      deepseek,
+      parallel: body.parallel_tool_calls !== false,
+    });
+    if (toolChoice) payload.tool_choice = toolChoice;
+  }
+  if (typeof body.temperature === 'number') payload.temperature = body.temperature;
+  const topP = Number(body.top_p);
+  if (typeof body.top_p === 'number' && Number.isFinite(topP) && topP >= 0 && topP <= 1) payload.top_p = topP;
+  if (Array.isArray(body.stop_sequences)) {
+    const stopSequences = body.stop_sequences.filter((value) => typeof value === 'string' && value);
+    if (stopSequences.length) payload.stop_sequences = stopSequences;
+  }
+  if (deepseek && typeof body.reasoning?.effort === 'string') {
+    const effort = body.reasoning.effort.toLowerCase();
+    payload.thinking = { type: effort === 'none' ? 'disabled' : 'enabled' };
+    const mappedEffort = toDeepSeekEffort(effort);
+    if (mappedEffort) payload.output_config = { effort: mappedEffort };
+  }
+  if (body.anthropicThinking) payload.thinking = body.anthropicThinking;
+  else if (!deepseek && typeof body.reasoning?.effort === 'string') {
+    const effort = body.reasoning.effort.toLowerCase();
+    if (effort === 'none') payload.thinking = { type: 'disabled' };
+    else {
+      payload.thinking = { type: 'adaptive' };
+      payload.output_config = { effort: ({ minimal: 'low', xhigh: 'high', ultra: 'max' })[effort] || effort };
     }
   }
-  if (Number.isFinite(Number(body.temperature)) && !compat) payload.temperature = Number(body.temperature);
+  if (body.anthropicOutputConfig) payload.output_config = body.anthropicOutputConfig;
   return {
     url: joinApiUrl(provider.baseUrl, '/messages'),
     headers: buildHeaders(provider),
@@ -261,12 +434,10 @@ function buildRequest({ provider, modelId, body = {}, stream = true, compat = fa
  *       content_block_stop / message_delta / message_stop / error / ping
  */
 async function* translate(upstream) {
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let cacheReadInputTokens = 0;
-  let cacheCreationInputTokens = 0;
-  const blockKinds = new Map();
+  let usageCounts = normalizeUsageCounts(null);
   let finishReason = null;
+  let messageStopped = false;
+  const blockKinds = new Map();
 
   for await (const frame of parseSse(upstream.body)) {
     const data = frame.data;
@@ -275,29 +446,16 @@ async function* translate(upstream) {
     try {
       json = JSON.parse(data);
     } catch {
-      continue;
+      throw new Error('Anthropic 上游包含无效 JSON SSE 帧');
     }
     const type = json.type || frame.event;
     switch (type) {
       case 'message_start': {
         const usage = json.message?.usage;
         if (usage) {
-          const uncachedInputTokens = Number(usage.input_tokens) || 0;
-          outputTokens = Number(usage.output_tokens) || 0;
-          cacheReadInputTokens = Number(usage.cache_read_input_tokens) || 0;
-          cacheCreationInputTokens = Number(usage.cache_creation_input_tokens) || 0;
-          inputTokens = uncachedInputTokens + cacheReadInputTokens + cacheCreationInputTokens;
-          yield {
-            type: 'usage',
-            usage: {
-              ...usage,
-              input_tokens: inputTokens,
-              output_tokens: outputTokens,
-              total_tokens: inputTokens + outputTokens,
-              cache_read_input_tokens: cacheReadInputTokens,
-              cache_creation_input_tokens: cacheCreationInputTokens,
-            },
-          };
+          const normalized = usageEvent(usage, usageCounts);
+          usageCounts = normalized.counts;
+          yield normalized.event;
         }
         break;
       }
@@ -307,6 +465,14 @@ async function* translate(upstream) {
         blockKinds.set(index, block.type);
         if (block.type === 'tool_use') {
           yield { type: 'tool_start', key: index, id: block.id, name: block.name };
+          if (block.input && Object.keys(block.input).length) yield { type: 'tool_args', key: index, delta: JSON.stringify(block.input) };
+        } else if (block.type === 'text' && typeof block.text === 'string' && block.text) {
+          yield { type: 'text', delta: block.text };
+        } else if (block.type === 'thinking') {
+          if (block.thinking) yield { type: 'reasoning', delta: block.thinking };
+          if (typeof block.signature === 'string' && block.signature) {
+            yield { type: 'reasoning_signature', delta: block.signature };
+          }
         }
         break;
       }
@@ -316,6 +482,8 @@ async function* translate(upstream) {
           yield { type: 'text', delta: delta.text };
         } else if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string' && delta.thinking) {
           yield { type: 'reasoning', delta: delta.thinking };
+        } else if (delta.type === 'signature_delta' && typeof delta.signature === 'string' && delta.signature) {
+          yield { type: 'reasoning_signature', delta: delta.signature };
         } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string' && delta.partial_json) {
           yield { type: 'tool_args', key: json.index ?? 0, delta: delta.partial_json };
         }
@@ -324,17 +492,9 @@ async function* translate(upstream) {
       case 'message_delta': {
         if (json.delta?.stop_reason) finishReason = json.delta.stop_reason;
         if (json.usage) {
-          outputTokens = Number(json.usage.output_tokens) || outputTokens;
-          yield {
-            type: 'usage',
-            usage: {
-              input_tokens: inputTokens,
-              output_tokens: outputTokens,
-              cache_read_input_tokens: cacheReadInputTokens,
-              cache_creation_input_tokens: cacheCreationInputTokens,
-              total_tokens: inputTokens + outputTokens,
-            },
-          };
+          const normalized = usageEvent(json.usage, usageCounts);
+          usageCounts = normalized.counts;
+          yield normalized.event;
         }
         break;
       }
@@ -343,24 +503,40 @@ async function* translate(upstream) {
         throw new Error(String(message));
       }
       case 'ping':
-      case 'message_stop':
       case 'content_block_stop':
+        if (type === 'content_block_stop') {
+          const index = json.index ?? 0;
+          if (blockKinds.get(index) === 'thinking') yield { type: 'reasoning_done' };
+          blockKinds.delete(index);
+        }
+        break;
+      case 'message_stop':
+        messageStopped = true;
+        break;
       default:
         break;
     }
   }
+  if (!messageStopped) throw new Error('Anthropic stream ended before message_stop');
   yield { type: 'finish', reason: finishReason };
 }
 
 function parseJson(json) {
+  if (!Array.isArray(json?.content)) throw new Error('Anthropic 上游响应缺少 content 数组');
   const blocks = Array.isArray(json?.content) ? json.content : [];
   let text = '';
-  let reasoning = '';
+  const reasoningItems = [];
   const toolCalls = [];
   for (const block of blocks) {
     if (!block) continue;
     if (block.type === 'text' && typeof block.text === 'string') text += block.text;
-    else if (block.type === 'thinking' && typeof block.thinking === 'string') reasoning += block.thinking;
+    else if (block.type === 'refusal' && typeof block.refusal === 'string') text += block.refusal;
+    else if (block.type === 'thinking') {
+      reasoningItems.push({
+        text: typeof block.thinking === 'string' ? block.thinking : '',
+        signature: typeof block.signature === 'string' ? block.signature : '',
+      });
+    }
     else if (block.type === 'tool_use') {
       toolCalls.push({
         id: block.id,
@@ -369,16 +545,10 @@ function parseJson(json) {
       });
     }
   }
-  const usage = json?.usage
-    ? (() => {
-        const input = (Number(json.usage.input_tokens) || 0)
-          + (Number(json.usage.cache_read_input_tokens) || 0)
-          + (Number(json.usage.cache_creation_input_tokens) || 0);
-        const output = Number(json.usage.output_tokens) || 0;
-        return { ...json.usage, input_tokens: input, output_tokens: output, total_tokens: input + output };
-      })()
-    : null;
-  return { text, reasoning, toolCalls, usage, finishReason: json?.stop_reason || null };
+  const reasoning = reasoningItems.map((item) => item.text).filter(Boolean).join('\n');
+  const reasoningSignature = reasoningItems.length === 1 ? reasoningItems[0].signature : '';
+  const usage = json?.usage ? usageEvent(json.usage).event.usage : null;
+  return { text, reasoning, reasoningSignature, reasoningItems, toolCalls, usage, finishReason: json?.stop_reason || null };
 }
 
 function createAnthropicAdapter() {

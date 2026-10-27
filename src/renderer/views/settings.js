@@ -1,4 +1,4 @@
-﻿// 设置页：本地网关（开关/端口/探活/令牌）、Codex 配置写入情况与还原注入。
+// 设置页：本地网关（开关/端口/探活/令牌）、Codex 配置写入情况与还原注入。
 
 import { createSelectPicker } from '../app.js';
 
@@ -204,7 +204,18 @@ function peerCard(ctx, peer, gateway, modal = false, modalState = null) {
         el('span', { class: 'right' }),
         clients.length ? el('button', { class: 'btn btn-sm btn-danger', type: 'button', on: { click: () => void revokeAllClients() } }, [icon('trash', 12), el('span', { text: '清除全部' })]) : null,
       ]),
-      clients.length ? clients.map((client) => el('div', { class: 'peer-client-row' }, [el('span', { class: 'grow' }, [el('span', { text: client.name }), el('span', { class: 'faint mono', text: ' · ' + client.id })]), el('button', { class: 'btn btn-sm btn-danger', type: 'button', on: { click: () => void revokeClient(client.id) } }, [icon('trash', 12), el('span', { text: '撤销' })])])) : el('div', { class: 'hint', text: '尚未授权其它电脑。' }),
+      ...(clients.length
+        ? clients.map((client) => el('div', { class: 'peer-client-row' }, [
+          el('span', { class: 'grow' }, [
+            el('span', { text: client.name }),
+            el('span', { class: 'faint mono', text: ' · ' + client.id }),
+          ]),
+          el('button', { class: 'btn btn-sm btn-danger', type: 'button', on: { click: () => void revokeClient(client.id) } }, [
+            icon('trash', 12),
+            el('span', { text: '撤销' }),
+          ]),
+        ]))
+        : [el('div', { class: 'hint', text: '尚未授权其它电脑。' })]),
       el('button', { class: 'btn btn-sm btn-ghost', type: 'button', on: { click: () => void addClient() } }, [icon('plus', 12), el('span', { text: '生成新客户端授权' })]),
     ]),
   ];

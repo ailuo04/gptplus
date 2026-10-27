@@ -139,5 +139,7 @@ node tools\live-client-test.cjs # 真机：真实客户端经本地网关拿回�
 - 目录是整体替换，无法做到"官方模型 + 自定义模型"同时出现在同一个选择器里。
 - 注入状态与客户端共享 `~/.codex/config.toml`：如果你同时用其他工具改这个文件，
   关闭注入时 gpt++ 会按自己的备份还原自己写过的那几个键（其它内容不动）。
-- 上游若是 Anthropic 协议，走的是最小实现的适配器；OpenAI 兼容路径覆盖最完整。
+- 网关支持 `/v1/responses`、`/v1/chat/completions`、`/v1/messages` 三种入站协议，均可路由到 Responses、Chat Completions 或 Anthropic Messages 上游，提供 JSON 和 SSE 回包。Responses 到 Responses 保持原文透传。
+- 转换覆盖文本、图片、系统约束、函数工具及工具结果、推理文本/签名、缓存 Token 和输出截断状态。跨协议不是所有厂商扩展字段的无损透传；音视频、文件及 Anthropic 服务端内置工具等尚无完整映射的输入会明确拒绝。Chat 多候选输出当前仅支持 `n=1`。
+- 上游拒绝推理档位时不会删掉档位后伪装成功；可选兼容字段的重试只针对上游明确拒绝的字段。模型自身不支持的能力仍需由提供商返回错误。
 - 网关只在 gpt++ 运行时监听；关掉 App 客户端就发不出请求。

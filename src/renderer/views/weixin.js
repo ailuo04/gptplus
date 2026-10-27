@@ -47,8 +47,10 @@ const viewState = {
 let statusTimer = null;
 let qrPollTimer = null;
 let qrPollInFlight = false;
+let qrPollGeneration = 0;
 
 function stopQrPoll() {
+  qrPollGeneration += 1;
   qrPollInFlight = false;
   if (qrPollTimer === null) return;
   clearInterval(qrPollTimer);
@@ -372,10 +374,11 @@ export function renderWeixin(root, ctx, actions) {
 
   // ---- 操作 ----
   async function persistDraft() {
-    if (!viewState.draft) return;
+    const draftAtStart = viewState.draft;
+    if (!draftAtStart) return;
     const saved = await ctx.api.setWeixin(collect());
     state.weixin = saved;
-    viewState.draft = null;
+    if (viewState.draft === draftAtStart) viewState.draft = null;
   }
 
   async function save() {
@@ -489,11 +492,13 @@ export function renderWeixin(root, ctx, actions) {
     );
     modal.classList.add('is-weixin-qr');
 
+    const pollGeneration = qrPollGeneration;
     qrPollTimer = setInterval(async () => {
-      if (qrPollInFlight) return;
+      if (pollGeneration !== qrPollGeneration || qrPollInFlight) return;
       qrPollInFlight = true;
       try {
         const next = await ctx.api.getWeixinQrStatus();
+        if (pollGeneration !== qrPollGeneration) return;
         if (!next || !next.qrStatus) return;
         if (next.qrStatus === 'confirmed') {
           stopQrPoll();
@@ -516,10 +521,11 @@ export function renderWeixin(root, ctx, actions) {
           statusText.textContent = '等待扫码…';
         }
       } catch (err) {
+        if (pollGeneration !== qrPollGeneration) return;
         stopQrPoll();
         statusText.textContent = `⚠ ${ctx.describeError(err)}`;
       } finally {
-        qrPollInFlight = false;
+        if (pollGeneration === qrPollGeneration) qrPollInFlight = false;
       }
     }, 1500);
     if (typeof qrPollTimer === 'object' && qrPollTimer && typeof qrPollTimer.unref === 'function') qrPollTimer.unref();

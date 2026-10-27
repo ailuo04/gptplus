@@ -16,15 +16,256 @@ const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
 const { createGateway, inlineWeixinImageUrls, isWeixinGatewayRequest } = require('../src/core/gateway/server.js');
-const { pipeResponsesSse } = require('../src/core/gateway/responses.js');
+const { buildResponseObject, generationSpeed, pipeResponsesSse } = require('../src/core/gateway/responses.js');
 const { slugify, parseSlug, createRouter } = require('../src/core/gateway/router.js');
 const openaiAdapter = require('../src/core/gateway/adapters/openai.js');
 const anthropicAdapter = require('../src/core/gateway/adapters/anthropic.js');
+const { normalizeRequest } = require('../src/core/gateway/protocols.js');
 const { createRemoteSync, hashPeerToken, remoteProviderId } = require('../src/core/peer-sharing.js');
 
 // ---------------------------------------------------------------------------
 // 测试脚手架
 // ---------------------------------------------------------------------------
+
+test('协议归一化保留图片、系统约束、工具历史及原始 thinking 设置', () => {
+  const chat = normalizeRequest({
+    model: 'm', max_completion_tokens: 400, reasoning_effort: 'max',
+    messages: [
+      { role: 'system', content: 'system rule' },
+      { role: 'user', content: [{ type: 'image_url', image_url: { url: 'https://example.com/p.png' } }] },
+      { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'run', arguments: '{"x":1}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: 'result' },
+    ],
+  }, 'chat').body;
+  assert.equal(chat.max_output_tokens, 400);
+  assert.equal(chat.reasoning.effort, 'max');
+  for (const adapter of [openaiAdapter, anthropicAdapter]) {
+    const request = adapter.buildRequest({ provider: { baseUrl: 'https://example.com/v1' }, modelId: 'm', body: chat });
+    const wire = JSON.stringify(request.payload);
+    for (const expected of ['system rule', 'p.png', 'c1', 'result']) assert.ok(wire.includes(expected));
+  }
+  const anthropic = normalizeRequest({
+    system: [{ type: 'text', text: 'keep rule' }], max_tokens: 9000,
+    thinking: { type: 'enabled', budget_tokens: 2048 },
+    output_config: { effort: 'max' },
+    tool_choice: { type: 'auto', disable_parallel_tool_use: true },
+    messages: [{ role: 'assistant', content: [{ type: 'thinking', thinking: 'exact reasoning', signature: 'exact-signature' }, { type: 'tool_use', id: 'c2', name: 'run', input: { x: 2 } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'c2', content: 'ok' }] }],
+  }, 'anthropic').body;
+  const rebuilt = anthropicAdapter.buildRequest({ provider: { baseUrl: 'https://example.com/v1' }, modelId: 'claude', body: anthropic }).payload;
+  assert.deepEqual(rebuilt.thinking, { type: 'enabled', budget_tokens: 2048 });
+  assert.deepEqual(rebuilt.output_config, { effort: 'max' });
+  assert.equal(anthropic.parallel_tool_calls, false);
+  assert.deepEqual(rebuilt.messages[0].content[0], { type: 'thinking', thinking: 'exact reasoning', signature: 'exact-signature' });
+  assert.equal(JSON.stringify(anthropic).includes('anthropicThinking'), false);
+  assert.throws(() => normalizeRequest({ messages: [{ role: 'user', content: [{ type: 'file', file: {} }] }] }, 'chat'), /不支持/);
+  assert.throws(() => normalizeRequest({ messages: [], tools: [{ type: 'web_search_20250305', name: 'web_search' }] }, 'anthropic'), /服务端/);
+});
+
+test('生成速度按首段可见文本后的耗时计算，不把思考等待算进分母', () => {
+  const usage = { output_tokens: 2308, input_tokens: 1, total_tokens: 2309 };
+  assert.equal(Math.round(generationSpeed(usage, 79811, 71680)), 284);
+  assert.equal(Math.round(generationSpeed(usage, 10000, 9000)), 2308);
+  assert.equal(generationSpeed(usage, 10000, 9980), null);
+  assert.equal(generationSpeed({ output_tokens: 0 }, 10000, 0), null);
+});
+
+test('gateway: 单次请求记录首段文本时间与速度，并可由 thread-usage-live 读取', async (t) => {
+  const upstream = await startMockUpstream((req, res, body) => {
+    assert.equal(body.prompt_cache_key, 'thread_speed_12345678');
+    res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
+    const send = (value) => res.write(`data: ${JSON.stringify(value)}\n\n`);
+    send({ choices: [{ index: 0, delta: { role: 'assistant' } }] });
+    setTimeout(() => {
+      send({ choices: [{ index: 0, delta: { content: 'hello' } }] });
+      setTimeout(() => {
+        send({
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 10, completion_tokens: 60, total_tokens: 70 },
+        });
+        res.write('data: [DONE]\n\n');
+        res.end();
+      }, 300);
+    }, 200);
+  });
+  t.after(() => upstream.close());
+  const provider = { ...SAMPLE_PROVIDER, baseUrl: `${upstream.url}/v1` };
+  const usageLive = {
+    read: (id) => ({
+      status: 'ok',
+      session_id: id,
+      events: [{
+        t: new Date().toISOString(),
+        turn_output_tokens: 60,
+        input_tokens: 10,
+        cached_input_tokens: 0,
+        total_tokens: 70,
+        context_window: 1000,
+      }],
+    }),
+  };
+  const { gw, base, logs } = await withGateway({ providers: [provider], usageLive });
+  t.after(() => gw.stop());
+
+  const response = await postJson(`${base}/responses`, {
+    model: 'p_ab12cd__gpt-6.1-sol',
+    input: 'hi',
+    stream: true,
+    prompt_cache_key: 'thread_speed_12345678',
+  });
+  assert.equal(response.status, 200, response.text);
+  const final = logs.filter((entry) => entry.final === true).at(-1);
+  assert.equal(final.sessionId, 'thread_speed_12345678');
+  assert.ok(final.firstTextMs >= 150, `firstTextMs=${final.firstTextMs}`);
+  assert.ok(final.speed > 100 && final.speed < 400, `speed=${final.speed}`);
+  assert.ok(Math.abs(final.speed - 60 / ((final.ms - final.firstTextMs) / 1000)) < 1e-6);
+
+  const live = await postJson(`http://127.0.0.1:${new URL(base).port}/thread-usage-live`, { session_id: 'thread_speed_12345678' });
+  assert.equal(live.status, 200, live.text);
+  const snapshot = JSON.parse(live.text);
+  assert.equal(snapshot.request.outputTokens, 60);
+  assert.equal(snapshot.request.speed, final.speed);
+  assert.equal(gw.getRequestSpeed('thread_speed_12345678').speed, final.speed);
+});
+
+test('转换适配器拒绝坏 JSON、无终结事件及无效非流式响应', async () => {
+  for (const adapter of [openaiAdapter, anthropicAdapter, require('../src/core/gateway/adapters/responses.js')]) {
+    async function* broken() { yield Buffer.from('data: {broken}\n\n'); }
+    await assert.rejects(async () => { for await (const event of adapter.translate({ body: broken() })) void event; }, /JSON/);
+    async function* empty() { yield Buffer.from(': heartbeat\n\n'); }
+    await assert.rejects(async () => { for await (const event of adapter.translate({ body: empty() })) void event; }, /ended before/);
+    assert.throws(() => adapter.parseJson({}), /缺少/);
+  }
+});
+
+test('工具名分片与 Responses 增量收尾不会重复文本或串联两路参数', async () => {
+  const { createOutputStream } = require('../src/core/gateway/protocols.js');
+  let wire = '';
+  const stream = createOutputStream('chat', { write: (chunk) => { wire += chunk; }, end() {} }, { model: 'm' });
+  stream.start();
+  stream.toolStart({ key: 0, id: 'call', name: 'get_' });
+  stream.toolStart({ key: 0, name: 'get_weather' });
+  stream.toolArgsDelta({ key: 0, delta: '{}' });
+  stream.complete();
+  const names = parseFrames(wire).filter((frame) => frame.json).flatMap((frame) => frame.json.choices || [])
+    .flatMap((choice) => choice.delta?.tool_calls || []).map((call) => call.function?.name || '').join('');
+  assert.equal(names, 'get_weather');
+  const adapter = require('../src/core/gateway/adapters/responses.js');
+  const item = { id: 'msg_dedupe', type: 'message', content: [{ type: 'output_text', text: 'hello' }] };
+  async function* body() {
+    yield Buffer.from([
+      { type: 'response.output_text.delta', item_id: item.id, delta: 'hello' },
+      { type: 'response.output_item.done', item },
+      { type: 'response.completed', response: { output: [item] } },
+    ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''));
+  }
+  const events = [];
+  for await (const event of adapter.translate({ body: body() })) events.push(event);
+  assert.equal(events.filter((event) => event.type === 'text').map((event) => event.delta).join(''), 'hello');
+});
+
+test('Messages 支持 x-api-key 认证，非法入站请求返回 400', async () => {
+  const ctx = await withGateway({ gatewayPatch: { token: 'matrix-secret' } });
+  try {
+    const url = `http://127.0.0.1:${ctx.port}/v1/messages`;
+    const rejected = await postJson(url, {}, { 'x-api-key': 'wrong' });
+    assert.equal(rejected.status, 401);
+    const accepted = await postJson(url, {}, { 'x-api-key': 'matrix-secret' });
+    assert.equal(accepted.status, 400);
+    assert.match(accepted.text, /messages/);
+  } finally { await ctx.gw.stop(); }
+});
+
+test('三协议 3x3 转换矩阵：JSON/SSE 均保留文本、两路工具、缓存用量与截断原因', async () => {
+  const output = [
+    { id: 'msg_matrix', type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'matrix-ok' }] },
+    { id: 'fc_a', type: 'function_call', call_id: 'call_a', name: 'alpha', arguments: '{"x":1}' },
+    { id: 'fc_b', type: 'function_call', call_id: 'call_b', name: 'beta', arguments: '{"x":2}' },
+  ];
+  const usage = { input_tokens: 15, output_tokens: 4, total_tokens: 19, input_tokens_details: { cached_tokens: 5, cache_write_tokens: 2 } };
+  const upstream = await startMockUpstream((req, res, body) => {
+    assert.equal(body.model, 'matrix-model');
+    const tools = body.tools || [];
+    assert.ok(tools.some((tool) => (tool.name || tool.function?.name) === 'alpha'));
+    if (req.url === '/v1/responses') {
+      assert.equal(body.messages, undefined);
+      const response = { id: 'resp_matrix', object: 'response', status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, model: body.model, output, usage };
+      if (!body.stream) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(response)); return; }
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.end(`data: ${JSON.stringify({ type: 'response.incomplete', response })}\n\n`);
+    } else if (req.url === '/v1/chat/completions') {
+      assert.ok(Array.isArray(body.messages));
+      const calls = output.slice(1).map((item, index) => ({ index, id: item.call_id, type: 'function', function: { name: item.name, arguments: item.arguments } }));
+      const chatUsage = { prompt_tokens: 15, completion_tokens: 4, total_tokens: 19, prompt_tokens_details: { cached_tokens: 5 } };
+      if (!body.stream) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'matrix-ok', tool_calls: calls }, finish_reason: 'length' }], usage: chatUsage })); return; }
+      writeChatSse(res, [
+        { choices: [{ index: 0, delta: { content: 'matrix-ok', tool_calls: calls } }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: 'length' }], usage: chatUsage },
+      ]);
+    } else if (req.url === '/v1/messages') {
+      const content = [{ type: 'text', text: 'matrix-ok' }, ...output.slice(1).map((item) => ({ type: 'tool_use', id: item.call_id, name: item.name, input: JSON.parse(item.arguments) }))];
+      const anthropicUsage = { input_tokens: 8, output_tokens: 4, cache_read_input_tokens: 5, cache_creation_input_tokens: 2 };
+      if (!body.stream) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ type: 'message', role: 'assistant', content, stop_reason: 'max_tokens', usage: anthropicUsage })); return; }
+      writeAnthropicSse(res, [
+        { type: 'message_start', message: { usage: anthropicUsage } },
+        ...content.flatMap((block, index) => [{ type: 'content_block_start', index, content_block: block }, { type: 'content_block_stop', index }]),
+        { type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 4 } },
+        { type: 'message_stop' },
+      ]);
+    } else throw new Error(`Unexpected upstream endpoint ${req.url}`);
+  });
+  const providers = ['responses', 'openai', 'anthropic'].map((api, index) => ({ id: `p_matrix${index}`, name: `Matrix ${index}`, api, baseUrl: `${upstream.url}/v1`, apiKey: 'test', enabled: true, models: [{ id: 'matrix-model', enabled: true }] }));
+  const ctx = await withGateway({ providers });
+  try {
+    for (let index = 0; index < providers.length; index += 1) {
+      for (const protocol of ['responses', 'chat', 'anthropic']) {
+        for (const stream of [false, true]) {
+          const body = { model: `p_matrix${index}__matrix-model`, stream };
+          const route = protocol === 'chat' ? 'chat/completions' : protocol === 'anthropic' ? 'messages' : 'responses';
+          if (protocol === 'responses') Object.assign(body, { input: 'matrix input', tools: [{ type: 'function', name: 'alpha', parameters: { type: 'object' } }] });
+          else if (protocol === 'chat') Object.assign(body, { messages: [{ role: 'user', content: 'matrix input' }], stream_options: { include_usage: true }, tools: [{ type: 'function', function: { name: 'alpha', parameters: { type: 'object' } } }] });
+          else Object.assign(body, { max_tokens: 100, messages: [{ role: 'user', content: 'matrix input' }], tools: [{ name: 'alpha', input_schema: { type: 'object' } }] });
+          const response = await postJson(`http://127.0.0.1:${ctx.port}/v1/${route}`, body);
+          assert.equal(response.status, 200, `${protocol}->${providers[index].api}, stream=${stream}: ${response.text}`);
+          if (!stream) {
+            const json = JSON.parse(response.text);
+            if (protocol === 'responses') {
+              assert.equal(json.status, 'incomplete');
+              assert.equal(json.usage.input_tokens, 15);
+              assert.equal(json.output.filter((item) => item.type === 'function_call').length, 2);
+            } else if (protocol === 'chat') {
+              assert.equal(json.choices[0].message.content, 'matrix-ok');
+              assert.equal(json.choices[0].message.tool_calls.length, 2);
+              assert.equal(json.choices[0].finish_reason, 'length');
+              assert.equal(json.usage.prompt_tokens, 15);
+              assert.equal(json.usage.prompt_tokens_details.cached_tokens, 5);
+            } else {
+              assert.equal(json.content.filter((block) => block.type === 'tool_use').length, 2);
+              assert.equal(json.stop_reason, 'max_tokens');
+              assert.equal(json.usage.input_tokens + json.usage.cache_read_input_tokens + json.usage.cache_creation_input_tokens, 15);
+            }
+          } else {
+            const frames = parseFrames(response.text).filter((frame) => frame.json).map((frame) => frame.json);
+            if (protocol === 'responses') assert.ok(frames.some((frame) => frame.type === 'response.incomplete'));
+            else if (protocol === 'chat') {
+              assert.equal(response.text.includes('event: undefined'), false);
+              assert.equal(frames.at(-1).usage.prompt_tokens, 15);
+              assert.ok(frames.some((frame) => frame.choices?.[0]?.finish_reason === 'length'));
+            } else {
+              assert.equal(response.text.includes('[DONE]'), false);
+              assert.equal(frames.at(-1).type, 'message_stop');
+              const starts = frames.filter((frame) => frame.type === 'content_block_start' && frame.content_block.type === 'tool_use');
+              assert.deepEqual(starts.map((frame) => frame.content_block.name), ['alpha', 'beta']);
+              const deltas = frames.filter((frame) => frame.type === 'content_block_delta' && frame.delta.type === 'input_json_delta');
+              assert.deepEqual(deltas.map((frame) => JSON.parse(frame.delta.partial_json)), [{ x: 1 }, { x: 2 }]);
+              assert.equal(frames.at(-2).delta.stop_reason, 'max_tokens');
+            }
+          }
+        }
+      }
+    }
+  } finally { await ctx.gw.stop(); await upstream.close(); }
+});
 
 function makeStore(providers, gatewayPatch = {}) {
   const cfg = {
@@ -161,9 +402,9 @@ const SAMPLE_PROVIDER = {
   ],
 };
 
-async function withGateway({ providers = [SAMPLE_PROVIDER], gatewayPatch = {}, logs = [], taskObserver = null, paths = null } = {}) {
+async function withGateway({ providers = [SAMPLE_PROVIDER], gatewayPatch = {}, logs = [], taskObserver = null, paths = null, usageLive = null } = {}) {
   const store = makeStore(providers, gatewayPatch);
-  const gw = createGateway({ store, log: (entry) => logs.push(entry), taskObserver, paths });
+  const gw = createGateway({ store, log: (entry) => logs.push(entry), taskObserver, paths, usageLive });
   const started = await gw.start({ port: 0, host: '127.0.0.1', token: gatewayPatch.token ?? '' });
   return { gw, store, logs, port: started.port, base: started.url };
 }
@@ -713,7 +954,7 @@ test('真实 codex 流量形状（probe/live-traffic.jsonl）：顶层键、deve
   };
 
   const upstream = await startMockUpstream((req, res, body) => {
-    // developer 消息并入 system；namespace/web_search 工具被跳过
+    // developer 消息并入 system；namespace 中的客户端工具要展开
     assert.deepEqual(body.messages, [
       {
         role: 'system',
@@ -724,7 +965,7 @@ test('真实 codex 流量形状（probe/live-traffic.jsonl）：顶层键、deve
     ]);
     assert.deepEqual(
       body.tools.map((t) => t.function.name),
-      ['exec_command'],
+      ['exec_command', 'spawn_agent'],
     );
     assert.equal(body.tool_choice, 'auto');
     assert.equal(body.parallel_tool_calls, true);
@@ -1039,6 +1280,209 @@ test('anthropic 提供商：走 /v1/messages，x-api-key + anthropic-version，�
   }
 });
 
+test('anthropic 适配器：DeepSeek effort 与缓存用量字段正确映射', async () => {
+  const provider = { baseUrl: 'https://api.deepseek.com/anthropic', apiKey: 'k' };
+  for (const [effort, expected] of [['medium', 'high'], ['xhigh', 'high'], ['max', 'max']]) {
+    const built = anthropicAdapter.buildRequest({
+      provider,
+      modelId: 'deepseek-v4.1-flash',
+      body: { input: 'hi', reasoning: { effort } },
+      stream: true,
+    });
+    assert.deepEqual(built.payload.output_config, { effort: expected });
+    assert.deepEqual(built.payload.thinking, { type: 'enabled' });
+  }
+  const noThinking = anthropicAdapter.buildRequest({
+    provider,
+    modelId: 'deepseek-v4.1-flash',
+    body: { input: 'hi', reasoning: { effort: 'none' } },
+    stream: true,
+  });
+  assert.deepEqual(noThinking.payload.thinking, { type: 'disabled' });
+  assert.equal(noThinking.payload.output_config, undefined);
+  const compat = anthropicAdapter.buildRequest({
+    provider,
+    modelId: 'deepseek-v4.1-flash',
+    body: { input: 'hi', reasoning: { effort: 'max' } },
+    stream: true,
+    compat: true,
+  });
+  assert.deepEqual(compat.payload.output_config, { effort: 'max' }, '兼容重试不能悄悄改变用户选择的推理档位');
+  assert.deepEqual(compat.payload.thinking, { type: 'enabled' });
+
+  const frames = [
+    {
+      type: 'message_start',
+      message: {
+        id: 'msg_deepseek',
+        usage: { output_tokens: 0 },
+      },
+    },
+    {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn' },
+      usage: { output_tokens: 771, prompt_cache_hit_tokens: 93600, prompt_cache_miss_tokens: 7269 },
+    },
+    { type: 'message_stop' },
+  ];
+  async function* body() {
+    yield Buffer.from(frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join(''));
+  }
+  const events = [];
+  for await (const event of anthropicAdapter.translate({ body: body() })) events.push(event);
+  const usage = events.filter((event) => event.type === 'usage').at(-1).usage;
+  assert.equal(usage.input_tokens, 100869);
+  assert.equal(usage.cache_read_input_tokens, 93600);
+  assert.equal(usage.output_tokens, 771);
+  assert.equal(usage.total_tokens, 101640);
+
+  const parsed = anthropicAdapter.parseJson({
+    content: [],
+    usage: { output_tokens: 771, prompt_cache_hit_tokens: 93600, prompt_cache_miss_tokens: 7269 },
+  });
+  assert.equal(parsed.usage.input_tokens, 100869, '非流式响应也要合并缓存命中与未命中输入');
+  assert.equal(parsed.usage.cache_read_input_tokens, 93600);
+  assert.equal(parsed.usage.total_tokens, 101640);
+});
+
+test('Anthropic thinking signature survives Responses output and the next DeepSeek turn', async () => {
+  const upstream = await startMockUpstream((req, res) => {
+    writeAnthropicSse(res, [
+      { type: 'message_start', message: { id: 'msg_signed', usage: { input_tokens: 4, output_tokens: 0 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'checked files' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'sig-exact-1' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'content_block_start', index: 1, content_block: { type: 'thinking', thinking: '' } },
+      { type: 'content_block_delta', index: 1, delta: { type: 'thinking_delta', thinking: 'checked output' } },
+      { type: 'content_block_delta', index: 1, delta: { type: 'signature_delta', signature: 'sig-exact-2' } },
+      { type: 'content_block_stop', index: 1 },
+      { type: 'content_block_start', index: 2, content_block: { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 2, delta: { type: 'text_delta', text: 'done' } },
+      { type: 'content_block_stop', index: 2 },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 2 } },
+      { type: 'message_stop' },
+    ]);
+  });
+  const provider = {
+    id: 'p_anth01', name: 'DeepSeek 中转', baseUrl: `${upstream.url}/v1`, apiKey: 'k', api: 'anthropic',
+    headers: {}, enabled: true, models: [{ id: 'deepseek-v4.1-flash', label: 'DeepSeek V4.1 Flash', enabled: true }],
+  };
+  const ctx = await withGateway({ providers: [provider] });
+  try {
+    const response = await postJson(`http://127.0.0.1:${ctx.port}/v1/responses`, {
+      model: 'p_anth01__deepseek-v4.1-flash',
+      input: 'inspect this',
+      reasoning: { effort: 'max' },
+      stream: true,
+    });
+    assert.equal(response.status, 200);
+    const frames = parseFrames(response.text).filter((frame) => frame.json);
+    const reasoningItems = frames.filter((frame) => frame.json.type === 'response.output_item.done'
+      && frame.json.item?.type === 'reasoning').map((frame) => frame.json.item);
+    assert.deepEqual(reasoningItems.map((item) => item.summary), [
+      [{ type: 'summary_text', text: 'checked files' }],
+      [{ type: 'summary_text', text: 'checked output' }],
+    ]);
+    assert.deepEqual(reasoningItems.map((item) => item.encrypted_content), ['sig-exact-1', 'sig-exact-2']);
+
+    const nextTurn = anthropicAdapter.buildRequest({
+      provider,
+      modelId: 'deepseek-v4.1-flash',
+      body: {
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'inspect this' }] },
+          ...reasoningItems,
+          { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'done' }] },
+          { type: 'function_call', call_id: 'call_next', name: 'exec', arguments: '{}' },
+        ],
+        reasoning: { effort: 'max' },
+      },
+    });
+    assert.deepEqual(nextTurn.payload.messages[1], {
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: 'checked files', signature: 'sig-exact-1' },
+        { type: 'thinking', thinking: 'checked output', signature: 'sig-exact-2' },
+        { type: 'text', text: 'done' },
+        { type: 'tool_use', id: 'call_next', name: 'exec', input: {} },
+      ],
+    });
+
+    const unsigned = anthropicAdapter.buildRequest({
+      provider,
+      modelId: 'deepseek-v4.1-flash',
+      body: { input: [{ type: 'reasoning', summary: [{ type: 'summary_text', text: 'summary only' }] }] },
+    });
+    assert.equal(JSON.stringify(unsigned.payload.messages).includes('summary only'), false);
+  } finally {
+    await ctx.gw.stop();
+    await upstream.close();
+  }
+});
+
+test('Anthropic 转换按模型能力处理历史 system 消息，并保留多段 thinking 签名', () => {
+  const history = [
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: '第一轮' }] },
+    { type: 'message', role: 'developer', content: [{ type: 'input_text', text: '中途约束' }] },
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '继续' }] },
+  ];
+  const flash = anthropicAdapter.buildRequest({
+    provider: { baseUrl: 'https://api.deepseek.com/anthropic', apiKey: 'k' },
+    modelId: 'deepseek-v4.1-flash',
+    body: { input: history },
+  });
+  assert.equal(flash.payload.system, undefined);
+  assert.deepEqual(flash.payload.messages, [
+    { role: 'user', content: [{ type: 'text', text: '第一轮' }] },
+    { role: 'system', content: [{ type: 'text', text: '中途约束' }] },
+    { role: 'assistant', content: [{ type: 'text', text: '继续' }] },
+  ]);
+
+  const pro = anthropicAdapter.buildRequest({
+    provider: { baseUrl: 'https://api.deepseek.com/anthropic', apiKey: 'k' },
+    modelId: 'deepseek-v4-pro',
+    body: { input: history },
+  });
+  assert.deepEqual(pro.payload.system, [{ type: 'text', text: '中途约束', cache_control: { type: 'ephemeral' } }]);
+  assert.deepEqual(pro.payload.messages, [
+    { role: 'user', content: [{ type: 'text', text: '第一轮' }] },
+    { role: 'assistant', content: [{ type: 'text', text: '继续' }] },
+  ]);
+
+  const parsed = anthropicAdapter.parseJson({
+    content: [
+      { type: 'thinking', thinking: '第一段', signature: 'sig-a' },
+      { type: 'text', text: '正文' },
+      { type: 'thinking', thinking: '第二段', signature: 'sig-b' },
+    ],
+  });
+  assert.deepEqual(parsed.reasoningItems, [
+    { text: '第一段', signature: 'sig-a' },
+    { text: '第二段', signature: 'sig-b' },
+  ]);
+  assert.equal(parsed.reasoningSignature, '');
+  const response = buildResponseObject({ ...parsed, model: 'deepseek-v4.1-flash', requestBody: { input: 'hi' } });
+  assert.deepEqual(response.output.filter((item) => item.type === 'reasoning').map((item) => item.encrypted_content), [
+    'sig-a',
+    'sig-b',
+  ]);
+});
+
+test('Anthropic tool choice required preserves the no-parallel constraint', () => {
+  const built = anthropicAdapter.buildRequest({
+    provider: { baseUrl: 'https://api.anthropic.com/v1', apiKey: 'k' },
+    modelId: 'claude-sonnet',
+    body: {
+      input: 'run it',
+      tools: [{ type: 'function', name: 'run', parameters: { type: 'object' } }],
+      tool_choice: 'required',
+      parallel_tool_calls: false,
+    },
+  });
+  assert.deepEqual(built.payload.tool_choice, { type: 'any', disable_parallel_tool_use: true });
+});
+
 // ---------------------------------------------------------------------------
 // 4. 失败路径 / 兼容重试 / 生命周期 / 环形日志
 // ---------------------------------------------------------------------------
@@ -1190,7 +1634,7 @@ test('流式客户端断开时保留已经收到的 usage 和缓存命中字段'
   }
 });
 
-test('上游 502 Unknown error 且提示不兼容参数时也自动降级重试', async () => {
+test('Chat 推理参数被拒绝时不静默删除后伪装成功', async () => {
   let calls = 0;
   const upstream = await startMockUpstream((req, res, body) => {
     calls += 1;
@@ -1215,9 +1659,9 @@ test('上游 502 Unknown error 且提示不兼容参数时也自动降级重试'
       max_output_tokens: 128,
       reasoning: { effort: 'medium' },
     });
-    assert.equal(res.status, 200);
-    assert.equal(calls, 2);
-    assert.match(res.text, /ok after 502 retry/);
+    assert.equal(res.status, 502);
+    assert.equal(calls, 2, '502 只允许一次保留参数的瞬时重试');
+    assert.match(res.text, /unsupported reasoning_effort/);
   } finally {
     await ctx.gw.stop();
     await upstream.close();
@@ -1228,7 +1672,7 @@ test('上游 400 报可选参数错误时去掉可选参数重试一次（compat
   let calls = 0;
   const upstream = await startMockUpstream((req, res, body) => {
     calls += 1;
-    if (body.stream_options || body.reasoning_effort || body.max_tokens) {
+    if (body.stream_options) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: { message: 'Unsupported parameter: stream_options' } }));
       return;
@@ -1256,8 +1700,9 @@ test('上游 400 报可选参数错误时去掉可选参数重试一次（compat
     assert.equal(frames.find((f) => f.json && f.json.type === 'response.output_text.done').json.text, 'ok after retry');
     assert.equal(upstream.requests[0].body.prompt_cache_key, 'session-cache-key');
     assert.equal(upstream.requests[1].body.stream_options, undefined);
-    assert.equal(upstream.requests[1].body.max_tokens, undefined);
-    assert.equal(upstream.requests[1].body.prompt_cache_key, undefined);
+    assert.equal(upstream.requests[1].body.max_tokens, 128);
+    assert.equal(upstream.requests[1].body.reasoning_effort, 'medium');
+    assert.equal(upstream.requests[1].body.prompt_cache_key, 'session-cache-key');
     assert.ok(logs.some((e) => e.level === 'warn' && /兼容请求重试/.test(e.msg)));
   } finally {
     await ctx.gw.stop();
@@ -1516,6 +1961,134 @@ test('anthropic 适配器：tool_use/tool_result 双向 + 相邻同角色合并'
   assert.deepEqual(withTools.payload.tools[0].cache_control, { type: 'ephemeral' });
 });
 
+test('Anthropic 转换：Responses Lite 工具、历史 developer 消息与不可转换输入', () => {
+  const built = anthropicAdapter.buildRequest({
+    provider: { baseUrl: 'https://api.deepseek.com/anthropic', apiKey: 'k' },
+    modelId: 'deepseek-v4.1-flash',
+    body: {
+      input: [
+        {
+          type: 'additional_tools',
+          tools: [{ type: 'namespace', name: 'functions', tools: [{ type: 'custom', name: 'exec', description: 'run' }] }],
+        },
+        { type: 'message', role: 'developer', content: [{ type: 'input_text', text: '追加的系统约束' }] },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: '列出目录' }] },
+        { type: 'custom_tool_call', call_id: 'call_1', name: 'exec', input: 'print(1)' },
+        { type: 'custom_tool_call_output', call_id: 'call_1', output: '' },
+      ],
+      parallel_tool_calls: false,
+      reasoning: { effort: 'none' },
+    },
+    stream: true,
+  });
+  assert.deepEqual(built.payload.tools.map((tool) => tool.name), ['exec']);
+  assert.equal(built.payload.system, undefined);
+  assert.deepEqual(built.payload.messages, [
+    { role: 'system', content: [{ type: 'text', text: '追加的系统约束' }] },
+    { role: 'user', content: [{ type: 'text', text: '列出目录' }] },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'call_1', name: 'exec', input: { input: 'print(1)' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_1', content: '' }] },
+  ]);
+  assert.deepEqual(built.payload.tool_choice, { type: 'auto', disable_parallel_tool_use: true });
+  assert.deepEqual(built.payload.thinking, { type: 'disabled' });
+
+  assert.throws(() => anthropicAdapter.toAnthropicMessages({
+    input: [{ type: 'function_call', name: 'f', arguments: '{invalid' }],
+  }), /有效的 JSON 对象/);
+  assert.throws(() => anthropicAdapter.toAnthropicMessages({
+    input: [{ type: 'message', role: 'user', content: [{ type: 'input_audio', audio_url: 'data:...' }] }],
+  }), /不支持 input_audio/);
+
+  const signedThinking = anthropicAdapter.toAnthropicMessages({
+    input: [{
+      type: 'reasoning',
+      summary: [{ type: 'summary_text', text: '已签名的历史思考' }],
+      encrypted_content: 'sig-1',
+    }],
+  });
+  assert.deepEqual(signedThinking.messages, [{
+    role: 'assistant',
+    content: [{ type: 'thinking', thinking: '已签名的历史思考', signature: 'sig-1' }],
+  }]);
+  assert.deepEqual(anthropicAdapter.toAnthropicMessages({
+    input: [{ type: 'reasoning', summary: [{ type: 'summary_text', text: '没有签名' }] }],
+  }).messages, [], '无原始签名的摘要不能伪造成可回放思考块');
+});
+
+test('Anthropic max_tokens stop reason maps to Responses incomplete in stream and JSON', async () => {
+  const upstream = await startMockUpstream((req, res, body) => {
+    if (body.stream) {
+      writeAnthropicSse(res, [
+        { type: 'message_start', message: { id: 'msg_limit_stream', usage: { input_tokens: 4, output_tokens: 0 } } },
+        { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'part' } },
+        { type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 3 } },
+        { type: 'message_stop' },
+      ]);
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'msg_limit_json',
+      content: [{ type: 'text', text: 'part' }],
+      stop_reason: 'max_tokens',
+      usage: { input_tokens: 4, output_tokens: 3 },
+    }));
+  });
+  const provider = {
+    id: 'p_anth01', name: 'DeepSeek 中转', baseUrl: `${upstream.url}/v1`, apiKey: 'k', api: 'anthropic',
+    headers: {}, enabled: true, models: [{ id: 'deepseek-v4.1-flash', label: 'DeepSeek V4.1 Flash', enabled: true }],
+  };
+  const ctx = await withGateway({ providers: [provider] });
+  try {
+    const stream = await postJson(`http://127.0.0.1:${ctx.port}/v1/responses`, {
+      model: 'p_anth01__deepseek-v4.1-flash', input: 'hi', stream: true,
+    });
+    const finalFrame = parseFrames(stream.text).filter((frame) => frame.json).at(-1).json;
+    assert.equal(finalFrame.type, 'response.incomplete');
+    assert.equal(finalFrame.response.status, 'incomplete');
+    assert.deepEqual(finalFrame.response.incomplete_details, { reason: 'max_output_tokens' });
+
+    const json = await postJson(`http://127.0.0.1:${ctx.port}/v1/responses`, {
+      model: 'p_anth01__deepseek-v4.1-flash', input: 'hi', stream: false,
+    });
+    assert.equal(JSON.parse(json.text).status, 'incomplete');
+    assert.deepEqual(JSON.parse(json.text).incomplete_details, { reason: 'max_output_tokens' });
+  } finally {
+    await ctx.gw.stop();
+    await upstream.close();
+  }
+});
+
+test('DeepSeek max effort is not silently removed when an upstream rejects it', async () => {
+  let calls = 0;
+  const upstream = await startMockUpstream((req, res, body) => {
+    calls += 1;
+    assert.deepEqual(body.output_config, { effort: 'max' });
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'unsupported output_config' } }));
+  });
+  const provider = {
+    id: 'p_anth01', name: 'DeepSeek 中转', baseUrl: `${upstream.url}/v1`, apiKey: 'k', api: 'anthropic',
+    headers: {}, enabled: true, models: [{ id: 'deepseek-v4.1-flash', label: 'DeepSeek V4.1 Flash', enabled: true }],
+  };
+  const ctx = await withGateway({ providers: [provider] });
+  try {
+    const response = await postJson(`http://127.0.0.1:${ctx.port}/v1/responses`, {
+      model: 'p_anth01__deepseek-v4.1-flash',
+      input: 'hi',
+      reasoning: { effort: 'max' },
+      stream: false,
+    });
+    assert.equal(response.status, 400);
+    assert.match(JSON.parse(response.text).error.message, /unsupported output_config/);
+    assert.equal(calls, 1, '不能删除 max effort 后重试并将默认档位伪装为成功');
+  } finally {
+    await ctx.gw.stop();
+    await upstream.close();
+  }
+});
+
 test('openai 适配器：一轮助手的文本与工具调用必须合成同一条 assistant 消息', () => {
   // 真实 Codex 流量是 reasoning -> assistant 文本 -> function_call x2 -> 两个 function_call_output。
   // 拆成两条连续的 assistant 消息，OpenAI 直连能收，但 Anthropic 系上游要求一个 assistant 轮
@@ -1701,6 +2274,26 @@ test('responses SSE 透传：客户端断开后不再写入或消费上游', asy
   assert.equal(yielded, 1, '客户端不可写时应停止读取上游');
 });
 
+test('responses 透传：首个可见文本 delta 记录 firstTextAt', async () => {
+  async function* body() {
+    yield Buffer.from('data: {"type":"response.output_text.delta","delta":"hi"}\n\n');
+    yield Buffer.from('data: {"type":"response.completed","response":{"id":"r1","output":[],"usage":{}}}\n\n');
+  }
+  const chunks = [];
+  const res = {
+    destroyed: false,
+    writableEnded: false,
+    on() {},
+    write(chunk) { chunks.push(chunk); },
+    end() {},
+  };
+  const out = { events: 0, firstTextAt: null };
+  await pipeResponsesSse({ body: body() }, res, out);
+  assert.equal(typeof out.firstTextAt, 'number');
+  assert.ok(out.firstTextAt > 0);
+  assert.equal(chunks.length > 0, true);
+});
+
 test('responses.js：SSE 解析容忍 event 名、多行 data、CRLF 与心跳注释', async () => {
   const { parseSse } = require('../src/core/gateway/responses.js');
   async function* body() {
@@ -1763,6 +2356,117 @@ test('responses 适配器：buildRequest 只改写 model，其余字段原样转
     body: {},
   });
   assert.equal(bare.url, 'https://relay.example/v1/responses');
+});
+
+test('responses 适配器：DeepSeek reasoning_text（content 块与增量事件）不丢', async () => {
+  const reasoningItem = {
+    id: 'rs_ds',
+    type: 'reasoning',
+    summary: [],
+    content: [{ type: 'reasoning_text', text: '先分析需求' }],
+  };
+  const parsed = responsesAdapter.parseJson({
+    output: [
+      reasoningItem,
+      { id: 'msg_ds', type: 'message', content: [{ type: 'output_text', text: 'done' }] },
+    ],
+    usage: { input_tokens: 10, input_tokens_details: { cached_tokens: 4 }, output_tokens: 2 },
+  });
+  assert.equal(parsed.reasoning, '先分析需求');
+  assert.equal(parsed.reasoningItems[0].text, '先分析需求');
+
+  const both = responsesAdapter.parseJson({
+    output: [{
+      type: 'reasoning',
+      summary: [{ type: 'summary_text', text: '摘要' }],
+      content: [{ type: 'reasoning_text', text: '原始思考' }],
+    }],
+  });
+  assert.equal(both.reasoning, '原始思考', 'summary 与 content 同时存在时优先原始思考，避免重复拼接');
+
+  async function* body() {
+    for (const event of [
+      { type: 'response.output_item.added', output_index: 0, item: { id: 'rs_ds', type: 'reasoning', summary: [], content: [] } },
+      { type: 'response.reasoning_text.delta', item_id: 'rs_ds', output_index: 0, delta: '先分析' },
+      { type: 'response.reasoning_text.delta', item_id: 'rs_ds', output_index: 0, delta: '需求' },
+      { type: 'response.reasoning_text.done', item_id: 'rs_ds', output_index: 0, text: '先分析需求' },
+      { type: 'response.output_item.done', output_index: 0, item: reasoningItem },
+      { type: 'response.output_text.delta', item_id: 'msg_ds', output_index: 1, delta: 'done' },
+      { type: 'response.output_item.done', output_index: 1, item: { id: 'msg_ds', type: 'message', content: [{ type: 'output_text', text: 'done' }] } },
+      { type: 'response.completed', response: { output: [], usage: { input_tokens: 10, output_tokens: 2 } } },
+    ]) yield Buffer.from(`data: ${JSON.stringify(event)}\n\n`);
+  }
+  const events = [];
+  for await (const event of responsesAdapter.translate({ body: body() })) events.push(event);
+  assert.equal(events.filter((event) => event.type === 'reasoning').map((event) => event.delta).join(''), '先分析需求');
+  assert.equal(events.filter((event) => event.type === 'text').map((event) => event.delta).join(''), 'done');
+  assert.deepEqual(events.find((event) => event.type === 'finish'), { type: 'finish', reason: 'stop' });
+});
+
+test('DeepSeek Responses 上游转 Chat/Anthropic：reasoning_text 映射为 reasoning_content 与 thinking 块', async () => {
+  const reasoningItem = {
+    id: 'rs_ds',
+    type: 'reasoning',
+    summary: [],
+    content: [{ type: 'reasoning_text', text: '先分析需求' }],
+  };
+  const messageItem = { id: 'msg_ds', type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '完成' }] };
+  const usage = { input_tokens: 10, input_tokens_details: { cached_tokens: 4 }, output_tokens: 2 };
+  const upstream = await startMockUpstream((req, res, body) => {
+    assert.equal(req.url, '/v1/responses');
+    if (!body.stream) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ id: 'resp_ds', status: 'completed', output: [reasoningItem, messageItem], usage }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
+    for (const event of [
+      { type: 'response.output_item.added', output_index: 0, item: { id: 'rs_ds', type: 'reasoning', summary: [], content: [] } },
+      { type: 'response.reasoning_text.delta', item_id: 'rs_ds', output_index: 0, delta: '先分析' },
+      { type: 'response.reasoning_text.delta', item_id: 'rs_ds', output_index: 0, delta: '需求' },
+      { type: 'response.reasoning_text.done', item_id: 'rs_ds', output_index: 0, text: '先分析需求' },
+      { type: 'response.output_item.done', output_index: 0, item: reasoningItem },
+      { type: 'response.output_text.delta', item_id: 'msg_ds', output_index: 1, delta: '完成' },
+      { type: 'response.output_item.done', output_index: 1, item: messageItem },
+      { type: 'response.completed', response: { output: [reasoningItem, messageItem], usage } },
+    ]) res.write(`data: ${JSON.stringify(event)}\n\n`);
+    res.end();
+  });
+  const provider = {
+    id: 'p_dsresp', name: 'DeepSeek Responses', api: 'responses', baseUrl: `${upstream.url}/v1`,
+    apiKey: 'k', headers: {}, enabled: true,
+    models: [{ id: 'deepseek-v4.1-flash', label: 'DeepSeek V4.1 Flash', enabled: true }],
+  };
+  const ctx = await withGateway({ providers: [provider] });
+  const slug = 'p_dsresp__deepseek-v4.1-flash';
+  try {
+    const chat = await postJson(`http://127.0.0.1:${ctx.port}/v1/chat/completions`, {
+      model: slug, messages: [{ role: 'user', content: 'hi' }], stream: false,
+    });
+    assert.equal(chat.status, 200, chat.text);
+    const chatJson = JSON.parse(chat.text);
+    assert.equal(chatJson.choices[0].message.reasoning_content, '先分析需求');
+    assert.equal(chatJson.choices[0].message.content, '完成');
+
+    const anthropic = await postJson(`http://127.0.0.1:${ctx.port}/v1/messages`, {
+      model: slug, max_tokens: 100, messages: [{ role: 'user', content: 'hi' }], stream: false,
+    });
+    assert.equal(anthropic.status, 200, anthropic.text);
+    const anthropicJson = JSON.parse(anthropic.text);
+    assert.deepEqual(anthropicJson.content[0], { type: 'thinking', thinking: '先分析需求' });
+
+    const streamed = await postJson(`http://127.0.0.1:${ctx.port}/v1/chat/completions`, {
+      model: slug, messages: [{ role: 'user', content: 'hi' }], stream: true,
+    });
+    assert.equal(streamed.status, 200, streamed.text);
+    const reasoningDeltas = parseFrames(streamed.text).filter((frame) => frame.json)
+      .flatMap((frame) => frame.json.choices || [])
+      .map((choice) => choice.delta?.reasoning_content || '').join('');
+    assert.equal(reasoningDeltas, '先分析需求');
+  } finally {
+    await ctx.gw.stop();
+    await upstream.close();
+  }
 });
 
 test('gateway: responses 透传（流式）逐字节转发，只改写 model，并记录 usage', async () => {
@@ -2111,7 +2815,7 @@ test('上游 404（地址填错）不做兼容重发，状态码原样转给客�
   }
 });
 
-test('502 且报错提到可选参数时优先兼容重试（总共只重发一次）', async () => {
+test('502 拒绝 reasoning_effort 时保留档位重试一次，不降档', async () => {
   const upstream = await startMockUpstream((req, res, body) => {
     if (body && (body.stream_options || body.reasoning_effort || body.max_tokens)) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -2132,10 +2836,10 @@ test('502 且报错提到可选参数时优先兼容重试（总共只重发一�
       input: 'hi',
       reasoning: { effort: 'medium' },
     });
-    assert.equal(res.status, 200);
+    assert.equal(res.status, 502);
     assert.equal(upstream.requests.length, 2, '不能先原样重发再兼容重发（那是 3 次）');
-    assert.equal(upstream.requests[1].body.reasoning_effort, undefined);
-    assert.match(res.text, /compat ok/);
+    assert.equal(upstream.requests[1].body.reasoning_effort, 'medium');
+    assert.match(res.text, /unsupported reasoning_effort/);
   } finally {
     await ctx.gw.stop();
     await upstream.close();

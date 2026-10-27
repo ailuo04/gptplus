@@ -17,7 +17,7 @@ const CORE = path.join(ROOT, 'src', 'core');
 const pathsMod = require(path.join(CORE, 'paths.js'));
 const { createStore } = require(path.join(CORE, 'store.js'));
 const { createCatalog, slugify, parseSlug, FALLBACK_BASE_INSTRUCTIONS } = require(path.join(CORE, 'catalog.js'));
-const { createCodexConfig, _internal: codexToml } = require(path.join(CORE, 'codex-config.js'));
+const { createCodexConfig, SECTION_BEGIN, SECTION_END, _internal: codexToml } = require(path.join(CORE, 'codex-config.js'));
 const { createProviderClient } = require(path.join(CORE, 'provider-client.js'));
 const { createLogStore, LOG_RING_SIZE } = require(path.join(CORE, 'log-store.js'));
 const { createUsageStore } = require(path.join(CORE, 'usage-store.js'));
@@ -1292,6 +1292,58 @@ test('codex-config: 重注入只迁移 gpt++ 旧 token，不触碰 memories 段'
   assert.match(text, /\[model_providers\.gptplus\.auth\]/);
   assert.doesNotMatch(text, /old-gateway-token/);
   assert.equal((text.match(/experimental_bearer_token\s*=/g) || []).length, 1);
+});
+
+test('codex-config: 重注入保留落进标记块的客户端设置（reasoning/desktop/projects）', (t) => {
+  const toml = [
+    'model = "old"',
+    'model_provider = "custom"',
+    '',
+    '[mcp_servers.x]',
+    'command = "x"',
+    '',
+  ].join('\n');
+  const { codex, catalogPath } = makeCodex(t, { toml });
+  codex.applyInjection({ enabled: true, catalogPath, defaultModel: 'slug-1' });
+
+  // 复现实际文件：Codex 把顶层键插到 gptplus 表之前，把 [desktop]/[projects]
+  // 插到结束标记之前。旧实现按整块删除，会把这些设置一并抹掉。
+  let text = codex.readText();
+  text = text.replace(`${SECTION_BEGIN}\n`, `${SECTION_BEGIN}\nmodel_reasoning_effort = "max"\n`);
+  text = text.replace(`${SECTION_END}\n`, [
+    '',
+    '[desktop]',
+    'show-context-window-usage = true',
+    'enabled-reasoning-efforts = ["low", "medium", "high", "xhigh", "max", "ultra"]',
+    '',
+    "[projects.'c:/work']",
+    'trust_level = "trusted"',
+    '',
+    SECTION_END,
+    '',
+  ].join('\n'));
+  fs.writeFileSync(codex.configPath, text, 'utf8');
+
+  assert.equal(codex.applyInjection({ enabled: true, catalogPath, defaultModel: 'slug-1' }).changed, true);
+  const after = codex.readText();
+  assert.match(after, /^model_reasoning_effort = "max"$/m);
+  assert.match(after, /\[desktop\][\s\S]*show-context-window-usage = true/);
+  assert.match(after, /enabled-reasoning-efforts = \[[^\]]*"max"[^\]]*\]/);
+  assert.match(after, /\[projects\.'c:\/work'\][\s\S]*trust_level = "trusted"/);
+  assert.equal(countMatches(after, /\[model_providers\.gptplus\]/g), 1);
+  assert.equal(countMatches(after, /# >>> gpt\+\+ gateway provider >>>/g), 1);
+  assert.equal(countMatches(after, /# <<< gpt\+\+ gateway provider <<</g), 1);
+
+  // 再次注入必须幂等，不能每改一次配置就多出空行或重复段。
+  assert.equal(codex.applyInjection({ enabled: true, catalogPath, defaultModel: 'slug-1' }).changed, false);
+
+  assert.equal(codex.applyInjection({ enabled: false }).changed, true);
+  const restored = codex.readText();
+  assert.match(restored, /^model_reasoning_effort = "max"$/m);
+  assert.match(restored, /\[desktop\][\s\S]*show-context-window-usage = true/);
+  assert.match(restored, /\[projects\.'c:\/work'\][\s\S]*trust_level = "trusted"/);
+  assert.doesNotMatch(restored, /model_providers\.gptplus/);
+  assert.doesNotMatch(restored, /gpt\+\+ gateway provider/);
 });
 
 test('codex-config: 用户原本就有 model_catalog_json 也要能还原', (t) => {

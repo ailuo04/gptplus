@@ -5,7 +5,7 @@ const viewState = {
 };
 
 const METRICS = [
-  ['speed', '生成速度', '显示最近一轮输出的平均 tok/s'],
+  ['speed', '生成速度', '显示最近一次响应的 tok/s（不含思考等待）'],
   ['cache', '缓存命中率', '显示输入 Token 的缓存命中比例'],
   ['context', '上下文占用', '显示当前会话占用的上下文窗口比例'],
 ];

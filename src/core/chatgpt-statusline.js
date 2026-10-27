@@ -37,8 +37,8 @@ function buildScriptSources(metrics) {
   };
 }
 
-function applyExpression(id, events) {
-  return `globalThis.__gptplusUsageStatusline?.apply?.(${JSON.stringify(String(id))}, ${JSON.stringify(events)})`;
+function applyExpression(id, events, request) {
+  return `globalThis.__gptplusUsageStatusline?.apply?.(${JSON.stringify(String(id))}, ${JSON.stringify(events)}, ${JSON.stringify(request || null)})`;
 }
 
 async function ensurePageScript(page, scripts, prepared) {
@@ -153,6 +153,7 @@ function usageMetrics(ctx) {
 function startUsageStatuslineBridge({
   cdpPort,
   read,
+  requestSpeed,
   log,
   metrics,
   visibleIntervalMs = VISIBLE_INTERVAL_MS,
@@ -187,7 +188,8 @@ function startUsageStatuslineBridge({
           if (value?.id) {
             const snapshot = read(value.id);
             if (snapshot?.status === 'ok' && Array.isArray(snapshot.events)) {
-              await evaluate(target, applyExpression(value.id, snapshot.events), { timeoutMs: COMMAND_TIMEOUT_MS });
+              const request = typeof requestSpeed === 'function' ? requestSpeed(value.id) : null;
+              await evaluate(target, applyExpression(value.id, snapshot.events, request || snapshot.request), { timeoutMs: COMMAND_TIMEOUT_MS });
             }
           }
           if (value?.hidden === true) delay = hiddenIntervalMs;
@@ -261,7 +263,13 @@ async function resumeUsageStatusline({
     let bridge = null;
     if (typeof ctx?.usageLive?.read === 'function' && typeof startBridge === 'function') {
       const metrics = usageMetrics(ctx);
-      bridge = startBridge({ cdpPort: port, read: (id) => ctx.usageLive.read(id), log: ctx.log, ...(metrics ? { metrics } : {}) });
+      bridge = startBridge({
+        cdpPort: port,
+        read: (id) => ctx.usageLive.read(id),
+        requestSpeed: (id) => ctx.gateway?.getRequestSpeed?.(id),
+        log: ctx.log,
+        ...(metrics ? { metrics } : {}),
+      });
     }
     ctx?.log?.({ level: 'info', msg: `已恢复 ChatGPT 输入框用量状态栏（调试端口 ${port}）` });
     return { ok: true, cdpPort: port, bridge: !!bridge };
@@ -302,7 +310,13 @@ async function launchChatGptWithUsageStatusline({
     let bridge = null;
     if (typeof ctx?.usageLive?.read === 'function' && typeof startBridge === 'function') {
       const metrics = usageMetrics(ctx);
-      bridge = startBridge({ cdpPort, read: (id) => ctx.usageLive.read(id), log: ctx.log, ...(metrics ? { metrics } : {}) });
+      bridge = startBridge({
+        cdpPort,
+        read: (id) => ctx.usageLive.read(id),
+        requestSpeed: (id) => ctx.gateway?.getRequestSpeed?.(id),
+        log: ctx.log,
+        ...(metrics ? { metrics } : {}),
+      });
     }
     return { ...launched, injected: true, cdpPort, bridge: !!bridge };
   } catch (error) {

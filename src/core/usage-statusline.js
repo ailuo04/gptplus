@@ -17,7 +17,7 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
   const STALE_MS = 120000;
   const CIRCUMFERENCE = 37.7;
   const SYNC_INTERVAL_MS = 5000;
-  const runtimeKey = "gptplus-usage-statusline-v3";
+  const runtimeKey = "gptplus-usage-statusline-v4";
   if (globalThis.__gptplusUsageStatuslineRuntime === runtimeKey && globalThis.__gptplusUsageStatusline) {
     return { ok: true, installed: true, reused: true };
   }
@@ -185,12 +185,18 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
     return recent.reduce((sum, value) => sum + value, 0) / recent.length;
   }
 
-  function snapshot(events) {
+  function snapshot(events, request) {
     if (!Array.isArray(events) || !events.length) return null;
     const latest = events[events.length - 1];
     const time = Date.parse(latest.t);
+    const requestSpeed = Number(request?.speed);
+    const requestAt = Number(request?.at);
+    // 网关按「单次响应输出 / 首段可见文本后的耗时」计算，和原生速度口径一致；
+    // rollout 事件间隔包含工具执行时间，只作为没有网关数据时的兜底。
+    const useRequest = Number.isFinite(requestSpeed) && requestSpeed > 0
+      && (!Number.isFinite(time) || !Number.isFinite(requestAt) || requestAt >= time - STALE_MS);
     return {
-      speed: speedRate(events),
+      speed: useRequest ? requestSpeed : speedRate(events),
       cache: cacheRate(events),
       context: percent(Number(latest.total_tokens), Number(latest.context_window)),
       stale: Number.isFinite(time) ? Date.now() - time > STALE_MS : false,
@@ -239,15 +245,19 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
     const previous = state.threadId;
     state.threadId = id;
     ensureNode(card);
-    render(snapshot(state.cache.get(id)));
+    const cached = state.cache.get(id);
+    render(snapshot(cached?.events, cached?.request));
     return { id, changed: id !== previous };
   }
 
-  function apply(id, events) {
+  function apply(id, events, request) {
     if (state.disposed) return false;
     const key = String(id || "").trim();
     if (!key || !Array.isArray(events)) return false;
-    state.cache.set(key, events.slice(-24));
+    state.cache.set(key, {
+      events: events.slice(-24),
+      request: request && typeof request === "object" ? request : null,
+    });
     while (state.cache.size > 32) state.cache.delete(state.cache.keys().next().value);
     sync();
     return true;

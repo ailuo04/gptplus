@@ -9,7 +9,8 @@
 //  * 顶层键“就地改写”：原本存在的行保持位置，只替换值；原本不存在的行插到
 //    顶层区末尾（第一个 [table] 之前）。还原时把原行原样写回 / 删除新增行，
 //    因此 enable -> disable 能逐字节回到原文件。
-//  * 段 [model_providers.gptplus] 以带标记的块形式追加在文件末尾，整块可精确删除；
+//  * 段 [model_providers.gptplus] 以带标记的块形式追加在文件末尾；删除时按 TOML
+//    表边界只移除 gptplus 表及其子表，标记之间混入的客户端配置保持原样；
 //    base_url 跟随 store.get().gateway.{port,host}（用户改端口后客户端必须指向新端口），
 //    applyInjection 显式传入的 port/host 优先。
 //  * 原始值记录在 <BACKUP_DIR>/inject-state-<hash>.json，还原时据此恢复；
@@ -29,7 +30,7 @@ const BACKUP_KEEP = 10;
 const SECTION_BEGIN = '# >>> gpt++ gateway provider >>>';
 const SECTION_END = '# <<< gpt++ gateway provider <<<';
 
-const SECTION_RE = /^\s*\[\s*model_providers\s*\.\s*gptplus\s*\]\s*$/;
+const GPT_SECTION_RE = /^\s*\[\s*model_providers\s*\.\s*gptplus\s*(?:\.[^\]]*)?\]\s*$/;
 const KEY_RE = /^\s*([A-Za-z0-9_-]+|"[^"]*"|'[^']*')\s*=/;
 
 // ---------------------------------------------------------------- 文本工具
@@ -382,31 +383,68 @@ function createCodexConfig({ store, catalog, paths } = {}) {
     const text = readText();
     if (!text) return false;
     if (text.includes(SECTION_BEGIN)) return true;
-    return splitKeepEol(text).some((l) => SECTION_RE.test(stripEol(l)));
+    return splitKeepEol(text).some((l) => GPT_SECTION_RE.test(stripEol(l)));
   }
 
-  /** 删除 [model_providers.gptplus] 段（含标记块；无标记时按表头范围删） */
+  /**
+   * 删除 [model_providers.gptplus] 及其子表。
+   *
+   * 标记块只能说明“这块曾经由 gpt++ 创建”，不能说明块内每一行都属于 gpt++：
+   * Codex 会在重启时把 model_reasoning_effort、[desktop]、[projects] 等配置
+   * 插到我们段落的后面（有时落到结束标记之前）。因此删除必须按 TOML 表边界
+   * 精确进行，只移除 gptplus 表本身；标记之间的其它内容原样保留。
+   */
   function removeGptplusSection(lines) {
+    const headers = tableHeaderIndices(lines);
+    const ours = new Array(lines.length).fill(false);
+    let found = false;
+
+    for (let i = 0; i < headers.length; i += 1) {
+      const at = headers[i];
+      if (!GPT_SECTION_RE.test(stripEol(lines[at]))) continue;
+      found = true;
+      const stop = i + 1 < headers.length ? headers[i + 1] : lines.length;
+      for (let j = at; j < stop; j += 1) ours[j] = true;
+    }
+
     const begin = lines.findIndex((l) => stripEol(l).trim() === SECTION_BEGIN);
+    let end = -1;
     if (begin >= 0) {
-      let end = lines.length - 1;
       for (let i = begin + 1; i < lines.length; i += 1) {
         if (stripEol(lines[i]).trim() === SECTION_END) {
           end = i;
           break;
         }
       }
-      lines.splice(begin, end - begin + 1);
-      return true;
     }
-    const headers = tableHeaderIndices(lines);
-    const at = headers.find((i) => SECTION_RE.test(stripEol(lines[i])));
-    if (at === undefined) return false;
-    const next = headers.find((i) => i > at);
-    const end = next === undefined ? lines.length - 1 : next - 1;
-    let start = at;
-    if (start > 0 && stripEol(lines[start - 1]).trim() === '') start -= 1;
-    lines.splice(start, end - start + 1);
+
+    const markers = new Set();
+    if (begin >= 0) markers.add(begin);
+    if (end >= 0) markers.add(end);
+    if (!found && markers.size === 0) return false;
+
+    // 标记块内只有我们的表/空行：整块删除，保证重复注入逐字节幂等。
+    if (begin >= 0 && end > begin) {
+      let onlyOurs = true;
+      for (let i = begin; i <= end; i += 1) {
+        const raw = stripEol(lines[i]);
+        if (i === begin || i === end || !raw.trim() || ours[i]) continue;
+        onlyOurs = false;
+        break;
+      }
+      if (onlyOurs) {
+        lines.splice(begin, end - begin + 1);
+        return true;
+      }
+    }
+
+    // 标记之间混入了用户/客户端配置：只删标记和 gptplus 表，其它行保留。
+    const remove = new Set(markers);
+    for (let i = 0; i < ours.length; i += 1) if (ours[i]) remove.add(i);
+    if (remove.size === 0) return false;
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      if (remove.has(i)) lines.splice(i, 1);
+    }
     return true;
   }
 

@@ -424,9 +424,11 @@ function modelTable(ctx, models, defaultModel) {
         el('div', { class: 'model-order-actions' }),
       ]);
       row.lastElementChild.append(
-        remoteLabelButton(ctx, m),
-        deleteModelButton(ctx, m),
-        dragHandle(ctx, row, visible, index),
+        ...[
+          remoteLabelButton(ctx, m),
+          deleteModelButton(ctx, m),
+          dragHandle(ctx, row, visible, index),
+        ].filter(Boolean),
       );
       return row;
     });

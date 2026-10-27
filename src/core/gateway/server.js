@@ -6,6 +6,8 @@
  *   GET  /healthz          -> { ok:true, providers:<n>, models:<n> }
  *   GET  /v1/models        -> { object:'list', data:[{id:<slug>, object:'model', owned_by:<providerName>}] }
  *   POST /v1/responses     -> Responses 契约（流式 SSE / 非流式 JSON）
+ *   POST /v1/chat/completions -> Chat Completions 契约
+ *   POST /v1/messages      -> Anthropic Messages 契约
  *   OPTIONS *              -> 204（方便浏览器里调试）
  *
  * 认证：store.gateway.token（或 start() 传入的 token）非空时，要求
@@ -34,6 +36,7 @@ const { createPeerManifest, hashPeerToken, safeEqual: safePeerEqual, peerEndpoin
 const { createOpenAIAdapter } = require('./adapters/openai.js');
 const { createAnthropicAdapter } = require('./adapters/anthropic.js');
 const { createResponsesAdapter } = require('./adapters/responses.js');
+const { normalizeRequest, protocolFromPath, createOutputStream, buildChatResponse, buildAnthropicResponse } = require('./protocols.js');
 const {
   ResponsesStream,
   buildResponseObject,
@@ -41,6 +44,7 @@ const {
   estimateUsage,
   extractErrorMessage,
   extractResponseText,
+  generationSpeed,
   hasCacheUsage,
   normalizeUsage,
   pipeResponsesSse,
@@ -60,7 +64,7 @@ const PROBE_TIMEOUT_MS = 5000;
 const UPSTREAM_TRANSIENT_RETRY_DELAY_MS = 250;
 
 /** 上游 400 且报错提到这些参数时，去掉可选参数重试一次（老中转的兼容姿势）。 */
-const COMPAT_TRIGGER = /stream_options|prompt_cache_key|cache_control|reasoning_effort|max_tokens|tool_choice|parallel_tool_calls|temperature|unknown|unsupported|not supported/i;
+const COMPAT_TRIGGER = /stream_options|prompt_cache_key|cache_control|reasoning_effort|output_config|thinking|max_tokens|tool_choice|parallel_tool_calls|temperature|unknown|unsupported|not supported/i;
 
 function isTransientUpstreamStatus(status) {
   return status === 502 || status === 503 || status === 504;
@@ -247,6 +251,28 @@ function createGateway(deps = {}) {
       }
     }
     return full;
+  }
+
+  /** 最近一次成功请求的生成速度；供输入框状态栏按会话读取。 */
+  function latestRequestSpeed(sessionId) {
+    const id = String(sessionId || '').trim().replace(/^local:/, '');
+    if (!id) return null;
+    for (let index = ring.length - 1; index >= 0; index -= 1) {
+      const entry = ring[index];
+      if (entry.final !== true || Number(entry.status) !== 200 || entry.sessionId !== id) continue;
+      const speed = Number(entry.speed);
+      if (!(speed > 0)) continue;
+      const tokens = normalizeUsage(entry.tokens);
+      return {
+        speed,
+        at: entry.at,
+        ms: entry.ms,
+        firstTextMs: entry.firstTextMs,
+        outputTokens: tokens?.output_tokens || 0,
+        model: entry.upstreamModel || entry.model || '',
+      };
+    }
+    return null;
   }
 
   function configuredPort() {
@@ -450,7 +476,7 @@ function createGateway(deps = {}) {
     if (!token) return true;
     const header = req.headers.authorization || req.headers.Authorization || '';
     const match = /^Bearer\s+(.+)$/i.exec(String(header).trim());
-    if (!match) return false;
+    if (!match) return req.url?.split('?')[0] === '/v1/messages' && safeEqual(req.headers['x-api-key'], token);
     return safeEqual(match[1].trim(), token);
   }
 
@@ -531,10 +557,13 @@ function createGateway(deps = {}) {
         sendJson(res, err.statusCode || 400, { status: 'failed', message: err.message, events: [] });
         return;
       }
-      const snapshot = usageLive.read(body?.session_id);
-      sendJson(res, snapshot?.status === 'ok' ? 200 : 404, snapshot || {
-        status: 'unavailable', message: '本机会话用量不可用', events: [],
-      });
+      const sessionId = body?.session_id;
+      const snapshot = usageLive.read(sessionId);
+      const request = latestRequestSpeed(sessionId);
+      const payload = snapshot && typeof snapshot === 'object'
+        ? { ...snapshot, ...(request ? { request } : {}) }
+        : { status: 'unavailable', message: '本机会话用量不可用', events: [], ...(request ? { request } : {}) };
+      sendJson(res, snapshot?.status === 'ok' ? 200 : 404, payload);
       return;
     }
 
@@ -553,8 +582,9 @@ function createGateway(deps = {}) {
       return;
     }
 
-    if (path === '/v1/responses' && method === 'POST') {
-      await handleResponses(req, res);
+    const protocol = protocolFromPath(path);
+    if (protocol && method === 'POST') {
+      await handleResponses(req, res, { protocol });
       return;
     }
 
@@ -591,16 +621,24 @@ function createGateway(deps = {}) {
     return status === 400 || status === 422 || (status >= 500 && status <= 599);
   }
 
-  async function handleResponses(req, res, { peerRequest = false } = {}) {
+  async function handleResponses(req, res, { peerRequest = false, protocol = 'responses' } = {}) {
     const started = Date.now();
     state.requests += 1;
 
     let body;
+    const sendProtocolError = (status, message, type = 'invalid_request_error') => {
+      if (protocol === 'anthropic') sendJson(res, status, { type: 'error', error: { type, message: String(message) } });
+      else sendError(res, status, message, type);
+    };
+    let outputOptions = {};
     try {
       body = await readJsonBody(req);
+      const normalized = normalizeRequest(body, protocol);
+      body = normalized.body;
+      outputOptions = normalized.options;
     } catch (err) {
       logEntry({ level: 'warn', msg: `请求体解析失败: ${err.message}`, status: err.statusCode || 400 });
-      sendError(res, err.statusCode || 400, err.message);
+      sendProtocolError(err.statusCode || 400, err.message);
       return;
     }
 
@@ -614,19 +652,21 @@ function createGateway(deps = {}) {
     const slug = peerRequest && route.ok ? route.slug : requestedModel;
     if (!route.ok) {
       if (peerRequest) sendPeerError(res, 404, 'MODEL_NOT_FOUND', '共享端未发布该模型');
-      else sendError(res, 404, route.reason, 'invalid_request_error');
+      else sendProtocolError(404, route.reason);
       logEntry({ level: 'warn', msg: peerRequest ? '对等端请求了未发布模型' : route.reason, status: 404, model: slug });
       return;
     }
 
     const provider = route.provider;
-    const adapter = provider.remote ? { passthrough: true } :
+    const upstreamAdapter = provider.remote ? adapters.responses :
       provider.api === 'anthropic'
         ? adapters.anthropic
         : provider.api === 'responses'
           ? adapters.responses
           : adapters.openai;
-    const wantStream = body.stream !== false;
+    const adapter = { ...upstreamAdapter, passthrough: !!upstreamAdapter.passthrough && protocol === 'responses' };
+    const wantStream = protocol === 'responses' ? body.stream !== false : body.stream === true;
+    body.stream = wantStream;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error('上游响应超时')), requestTimeoutMs);
     if (typeof timer.unref === 'function') timer.unref();
@@ -639,12 +679,16 @@ function createGateway(deps = {}) {
     };
     res.on('close', onClose);
 
+    const sessionId = typeof body?.prompt_cache_key === 'string'
+      ? body.prompt_cache_key.trim().replace(/^local:/, '').slice(0, 128)
+      : '';
     const baseLog = {
       requestId: `req_${crypto.randomBytes(12).toString('hex')}`,
       providerId: provider.id,
       providerName: route.providerName,
       model: slug,
       upstreamModel: route.modelId,
+      ...(sessionId ? { sessionId } : {}),
     };
     logEntry({ level: 'info', msg: `开始请求 ${slug}`, ...baseLog, status: 0 });
 
@@ -666,6 +710,7 @@ function createGateway(deps = {}) {
       }
     }
     let sawToolCall = false;
+    let firstTextAt = null;
     const observed = { hasToolCalls: false, text: '' };
 
     let finalLogged = false;
@@ -676,12 +721,15 @@ function createGateway(deps = {}) {
     const logFinal = (entry = {}) => {
       if (finalLogged) return null;
       finalLogged = true;
+      const ms = entry.ms ?? Date.now() - started;
+      const speed = entry.speed ?? generationSpeed(entry.tokens, ms, entry.firstTextMs);
       const final = logEntry({
         level: 'info',
         ...baseLog,
         ...entry,
+        ...(speed ? { speed } : {}),
         final: true,
-        ms: entry.ms ?? Date.now() - started,
+        ms,
       });
       if (observeTask && typeof taskObserver.turnResponse === 'function') {
         try {
@@ -702,6 +750,9 @@ function createGateway(deps = {}) {
 
     // 客户端提前断开时，尽量保留上游已经返回的 usage 和缓存字段。
     const partialUsage = () => {
+      const firstTextMs = firstTextAt
+        ? firstTextAt - started
+        : (pipe?.firstTextAt ? pipe.firstTextAt - started : undefined);
       if (stream) {
         const tokens = stream.usage || estimateUsage(body, stream.text);
         return {
@@ -709,6 +760,7 @@ function createGateway(deps = {}) {
           cacheUsageAvailable: stream.cacheUsageAvailable,
           estimatedUsage: stream.usageEstimated || !stream.usage || undefined,
           events: stream.emittedTypes.length,
+          ...(firstTextMs ? { firstTextMs } : {}),
         };
       }
       if (pipe) {
@@ -717,6 +769,7 @@ function createGateway(deps = {}) {
           cacheUsageAvailable: hasCacheUsage(pipe.usage),
           estimatedUsage: !pipe.usage || undefined,
           events: pipe.events,
+          ...(firstTextMs ? { firstTextMs } : {}),
         };
       }
       return {};
@@ -737,8 +790,12 @@ function createGateway(deps = {}) {
         //   瞬时错误   -> 原样重发一次（502/503/504；上游抖动很常见）。
         // 判据必须先看报错文本：502 里报 "unsupported reasoning_effort" 属于前者，
         // 原样重发只会再失败一次。
-        const paramIssue =
-          !adapter.passthrough && isCompatRetryableStatus(upstream.status) && COMPAT_TRIGGER.test(firstText);
+        const effortRequested = typeof body.reasoning?.effort === 'string';
+        const effortRejected = effortRequested && /output_config|thinking|effort/i.test(firstText);
+        const paramIssue = !effortRejected
+          && !adapter.passthrough
+          && isCompatRetryableStatus(upstream.status)
+          && COMPAT_TRIGGER.test(firstText);
         const transientIssue = !paramIssue && isTransientUpstreamStatus(upstream.status);
 
         if (paramIssue) {
@@ -750,7 +807,7 @@ function createGateway(deps = {}) {
           });
           const compatAttempt = await callUpstream(
             adapter,
-            { provider, modelId: route.modelId, body, stream: wantStream, compat: true },
+            { provider, modelId: route.modelId, body, stream: wantStream, compat: extractErrorMessage(firstText, '') },
             controller.signal,
           );
           upstream = compatAttempt.upstream;
@@ -816,19 +873,23 @@ function createGateway(deps = {}) {
         const parsed = adapter.parseJson(json);
         observed.hasToolCalls = !!(parsed.toolCalls && parsed.toolCalls.length);
         observed.text = parsed.text;
-        const responseObject = buildResponseObject({
+        const buildOutput = protocol === 'chat' ? buildChatResponse : protocol === 'anthropic' ? buildAnthropicResponse : buildResponseObject;
+        const responseObject = buildOutput({
           model: slug,
           text: parsed.text,
           reasoning: parsed.reasoning,
+          reasoningSignature: parsed.reasoningSignature,
+          reasoningItems: parsed.reasoningItems,
           toolCalls: parsed.toolCalls,
           usage: parsed.usage,
           requestBody: body,
+          finishReason: parsed.finishReason,
         });
         const entry = logFinal({
           level: 'info',
           msg: `完成 ${slug} -> ${route.modelId} (${Date.now() - started}ms)`,
           status: 200,
-          tokens: responseObject.usage,
+          tokens: normalizeUsage(parsed.usage) || estimateUsage(body, parsed.text),
           estimatedUsage: !parsed.usage || undefined,
           cacheUsageAvailable: hasCacheUsage(parsed.usage),
         });
@@ -840,31 +901,47 @@ function createGateway(deps = {}) {
       // 透传模式：上游报文逐字节转发，不做内部事件重建（见 adapters/responses.js）；
       // pipe 只收集日志要用的信息（usage / responseId / 失败事件 / 工具调用数）。
       pipe = adapter.passthrough
-        ? { usage: null, outputText: '', responseId: null, events: 0, completed: false, failed: null, toolCalls: 0 }
+        ? { usage: null, outputText: '', responseId: null, events: 0, completed: false, failed: null, toolCalls: 0, firstTextAt: null }
         : null;
-      stream = adapter.passthrough ? null : new ResponsesStream({ res, model: slug });
+      stream = adapter.passthrough ? null : createOutputStream(protocol, res, { model: slug, ...outputOptions }) || new ResponsesStream({ res, model: slug });
       if (stream) stream.start();
       try {
+        let finishReason = null;
         if (adapter.passthrough) {
           await pipeResponsesSse(upstream, res, pipe);
         } else {
           for await (const event of adapter.translate(upstream)) {
             switch (event.type) {
               case 'text':
+                if (!firstTextAt) firstTextAt = Date.now();
                 stream.textDelta(event.delta);
                 break;
               case 'reasoning':
                 stream.reasoningDelta(event.delta);
                 break;
+              case 'reasoning_signature':
+                stream.reasoningSignature(event.delta);
+                break;
+              case 'reasoning_done':
+                stream.reasoningDone();
+                break;
+              case 'text_done':
+                stream.textDone?.();
+                break;
               case 'tool_start':
                 sawToolCall = true;
+                if (!firstTextAt) firstTextAt = Date.now();
                 stream.toolStart({ key: event.key ?? 0, id: event.id, name: event.name });
                 break;
               case 'tool_args':
+                if (!firstTextAt) firstTextAt = Date.now();
                 stream.toolArgsDelta({ key: event.key ?? 0, delta: event.delta });
                 break;
               case 'usage':
                 stream.setUsage(event.usage);
+                break;
+              case 'finish':
+                finishReason = event.reason;
                 break;
               default:
                 break;
@@ -913,13 +990,14 @@ function createGateway(deps = {}) {
             cacheUsageAvailable: hasCacheUsage(pipe.usage),
             estimatedUsage: !pipe.usage || undefined,
             events: pipe.events,
+            firstTextMs: pipe.firstTextAt ? pipe.firstTextAt - started : undefined,
           });
           if (!res.writableEnded) res.end();
           return entry;
         }
         observed.hasToolCalls = sawToolCall;
         observed.text = stream.text;
-        stream.complete({ requestBody: body });
+        stream.complete({ requestBody: body, finishReason });
         logFinal({
           level: 'info',
           msg: `完成 ${slug} -> ${route.modelId} (${Date.now() - started}ms)`,
@@ -928,6 +1006,7 @@ function createGateway(deps = {}) {
           cacheUsageAvailable: stream.cacheUsageAvailable,
           estimatedUsage: stream.usageEstimated || undefined,
           events: stream.emittedTypes.length,
+          firstTextMs: firstTextAt ? firstTextAt - started : undefined,
         });
       } catch (err) {
         err.message = redactDiagnostic(err.message, [provider]);
@@ -965,13 +1044,13 @@ function createGateway(deps = {}) {
         return;
       }
       if (res.writableEnded) return;
-      const status = err.upstreamStatus && err.upstreamStatus < 500 ? err.upstreamStatus : 502;
+      const status = err.statusCode || (err.upstreamStatus && err.upstreamStatus < 500 ? err.upstreamStatus : 502);
       logFinal({
         level: 'error',
         msg: `上游请求失败: ${err.message}`,
         status,
       });
-      if (!res.headersSent) sendError(res, status, err.message, 'upstream_error');
+      if (!res.headersSent) sendProtocolError(status, err.message, status < 500 ? 'invalid_request_error' : 'api_error');
     } finally {
       clearTimeout(timer);
       res.removeListener('close', onClose);
@@ -1001,6 +1080,7 @@ function createGateway(deps = {}) {
     on,
     // ---- 以下为契约外的便利方法（渲染层/测试/诊断用）----
     getLogs: () => ring.slice(),
+    getRequestSpeed: latestRequestSpeed,
     resetLogs: () => {
       ring.length = 0;
     },

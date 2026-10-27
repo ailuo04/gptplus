@@ -81,6 +81,7 @@ function hasCacheUsage(raw) {
     (raw.input_tokens_details?.cached_tokens != null ||
       raw.prompt_tokens_details?.cached_tokens != null ||
       raw.cache_read_input_tokens != null ||
+      raw.prompt_cache_hit_tokens != null ||
       raw.cache_creation_input_tokens != null)
   );
 }
@@ -91,12 +92,13 @@ function hasCacheUsage(raw) {
  */
 function normalizeUsage(raw) {
   if (!raw || typeof raw !== 'object') return null;
-  const input = asNumber(raw.input_tokens ?? raw.prompt_tokens);
+  const input = asNumber(raw.input_tokens ?? raw.prompt_tokens ??
+    (raw.prompt_cache_miss_tokens != null ? asNumber(raw.prompt_cache_miss_tokens) + asNumber(raw.prompt_cache_hit_tokens) : undefined));
   const output = asNumber(raw.output_tokens ?? raw.completion_tokens);
   const cached = asNumber(
     raw.input_tokens_details?.cached_tokens ??
       raw.prompt_tokens_details?.cached_tokens ??
-      raw.cache_read_input_tokens,
+      raw.cache_read_input_tokens ?? raw.prompt_cache_hit_tokens,
   );
   const cacheWrite = asNumber(
     raw.input_tokens_details?.cache_write_tokens ?? raw.cache_creation_input_tokens,
@@ -112,6 +114,21 @@ function normalizeUsage(raw) {
     output_tokens_details: { reasoning_tokens: reasoning },
     total_tokens: total || input + output,
   };
+}
+
+/**
+ * 生成速度（tok/s）：输出 Token / 首段可见输出之后的耗时。
+ * 分母排除首 Token 等待和思考阶段；拿不到首段计时时才退回整请求耗时。
+ */
+function generationSpeed(rawUsage, elapsedMs, firstTextMs) {
+  const usage = normalizeUsage(rawUsage);
+  const output = usage ? usage.output_tokens : 0;
+  const totalMs = Number(elapsedMs);
+  if (!(output > 0) || !(totalMs > 0)) return null;
+  const first = Number(firstTextMs);
+  const activeMs = Number.isFinite(first) && first > 0 && first < totalMs ? totalMs - first : totalMs;
+  if (!(activeMs >= 50)) return null;
+  return output / (activeMs / 1000);
 }
 
 /** 上游没给 usage 时的粗略估算（仅用于日志/展示，标注 estimated）。 */
@@ -164,8 +181,10 @@ function writeSseHeaders(res) {
  * 只做「事件 -> SSE 帧」的搬运，序列号由 ResponsesStream 维护。
  */
 class SseWriter {
-  constructor(res) {
+  constructor(res, { namedEvents = true, doneFrame = true } = {}) {
     this.res = res;
+    this.namedEvents = namedEvents;
+    this.doneFrame = doneFrame;
     this.closed = false;
     // 客户端中途断开时，socket 层会异步在 res 上派发 'error'；没有监听器就是
     // unhandled error（try/catch 抓不到异步事件）。
@@ -175,7 +194,7 @@ class SseWriter {
   write(event) {
     if (this.closed) return;
     try {
-      this.res.write(sseFrame(event));
+      this.res.write(this.namedEvents ? sseFrame(event) : `data: ${JSON.stringify(event)}\n\n`);
     } catch {
       this.closed = true;
     }
@@ -194,7 +213,7 @@ class SseWriter {
     if (this.closed) return;
     this.closed = true;
     try {
-      this.res.write(DONE_FRAME);
+      if (this.doneFrame) this.res.write(DONE_FRAME);
     } catch {
       /* 客户端已断开 */
     }
@@ -211,7 +230,7 @@ class SseWriter {
 // ---------------------------------------------------------------------------
 
 /** response.created / response.in_progress 里带的 response 对象（官方形状）。 */
-function responseEnvelope({ id, model, status, output, usage, createdAt }) {
+function responseEnvelope({ id, model, status, output, usage, createdAt, incompleteDetails = null }) {
   return {
     id,
     object: 'response',
@@ -219,7 +238,7 @@ function responseEnvelope({ id, model, status, output, usage, createdAt }) {
     status,
     background: false,
     error: null,
-    incomplete_details: null,
+    incomplete_details: incompleteDetails,
     instructions: null,
     max_output_tokens: null,
     model,
@@ -291,7 +310,8 @@ class ResponsesStream {
   }
 
   get text() {
-    return this._text ? this._text.text : '';
+    return this._items.filter((entry) => entry.item.type === 'message')
+      .map((entry) => extractResponseText([entry.item])).join('') + (this._text?.text || '');
   }
 
   get reasoningText() {
@@ -415,9 +435,15 @@ class ResponsesStream {
     });
   }
 
+  reasoningSignature(delta) {
+    if (!delta) return;
+    const state = this._ensureReasoningItem();
+    state.signature = (state.signature || '') + delta;
+  }
+
   reasoningDone() {
     if (!this._reasoning) return;
-    const { item, outputIndex, text } = this._reasoning;
+    const { item, outputIndex, text, signature } = this._reasoning;
     this._send('response.reasoning_summary_text.done', {
       item_id: item.id,
       output_index: outputIndex,
@@ -434,6 +460,7 @@ class ResponsesStream {
       id: item.id,
       type: 'reasoning',
       summary: [{ type: 'summary_text', text }],
+      ...(signature ? { encrypted_content: signature } : {}),
       // codex 的 ReasoningItem 有 3 个字段（id/summary/content），
       // content 一并给出空数组，避免非 Option 字段缺失。
       content: [],
@@ -490,7 +517,7 @@ class ResponsesStream {
   toolStart({ key, id, name }) {
     const state = this._tool(key);
     if (id && !state.callId) state.callId = id;
-    if (name && !state.name) state.name = name;
+    if (name) state.name = name;
     this._flushTool(state);
     return state;
   }
@@ -539,7 +566,7 @@ class ResponsesStream {
   }
 
   /** 收尾：关掉所有打开的输出项 -> response.completed -> [DONE]。 */
-  complete({ usage, requestBody } = {}) {
+  complete({ usage, requestBody, finishReason } = {}) {
     if (this._finished) return this;
     this._finished = true;
     const outputText = this.text;
@@ -577,12 +604,16 @@ class ResponsesStream {
         content: [{ type: 'output_text', text: '', annotations: [] }],
       });
     }
-    this._send('response.completed', {
+    const incomplete = ['max_tokens', 'max_output_tokens', 'length', 'content_filter'].includes(String(finishReason || '').toLowerCase());
+    const incompleteReason = finishReason === 'content_filter' ? 'content_filter' : 'max_output_tokens';
+    const responseStatus = incomplete ? 'incomplete' : 'completed';
+    this._send(incomplete ? 'response.incomplete' : 'response.completed', {
       response: {
         id: this.responseId,
         object: 'response',
         created_at: this.createdAt,
-        status: 'completed',
+        status: responseStatus,
+        incomplete_details: incomplete ? { reason: incompleteReason } : null,
         model: this.model,
         output,
         usage: this._usage,
@@ -634,13 +665,25 @@ class ResponsesStream {
 // 非流式（stream:false）响应体
 // ---------------------------------------------------------------------------
 
-function buildResponseObject({ id, model, createdAt, text, reasoning, toolCalls, usage, requestBody, status }) {
+function buildResponseObject({ id, model, createdAt, text, reasoning, reasoningSignature, reasoningItems, toolCalls, usage, requestBody, status, finishReason }) {
   const output = [];
-  if (reasoning) {
+  if (Array.isArray(reasoningItems) && reasoningItems.length) {
+    for (const entry of reasoningItems) {
+      if (!entry?.text && !entry?.signature) continue;
+      output.push({
+        id: newItemId('rs_'),
+        type: 'reasoning',
+        summary: [{ type: 'summary_text', text: entry.text || '' }],
+        ...(entry.signature ? { encrypted_content: entry.signature } : {}),
+        content: [],
+      });
+    }
+  } else if (reasoning || reasoningSignature) {
     output.push({
       id: newItemId('rs_'),
       type: 'reasoning',
       summary: [{ type: 'summary_text', text: reasoning }],
+      ...(reasoningSignature ? { encrypted_content: reasoningSignature } : {}),
       content: [],
     });
   }
@@ -661,10 +704,12 @@ function buildResponseObject({ id, model, createdAt, text, reasoning, toolCalls,
       call_id: call.id || newItemId('call_'),
     });
   }
+  const incomplete = ['max_tokens', 'max_output_tokens', 'length', 'content_filter'].includes(String(finishReason || '').toLowerCase());
   return responseEnvelope({
     id: id || newResponseId(),
     model,
-    status: status || 'completed',
+    status: status || (incomplete ? 'incomplete' : 'completed'),
+    incompleteDetails: incomplete ? { reason: finishReason === 'content_filter' ? 'content_filter' : 'max_output_tokens' } : null,
     output,
     usage: normalizeUsage(usage) || estimateUsage(requestBody, text),
     createdAt: createdAt || nowSeconds(),
@@ -796,9 +841,16 @@ async function pipeResponsesSse(upstream, res, out) {
     }
     out.events += 1;
     const type = json?.type || evt;
+    if (!out.firstTextAt && (
+      (type === 'response.output_text.delta' && typeof json?.delta === 'string' && json.delta)
+      || (type === 'response.output_text.done' && typeof json?.text === 'string' && json.text)
+      || (type === 'response.function_call_arguments.delta' && typeof json?.delta === 'string' && json.delta)
+      || (type === 'response.output_item.added'
+        && (json?.item?.type === 'function_call' || json?.item?.type === 'custom_tool_call'))
+    )) out.firstTextAt = Date.now();
     if (type === 'response.created' || type === 'response.in_progress') {
       if (!out.responseId && json?.response?.id) out.responseId = json.response.id;
-    } else if (type === 'response.completed') {
+    } else if (type === 'response.completed' || type === 'response.incomplete' || type === 'response.cancelled') {
       out.completed = true;
       out.usage = json?.response?.usage || null;
       out.outputText = extractResponseText(json?.response?.output);
@@ -847,7 +899,8 @@ async function pipeResponsesSse(upstream, res, out) {
 function extractResponseText(output) {
   if (!Array.isArray(output)) return '';
   return output.flatMap((item) => {
-    if (!item || !Array.isArray(item.content)) return [];
+    // reasoning 项的 content 是 reasoning_text（DeepSeek 等），不能混进可见回答。
+    if (!item || item.type === 'reasoning' || !Array.isArray(item.content)) return [];
     return item.content.map((part) => part && (part.text || part.refusal)).filter(Boolean);
   }).join('');
 }
@@ -1028,6 +1081,7 @@ module.exports = {
   estimateUsage,
   extractErrorMessage,
   extractResponseText,
+  generationSpeed,
   joinApiUrl,
   newItemId,
   newResponseId,

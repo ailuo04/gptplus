@@ -57,6 +57,9 @@ function contentToChat(content) {
       continue;
     }
     if (!part) continue;
+    if (['input_audio', 'input_video', 'input_file'].includes(part.type)) {
+      throw Object.assign(new Error(`Chat 转换不支持 ${part.type}`), { statusCode: 400 });
+    }
     switch (part.type) {
       case 'input_text':
       case 'output_text':
@@ -200,13 +203,14 @@ function toMessages(body, { keepThinking = true } = {}) {
     if (!item || typeof item !== 'object') continue;
     const type = item.type || (item.role ? 'message' : '');
     switch (type) {
-      case 'message': {
+      case 'message':
+      case 'agent_message': {
         // 真实流量里 role 会出现 developer（skills/环境说明），归一到 system
         if (item.role === 'developer' || item.role === 'system') {
           pushSystemMessage(messages, textOfContent(item.content));
           break;
         }
-        const role = item.role || 'user';
+        const role = type === 'agent_message' || item.role === 'agent' ? 'assistant' : item.role || 'user';
         const content = contentToChat(item.content);
         if (content === '' && !Array.isArray(content)) continue;
         if (Array.isArray(content) && content.length === 0) continue;
@@ -265,6 +269,10 @@ function toTools(tools) {
   const out = [];
   for (const tool of tools) {
     if (!tool || typeof tool !== 'object') continue;
+    if (tool.type === 'namespace') {
+      out.push(...(toTools(tool.tools) || []));
+      continue;
+    }
     if (tool.type === 'function' && tool.function && tool.function.name) {
       // 已经是 chat 形状，但 parameters 仍要清洗
       out.push({ ...tool, function: { ...tool.function, parameters: toolParameters(tool.function.parameters) } });
@@ -319,8 +327,7 @@ function toToolChoice(choice) {
 function toReasoningEffort(effort) {
   if (typeof effort !== 'string') return undefined;
   const value = effort.toLowerCase();
-  if (value === 'minimal') return 'low';
-  if (value === 'low' || value === 'medium' || value === 'high') return value;
+  if (['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(value)) return value;
   return undefined;
 }
 
@@ -329,32 +336,49 @@ function toReasoningEffort(effort) {
  * @returns {{url:string, headers:Record<string,string>, payload:object}}
  */
 function buildRequest({ provider, modelId, body = {}, stream = true, compat = false }) {
-  const payload = { model: modelId, messages: toMessages(body, { keepThinking: !compat }), stream: !!stream };
-  if (typeof body.prompt_cache_key === 'string' && body.prompt_cache_key.trim() && !compat) {
+  const omitted = (name) => compat === true || (typeof compat === 'string' && compat.includes(name));
+  const payload = { model: modelId, messages: toMessages(body, { keepThinking: !omitted('reasoning_content') }), stream: !!stream };
+  if (typeof body.prompt_cache_key === 'string' && body.prompt_cache_key.trim() && !omitted('prompt_cache_key')) {
     // Chat Completions 兼容中转可能支持同名缓存键；兼容重试会主动移除它。
     payload.prompt_cache_key = body.prompt_cache_key.trim();
   }
-  if (stream && !compat) {
+  if (stream && !omitted('stream_options')) {
     // 让上游在最后一个 chunk 里带 usage；少数中转不认这个参数 -> retro 重试时去掉。
     payload.stream_options = { include_usage: true };
   }
-  const tools = toTools(body.tools);
+  const inputTools = (Array.isArray(body.input) ? body.input : [])
+    .filter((item) => item?.type === 'additional_tools').flatMap((item) => item.tools || []);
+  let tools = toTools([...(body.tools || []), ...inputTools]);
+  if (body.tool_choice?.type === 'allowed_tools') {
+    const names = (body.tool_choice.tools || []).map((tool) => typeof tool === 'string' ? tool : tool.name || tool.function?.name);
+    tools = (tools || []).filter((tool) => names.includes(tool.function.name));
+  }
   if (tools) {
     payload.tools = tools;
-    const toolChoice = toToolChoice(body.tool_choice);
-    if (toolChoice !== undefined && !compat) payload.tool_choice = toolChoice;
-    if (typeof body.parallel_tool_calls === 'boolean' && !compat) {
+    const toolChoice = body.tool_choice?.type === 'allowed_tools'
+      ? body.tool_choice.mode === 'required' ? 'required' : 'auto' : toToolChoice(body.tool_choice);
+    if (toolChoice !== undefined) payload.tool_choice = toolChoice;
+    if (typeof body.parallel_tool_calls === 'boolean') {
       payload.parallel_tool_calls = body.parallel_tool_calls;
     }
   }
   const maxOut = Number(body.max_output_tokens ?? body.max_tokens);
-  if (Number.isFinite(maxOut) && maxOut > 0 && !compat) {
+  if (Number.isFinite(maxOut) && maxOut > 0 && compat !== true) {
     // UNKNOWN：新版 OpenAI 直连要 max_completion_tokens，老中转只认 max_tokens。
     // 兼容面优先，这里用 max_tokens；被拒时 server 会用 compat 请求重试一次。
-    payload.max_tokens = Math.floor(maxOut);
+    payload[omitted('max_tokens') ? 'max_completion_tokens' : 'max_tokens'] = Math.floor(maxOut);
   }
   const effort = toReasoningEffort(body.reasoning && body.reasoning.effort);
-  if (effort && !compat) payload.reasoning_effort = effort;
+  if (effort && compat !== true) payload.reasoning_effort = effort;
+  if (compat !== true) {
+    for (const key of ['temperature', 'top_p']) if (typeof body[key] === 'number') payload[key] = body[key];
+    if (body.stop_sequences) payload.stop = body.stop_sequences;
+    const format = body.text?.format;
+    if (format?.type === 'json_schema') {
+      const { type, ...schema } = format;
+      payload.response_format = { type, json_schema: schema };
+    } else if (format?.type === 'json_object') payload.response_format = format;
+  }
 
   return {
     url: joinApiUrl(provider.baseUrl, '/chat/completions'),
@@ -369,15 +393,17 @@ function buildRequest({ provider, modelId, body = {}, stream = true, compat = fa
  */
 async function* translate(upstream) {
   let finishReason = null;
+  let done = false;
+  const toolNames = new Map();
   for await (const frame of parseSse(upstream.body)) {
     const data = frame.data;
     if (!data) continue;
-    if (data.trim() === '[DONE]') break;
+    if (data.trim() === '[DONE]') { done = true; break; }
     let json;
     try {
       json = JSON.parse(data);
     } catch {
-      continue; // 上游偶尔会插入非 JSON 的行，跳过而不是整轮失败
+      throw new Error('Chat 上游包含无效 JSON SSE 帧');
     }
     if (json.error) {
       const message =
@@ -389,6 +415,7 @@ async function* translate(upstream) {
     if (!choice) continue;
 
     const delta = choice.delta || choice.message || {};
+    if (typeof delta.refusal === 'string' && delta.refusal) yield { type: 'text', delta: delta.refusal };
     if (typeof delta.content === 'string' && delta.content) {
       yield { type: 'text', delta: delta.content };
     } else if (Array.isArray(delta.content)) {
@@ -409,7 +436,9 @@ async function* translate(upstream) {
       for (const call of delta.tool_calls) {
         const key = call.index ?? 0;
         if (call.id || call.function?.name) {
-          yield { type: 'tool_start', key, id: call.id, name: call.function?.name };
+          const name = (toolNames.get(key) || '') + (call.function?.name || '');
+          toolNames.set(key, name);
+          yield { type: 'tool_start', key, id: call.id, name };
         }
         const args = call.function?.arguments;
         if (typeof args === 'string' && args) yield { type: 'tool_args', key, delta: args };
@@ -418,19 +447,23 @@ async function* translate(upstream) {
 
     if (choice.finish_reason) finishReason = choice.finish_reason;
   }
+  if (!finishReason && !done) throw new Error('Chat stream ended before a terminal event');
   yield { type: 'finish', reason: finishReason };
 }
 
 /** 非流式 chat 响应 -> 内部结果。 */
 function parseJson(json) {
+  if (!Array.isArray(json?.choices) || !json.choices.length) throw new Error('Chat 上游响应缺少 choices');
   const choice = (Array.isArray(json?.choices) && json.choices[0]) || {};
   const message = choice.message || {};
   let text = '';
   if (typeof message.content === 'string') text = message.content;
   else if (Array.isArray(message.content)) text = textOfContent(message.content);
+  if (typeof message.refusal === 'string') text += message.refusal;
   const reasoning =
     (typeof message.reasoning_content === 'string' && message.reasoning_content) ||
     (typeof message.reasoning === 'string' && message.reasoning) ||
+    (typeof message.reasoning_text === 'string' && message.reasoning_text) ||
     '';
   const toolCalls = (Array.isArray(message.tool_calls) ? message.tool_calls : []).map((call) => ({
     id: call.id,
