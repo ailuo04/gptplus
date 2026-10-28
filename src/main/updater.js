@@ -7,7 +7,7 @@ const path = require('node:path');
 const UPDATER_CACHE_DIR = 'gptplus-updater';
 const RELEASES_API = 'https://api.github.com/repos/ailuo04/gptplus/releases?per_page=100';
 const RELEASE_DOWNLOAD_BASE = 'https://github.com/ailuo04/gptplus/releases/download';
-const INITIAL_CHECK_DELAY_MINUTES = 2;
+const INITIAL_CHECK_DELAY_MS = 20 * 1000;
 const DEFAULT_CHECK_INTERVAL_MINUTES = 60;
 const MIN_CHECK_INTERVAL_MINUTES = 5;
 const MAX_CHECK_INTERVAL_MINUTES = 1440;
@@ -145,7 +145,7 @@ function setupAutoUpdater(options = {}) {
     onLog = () => {},
     onState = () => {},
     checkIntervalMinutes = DEFAULT_CHECK_INTERVAL_MINUTES,
-    initialCheckDelayMs = INITIAL_CHECK_DELAY_MINUTES * 60 * 1000,
+    initialCheckDelayMs = INITIAL_CHECK_DELAY_MS,
     timers = globalThis,
   } = options;
 
@@ -161,7 +161,7 @@ function setupAutoUpdater(options = {}) {
     error: null,
     lastCheckedAt: null,
     checkIntervalMinutes: normalizeCheckIntervalMinutes(checkIntervalMinutes),
-    initialCheckDelayMinutes: INITIAL_CHECK_DELAY_MINUTES,
+    initialCheckDelaySeconds: INITIAL_CHECK_DELAY_MS / 1000,
   };
   const publish = (patch = {}) => {
     Object.assign(state, patch);

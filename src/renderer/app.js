@@ -367,7 +367,7 @@ const state = {
     rollbackReleases: null,
     lastCheckedAt: null,
     checkIntervalMinutes: 60,
-    initialCheckDelayMinutes: 2,
+    initialCheckDelaySeconds: 20,
   },
   loaded: { status: false, providers: false, models: false, modelLimits: false, gateway: false, inject: false, peer: false, startup: false, update: false, logs: false, usage: false, weixin: false, plugins: false },
 };

@@ -191,7 +191,7 @@ C:\ailuo_own\gpt++\
 
 ### 4.3 软件更新检查
 
-- 自动更新不会在应用启动时立即访问网络；启动后等待 2 分钟进行首次检查，之后按 `updates.checkIntervalMinutes` 定时检查，默认 60 分钟，范围 5-1440 分钟。
+- 自动更新不会在应用启动时立即访问网络；启动后等待 20 秒进行首次检查，之后按 `updates.checkIntervalMinutes` 定时检查，默认 60 分钟，范围 5-1440 分钟。
 - 自动检查只查询版本，不自动下载或安装；发现新版本后仍由用户确认下载和安装。设置页的手动检查仍立即执行。
 - `updates.checkIntervalMinutes` 持久化到本地配置；修改后立即重排后续定时器。未主动改变调度协议的后续版本继续读取该配置。
 
@@ -313,7 +313,7 @@ window.gptplus = {
   restoreRemoteModel(patch: { providerId:string; modelId:string }): Promise<Status>;
   setRemoteModelLabel(patch: { providerId:string; modelId:string; label:string }): Promise<Status>;
 
-  getUpdateState(): Promise<{ enabled: boolean; status: string; checkIntervalMinutes: number; initialCheckDelayMinutes: 2 }>;
+  getUpdateState(): Promise<{ enabled: boolean; status: string; checkIntervalMinutes: number; initialCheckDelaySeconds: 20 }>;
   checkForUpdates(): Promise<object>;                 // 用户手动立即检查
   setUpdateCheckInterval(patch: { checkIntervalMinutes: number }): Promise<object>;
 

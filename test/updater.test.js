@@ -108,7 +108,7 @@ test('发现更新后只记录版本，用户确认后才下载并安装', async
   assert.ok(logs.some((entry) => entry.msg.includes('等待用户选择')));
 });
 
-test('自动更新启动后延迟 2 分钟首次检查，之后按设定间隔检查', async () => {
+test('自动更新启动后延迟 20 秒首次检查，之后按设定间隔检查', async () => {
   const updater = createUpdater();
   const timers = createTimers();
   let checkCalls = 0;
@@ -125,7 +125,8 @@ test('自动更新启动后延迟 2 分钟首次检查，之后按设定间隔�
   });
 
   assert.equal(checkCalls, 0);
-  assert.deepEqual(timers.timeoutDelays(), [120_000]);
+  assert.deepEqual(timers.timeoutDelays(), [20_000]);
+  assert.equal(controller.getState().initialCheckDelaySeconds, 20);
   assert.equal(controller.getState().checkIntervalMinutes, 30);
 
   await timers.fireTimeout();
@@ -146,7 +147,7 @@ test('修改自动检查间隔会立即重排后续定时器', () => {
     timers,
   });
   assert.equal(controller.setCheckIntervalMinutes(45).checkIntervalMinutes, 45);
-  assert.deepEqual(timers.timeoutDelays(), [120_000]);
+  assert.deepEqual(timers.timeoutDelays(), [20_000]);
   controller.stopAutomaticChecks();
 });
 

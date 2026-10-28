@@ -346,7 +346,7 @@ function updateCard(ctx) {
       el('div', { class: 'setting' }, [
         el('div', { class: 'setting-main' }, [
           el('div', { class: 'setting-title', text: '自动检查更新间隔' }),
-          el('div', { class: 'setting-desc', text: `启动后 ${update.initialCheckDelayMinutes || 2} 分钟首次检查，之后每隔设定时间检查；范围 5-1440 分钟。` }),
+          el('div', { class: 'setting-desc', text: `启动后 ${update.initialCheckDelaySeconds || 20} 秒首次检查，之后每隔设定时间检查；范围 5-1440 分钟。` }),
         ]),
         el('div', { class: 'setting-ctl' }, [intervalInput]),
       ]),
