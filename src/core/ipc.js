@@ -155,6 +155,15 @@ function registerIpc(deps) {
     });
   };
 
+  const openExternalHttpUrl = async (url) => {
+    const value = String(url || '').trim();
+    if (!/^https?:\/\//i.test(value)) throw new Error('只允许打开 http(s) 链接');
+    await shell.openExternal(value);
+    return true;
+  };
+
+  handle('gptplus:external:open-link', openExternalHttpUrl);
+
   const publish = () => {
     const s = ctx.status();
     const peer = typeof ctx.peerState === 'function' ? ctx.peerState() : null;
@@ -770,10 +779,7 @@ function registerIpc(deps) {
   });
 
   handle('gptplus:weixin:open-link', async (url) => {
-    const value = String(url || '').trim();
-    if (!/^https?:\/\//i.test(value)) throw new Error('只允许打开 http(s) 链接');
-    await shell.openExternal(value);
-    return true;
+    return openExternalHttpUrl(url);
   });
 
   // ---- 模型与网关 ----

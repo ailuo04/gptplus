@@ -386,7 +386,10 @@ function modelTable(ctx, models, defaultModel) {
         class: 'trow tbody-row' + (m.enabled ? '' : ' is-off') + (isDefault ? ' is-default' : ''),
         data: { orderKey: m.orderKey || `${m.providerId}::${m.modelId}` },
       }, [
-        el('div', { class: 'cell-label', title: m.label || m.modelId, text: m.label || m.modelId }),
+        el('div', { class: 'cell-label' }, [
+          el('span', { class: 'cell-label-text', title: m.label || m.modelId, text: m.label || m.modelId }),
+          m.isNew ? el('span', { class: 'chip chip-warn', text: '新增' }) : null,
+        ]),
         el('div', { class: 'cell-slug' }, [
           el('span', { class: 'slug-text', title: m.slug, text: m.slug }),
           el('button', {
@@ -401,7 +404,6 @@ function modelTable(ctx, models, defaultModel) {
         el('div', {}, [modelSwitch(ctx, m)]),
         el('div', {}, [
           m.remote ? el('span', { class: 'chip chip-codex', text: '远端' }) : null,
-          m.isNew ? el('span', { class: 'chip chip-warn', text: '新增' }) : null,
           m.remote && !m.detected ? el('span', { class: 'chip chip-err', text: '未检测到' }) : null,
           m.remote && m.hidden ? el('span', { class: 'chip chip-warn', text: '本机已删除' }) : null,
           m.reasoning

@@ -1977,7 +1977,9 @@ html.is-theme-switching .logs {
 /* 默认模型行：左侧色条 + 极淡底色（过去整行铺 accent-soft 太重） */
 .tbody-row.is-default { background: var(--accent-soft); }
 .tbody-row.is-default::before { transform: scaleY(1); opacity: 1; }
-.cell-label { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); }
+.cell-label { display: flex; align-items: center; gap: 6px; min-width: 0; font-weight: 600; color: var(--fg); }
+.cell-label-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cell-label .chip { flex: 0 0 auto; white-space: nowrap; }
 .cell-slug { font-family: var(--mono); font-size: 11.5px; color: var(--fg-dim); display: flex; align-items: center; gap: 6px; min-width: 0; }
 .cell-slug .slug-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cell-slug .btn-icon { width: 22px; height: 22px; opacity: 0; transition: opacity var(--dur-2); }
@@ -2398,6 +2400,30 @@ html.is-theme-switching .logs {
 .modal.modal-update .note-warn { background: var(--glass-float-warn); }
 .modal-update .note .icon { margin-top: 1px; }
 .modal-update .note .faint { font-size: 11.5px; }
+.update-summary {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--glass-line);
+}
+.update-summary-title { margin-bottom: 6px; font-size: 11.5px; font-weight: 650; color: var(--fg); }
+.update-summary-list { display: grid; gap: 5px; margin: 0; padding-left: 18px; font-size: 12px; line-height: 1.5; color: var(--fg-dim); }
+.update-summary-list li { padding-left: 1px; }
+.update-summary-list li::marker { color: var(--warn); }
+.update-notes-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 7px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.update-notes-link:hover { color: var(--fg); }
+.update-notes-link:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 3px; border-radius: 3px; }
 .modal-update .modal-foot {
   justify-content: flex-end;
   padding: 11px 16px 12px;
@@ -2520,6 +2546,9 @@ html.is-theme-switching .logs {
 .mrow .input { padding: 5px 8px; min-height: 26px; font-size: 12.5px; }
 .mrow .check { font-size: 11.5px; }
 .mrow .btn-icon { width: 24px; height: 24px; }
+.mrow-id-cell { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.mrow-id-cell .input { flex: 1 1 auto; min-width: 0; }
+.mrow-id-cell .chip { flex: 0 0 auto; white-space: nowrap; }
 .model-rows-empty { padding: 20px 12px; text-align: center; font-size: 12px; color: var(--fg-faint); }
 
 /* ============ 14. 轻提示 ============ */

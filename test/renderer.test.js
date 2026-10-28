@@ -959,6 +959,9 @@ test('更新状态变化时同步刷新设置页更新卡片', () => {
   assert.match(handler, /const changed = Object\.keys\(next\)/, '更新处理应先判断状态是否真的变化');
   assert.match(handler, /state\.view === 'settings'/, '设置页需要响应更新状态变化');
   assert.match(handler, /renderCurrent\(false, \{ preserveScrollTop: true \}\)/, '设置页刷新必须保留滚动位置');
+  assert.match(appSrc, /current\.highlights\.slice\(0, 4\)/, '更新弹窗最多展示四条摘要');
+  assert.match(appSrc, /update-summary-list/, '更新弹窗必须以清单展示本次更新内容');
+  assert.match(appSrc, /完整更新说明/, '更新弹窗必须保留完整更新说明入口');
 });
 
 test('提供商表单支持多模型行与从 /models 拉取', () => {
@@ -981,6 +984,8 @@ test('提供商表单支持多模型行与从 /models 拉取', () => {
   assert.match(src, /event\.preventDefault\(\)/, '拖拽导入必须阻止浏览器直接打开文件');
   assert.match(src, /provider-import-dropzone/, '导入弹窗必须提供拖拽接收区域');
   assert.match(src, /复制 API Key/, 'API Key 复制入口必须保留');
+  assert.match(cssSrc, /\.mrow-id-cell\s*\{[^}]*display:\s*flex/s, '提供商模型 ID 与新增标记必须同行排列');
+  assert.match(cssSrc, /\.cell-label\s*\{[^}]*display:\s*flex/s, '模型页名称与新增标记必须同行排列');
   assert.match(cssSrc, /\.provider-file-drop-overlay\s*\{[\s\S]*?position:\s*fixed;[\s\S]*?align-items:\s*center;[\s\S]*?justify-content:\s*center;/, '窗口级拖拽覆盖层必须在窗口正中显示');
   assert.match(cssSrc, /\.provider-file-drop-card\s*\{[\s\S]*?width:\s*min\(356px, 100%\);[\s\S]*?backdrop-filter:\s*blur\(28px\) saturate\(155%\)/, '提示必须使用紧凑尺寸的液态玻璃卡片');
 });
@@ -1348,6 +1353,10 @@ function makeApi(state, calls) {
     },
     getLogs: async () => [],
     getUpdateState: async () => state.update || { enabled: false, status: 'idle' },
+    openExternalLink: async (url) => {
+      calls.push(['openExternalLink', url]);
+      return true;
+    },
     checkForUpdates: async () => {
       calls.push(['checkForUpdates']);
       return state.update || { enabled: false, status: 'idle' };
@@ -1540,7 +1549,9 @@ test('三个页面与提供商表单能在 DOM 替身上真实渲染', async () 
     providersMod.closeProviderForm();
 
     // --- 模型页：注入已开启 ---
-    const modelsCtx = makeCtx(appMod, fixtureState());
+    const badgeState = fixtureState();
+    badgeState.models[0].isNew = true;
+    const modelsCtx = makeCtx(appMod, badgeState);
     const mRoot = new FakeNode('main');
     const mActions = new FakeNode('div');
     modelsMod.renderModels(mRoot, modelsCtx, mActions);
@@ -1555,6 +1566,9 @@ test('三个页面与提供商表单能在 DOM 替身上真实渲染', async () 
     assert.match(modelsText, /2 · 本地网关/, '应有链路第二步');
     assert.match(modelsText, /3 · ChatGPT 客户端/, '应有链路第三步');
     assert.match(modelsText, /默认模型/, '应有默认模型选择器');
+    const badgeRow = mRoot.find('tbody-row')[0];
+    assert.ok(badgeRow.children[0].find('chip-warn').length, '模型页的新增标记应位于模型名右侧');
+    assert.equal(badgeRow.children[4].find('chip-warn').length, 0, '模型页的新增标记不应挤进推理列导致错位');
 
     // --- 模型页：空状态 ---
     const noModels = makeCtx(appMod, fixtureState({ models: [], inject: { enabled: false, catalogPath: null, defaultModel: null } }));
@@ -1577,6 +1591,31 @@ test('三个页面与提供商表单能在 DOM 替身上真实渲染', async () 
     assert.match(settingsText, /还原注入/, '应有还原注入按钮');
     assert.match(settingsText, /打开 Codex 目录/, '应有打开目录按钮');
     assert.equal(settingsText.includes('tok-abcdef123456'), false, '网关令牌默认也要打码');
+
+    const updateState = fixtureState({
+      update: {
+        enabled: true,
+        status: 'available',
+        currentVersion: '1.6.4',
+        version: '1.6.5',
+        highlights: ['新模型默认启用并开启推理。', '修复用量状态栏三项显示为空。'],
+        notesStatus: 'ready',
+        releaseNotesUrl: 'https://github.com/ailuo04/gptplus/releases/tag/v1.6.5',
+        percent: 0,
+      },
+    });
+    const updateCtx = makeCtx(appMod, updateState);
+    const updateRoot = new FakeNode('main');
+    settingsMod.renderSettings(updateRoot, updateCtx, new FakeNode('div'));
+    assert.match(updateRoot.allText(), /本次更新/, '设置页更新卡片必须展示摘要标题');
+    assert.match(updateRoot.allText(), /新模型默认启用并开启推理/, '设置页必须展示更新要点');
+    const updateLink = updateRoot.find('update-notes-link')[0];
+    assert.ok(updateLink, '设置页必须提供完整更新说明入口');
+    click(updateLink);
+    await flush();
+    assert.deepEqual(updateCtx._calls.find((item) => item[0] === 'openExternalLink'), [
+      'openExternalLink', 'https://github.com/ailuo04/gptplus/releases/tag/v1.6.5',
+    ]);
 
     settingsCtx.state.relaunchNeeded = true;
     const pendingSettingsRoot = new FakeNode('main');
@@ -2396,13 +2435,16 @@ test('提供商页：测试连接 / 删除 / 保存 / 从 /models 拉取都能�
     assert.deepEqual(pullErrors, [], '拉取成功后不应再弹出任何错误提示');
     assert.match(modal.allText(), /已完成手动 \/models 检查/, '成功提示应写进表单顶部');
     assert.match(modal.allText(), /新增/, '新模型应标记为新增');
-    assert.match(modal.allText(), /默认停用/, '新模型应默认停用');
+    assert.match(modal.allText(), /默认启用并开启推理/, '新模型应默认启用并开启推理');
     for (const row of modal.find('mrow')) {
       const id = row.findTag('input')[0]?.value;
       if (id === 'gpt-6.1-sol' || id === 'deepseek-v4') {
-        assert.equal(row.findTag('input')[2].checked, false, '新发现的上游模型必须默认禁用');
+        assert.equal(row.findTag('input')[2].checked, true, '新发现的上游模型必须默认启用');
+        assert.equal(row.findTag('input')[3].checked, true, '新发现的上游模型必须默认开启推理');
       }
     }
+    const newRow = modal.find('mrow').find((row) => row.findTag('input')[0]?.value === 'deepseek-v4');
+    assert.ok(newRow.children[0].find('chip-warn').length, '新增标记应位于模型 ID 右侧的同一行单元格');
     providersMod.closeProviderForm();
   } finally {
     delete globalThis.document;

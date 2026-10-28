@@ -5,12 +5,19 @@ const os = require('node:os');
 const path = require('node:path');
 
 const UPDATER_CACHE_DIR = 'gptplus-updater';
-const RELEASES_API = 'https://api.github.com/repos/ailuo04/gptplus/releases?per_page=100';
+const RELEASES_API_BASE = 'https://api.github.com/repos/ailuo04/gptplus/releases';
+const RELEASES_API = `${RELEASES_API_BASE}?per_page=100`;
+const RELEASE_TAG_BASE = 'https://github.com/ailuo04/gptplus/releases/tag';
 const RELEASE_DOWNLOAD_BASE = 'https://github.com/ailuo04/gptplus/releases/download';
 const INITIAL_CHECK_DELAY_MS = 20 * 1000;
 const DEFAULT_CHECK_INTERVAL_MINUTES = 60;
 const MIN_CHECK_INTERVAL_MINUTES = 5;
 const MAX_CHECK_INTERVAL_MINUTES = 1440;
+const MAX_UPDATE_HIGHLIGHTS = 4;
+const MAX_UPDATE_HIGHLIGHT_CHARS = 96;
+const SUMMARY_HEADING_RE = /^(?:软件内更新摘要|本次更新|更新内容|更新摘要|highlights?)$/i;
+const UPDATE_SECTION_RE = /(?:新增|修复|改进|优化|变更|更新|亮点|features?|fix(?:es)?|improvements?|changes?)/i;
+const NON_UPDATE_SECTION_RE = /(?:兼容性|验证|测试|安装|校验|发布说明|compatibility|verification|testing|installation|release checks?)/i;
 
 function stableVersion(value) {
   const match = String(value || '').replace(/^v/i, '').match(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
@@ -31,6 +38,130 @@ function normalizeCheckIntervalMinutes(value) {
     && candidate <= MAX_CHECK_INTERVAL_MINUTES
     ? candidate
     : DEFAULT_CHECK_INTERVAL_MINUTES;
+}
+
+function cleanMarkdownText(value) {
+  return String(value || '')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/\[([^\]]+)\]\[[^\]]*\]/g, '$1')
+    .replace(/<br\s*\/?>/gi, ' ')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/[*_~`]+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function truncateUpdateHighlight(value, maxChars = MAX_UPDATE_HIGHLIGHT_CHARS) {
+  const text = cleanMarkdownText(value).replace(/[，,；;：:\s]+$/g, '');
+  const chars = Array.from(text);
+  if (chars.length <= maxChars) return text;
+  return `${chars.slice(0, Math.max(1, maxChars - 1)).join('').replace(/[，,；;：:\s]+$/g, '')}…`;
+}
+
+function parseHeading(line) {
+  const match = /^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/.exec(String(line || ''));
+  if (!match) return null;
+  return { level: match[1].length, title: cleanMarkdownText(match[2]) };
+}
+
+function parseBullet(line) {
+  const source = String(line || '');
+  const markdown = /^\s{0,3}(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?(.+?)\s*$/.exec(source);
+  if (markdown) return cleanMarkdownText(markdown[1]);
+  const html = /^\s*<li\b[^>]*>(.*?)<\/li>\s*$/i.exec(source);
+  return html ? cleanMarkdownText(html[1]) : '';
+}
+
+/** 从 Release Markdown 提取软件内显示的精简更新要点。 */
+function extractUpdateHighlights(markdown, options = {}) {
+  const maxItems = Number.isInteger(options.maxItems) && options.maxItems > 0
+    ? options.maxItems
+    : MAX_UPDATE_HIGHLIGHTS;
+  const maxChars = Number.isInteger(options.maxChars) && options.maxChars > 0
+    ? options.maxChars
+    : MAX_UPDATE_HIGHLIGHT_CHARS;
+  const lines = String(markdown || '').replace(/\r\n?/g, '\n').split('\n');
+  const output = [];
+  const seen = new Set();
+  const add = (line) => {
+    const text = truncateUpdateHighlight(parseBullet(line) || line, maxChars);
+    const key = text.toLocaleLowerCase();
+    if (!text || seen.has(key)) return;
+    seen.add(key);
+    output.push(text);
+  };
+
+  let summary = null;
+  for (let index = 0; index < lines.length; index += 1) {
+    const heading = parseHeading(lines[index]);
+    if (heading && SUMMARY_HEADING_RE.test(heading.title)) {
+      summary = { start: index + 1, level: heading.level };
+      break;
+    }
+  }
+  if (summary) {
+    for (let index = summary.start; index < lines.length && output.length < maxItems; index += 1) {
+      const heading = parseHeading(lines[index]);
+      if (heading && heading.level <= summary.level) break;
+      if (parseBullet(lines[index])) add(lines[index]);
+    }
+  }
+
+  if (!output.length) {
+    let updateLevel = 0;
+    let excludedLevel = 0;
+    for (const line of lines) {
+      const heading = parseHeading(line);
+      if (heading) {
+        if (excludedLevel && heading.level <= excludedLevel) excludedLevel = 0;
+        if (NON_UPDATE_SECTION_RE.test(heading.title)) {
+          excludedLevel = heading.level;
+          updateLevel = 0;
+        } else if (UPDATE_SECTION_RE.test(heading.title)) {
+          updateLevel = heading.level;
+        } else if (updateLevel && heading.level <= updateLevel) {
+          updateLevel = 0;
+        }
+        continue;
+      }
+      if (!excludedLevel && parseBullet(line)) add(line);
+      if (output.length >= maxItems) break;
+    }
+  }
+  return output.slice(0, maxItems);
+}
+
+function releasePageUrl(version) {
+  const parsed = stableVersion(version);
+  return parsed ? `${RELEASE_TAG_BASE}/v${parsed.value}` : null;
+}
+
+/** 读取某个已发布版本的摘要；失败时由调用方保留更新能力，不阻塞下载。 */
+async function fetchReleaseDetails(version, options = {}) {
+  const parsed = stableVersion(version);
+  if (!parsed) throw new Error('更新版本格式无效');
+  const fetchImpl = options.fetchImpl || globalThis.fetch;
+  if (typeof fetchImpl !== 'function') throw new Error('当前环境无法连接 GitHub');
+  const response = await fetchImpl(`${RELEASES_API_BASE}/tags/v${parsed.value}`, {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'gptplus-updater',
+    },
+  });
+  if (!response.ok) throw new Error(`读取更新说明失败（HTTP ${response.status}）`);
+  const release = await response.json();
+  if (!release || typeof release !== 'object' || Array.isArray(release)) {
+    throw new Error('GitHub 返回的更新说明格式无效');
+  }
+  return {
+    highlights: extractUpdateHighlights(release.body),
+    releaseNotesUrl: releasePageUrl(parsed.value),
+  };
 }
 
 async function listRollbackReleases({ currentVersion, fetchImpl = globalThis.fetch }) {
@@ -157,6 +288,9 @@ function setupAutoUpdater(options = {}) {
     version: null,
     rollbackTarget: null,
     releaseDate: null,
+    highlights: [],
+    notesStatus: 'idle',
+    releaseNotesUrl: null,
     percent: 0,
     error: null,
     lastCheckedAt: null,
@@ -250,7 +384,11 @@ function setupAutoUpdater(options = {}) {
       publish({ status: 'error', version: null, rollbackTarget: null, error: `无法回退到 v${version}，请确认该版本仍可用` });
       return;
     }
-    publish({ status: 'latest', version: null, rollbackTarget: null, releaseDate: null, percent: 0, error: null, lastCheckedAt: Date.now() });
+    publish({
+      status: 'latest', version: null, rollbackTarget: null, releaseDate: null,
+      highlights: [], notesStatus: 'idle', releaseNotesUrl: null,
+      percent: 0, error: null, lastCheckedAt: Date.now(),
+    });
     log('info', '当前已是最新版本');
   });
 
@@ -262,16 +400,34 @@ function setupAutoUpdater(options = {}) {
       publish({ status: 'error', version: null, rollbackTarget: null, error: `版本校验不匹配：请求 v${requested}，服务器返回 v${info.version}` });
       return;
     }
+    const version = String(info.version || '');
     publish({
       status: 'available',
-      version: String(info.version || ''),
+      version,
       releaseDate: info.releaseDate || null,
       rollbackTarget,
+      highlights: [],
+      notesStatus: version ? 'loading' : 'idle',
+      releaseNotesUrl: releasePageUrl(version),
       percent: 0,
       error: null,
       lastCheckedAt: Date.now(),
     });
-    log('info', `发现新版本 ${info.version || ''}，等待用户选择更新时机`);
+    log('info', `发现新版本 ${version}，等待用户选择更新时机`);
+    if (version) {
+      void fetchReleaseDetails(version, { fetchImpl }).then((details) => {
+        if (state.version !== version || !['available', 'downloading', 'downloaded'].includes(state.status)) return;
+        publish({
+          highlights: details.highlights,
+          releaseNotesUrl: details.releaseNotesUrl,
+          notesStatus: 'ready',
+        });
+      }).catch((error) => {
+        if (state.version !== version || !['available', 'downloading', 'downloaded'].includes(state.status)) return;
+        publish({ notesStatus: 'error' });
+        log('warn', `读取 v${version} 更新摘要失败: ${error.message}`);
+      });
+    }
   });
 
   autoUpdater.on('download-progress', (progress) => {
@@ -419,4 +575,11 @@ function setupAutoUpdater(options = {}) {
   };
 }
 
-module.exports = { setupAutoUpdater, cleanupInstalledUpdateCache, listRollbackReleases };
+module.exports = {
+  setupAutoUpdater,
+  cleanupInstalledUpdateCache,
+  listRollbackReleases,
+  extractUpdateHighlights,
+  fetchReleaseDetails,
+  releasePageUrl,
+};

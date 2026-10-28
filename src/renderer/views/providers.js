@@ -1878,8 +1878,8 @@ async function doPull(ctx, draft, refs, afterRowsChange) {
         draft.models.push({
           id,
           label: String((item && item.label) || id).trim() || id,
-          enabled: false,
-          reasoning: item?.reasoning === true || item?.capabilities?.reasoning === true,
+          enabled: true,
+          reasoning: true,
           detected: true,
           isNew: true,
           missingSince: null,
@@ -1889,10 +1889,10 @@ async function doPull(ctx, draft, refs, afterRowsChange) {
     }
     afterRowsChange();
     const missing = draft.models.filter((model) => model.detected === false).length;
-    const msg = `检查到 ${remote.length} 个模型：新增 ${added} 个（默认停用），已存在 ${kept} 个，未检测到 ${missing} 个`;
+    const msg = `检查到 ${remote.length} 个模型：新增 ${added} 个（默认启用并开启推理），已存在 ${kept} 个，未检测到 ${missing} 个`;
     ctx.toast(msg, 'ok');
     ctx.logLocal('info', msg);
-    if (refs.note) refs.note('ok', '已完成手动 /models 检查：新增模型默认停用，未检测到的模型保留原启用状态；点「保存修改」写入结果。');
+    if (refs.note) refs.note('ok', '已完成手动 /models 检查：新增模型默认启用并开启推理，未检测到的模型保留原启用状态；点「保存修改」写入结果。');
   } catch (err) {
     ctx.toastError(err, '拉取 /models 失败');
   } finally {

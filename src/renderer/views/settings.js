@@ -286,6 +286,32 @@ function peerCard(ctx, peer, gateway, modal = false, modalState = null) {
 }
 
 // ============ 软件更新 ==========
+function updateSummary(ctx, update) {
+  const { el, icon } = ctx;
+  const highlights = Array.isArray(update.highlights) ? update.highlights.slice(0, 4) : [];
+  const notesLink = update.releaseNotesUrl
+    ? el('button', {
+        class: 'update-notes-link',
+        type: 'button',
+        title: '在 GitHub 查看完整更新说明',
+        on: {
+          click: () => {
+            void ctx.api.openExternalLink(update.releaseNotesUrl)
+              .catch((err) => ctx.toastError(err, '打开完整更新说明失败'));
+          },
+        },
+      }, [el('span', { text: '完整更新说明' }), icon('external', 11)])
+    : null;
+  if (!highlights.length && !notesLink) return null;
+  return el('div', { class: 'update-summary' }, [
+    highlights.length ? el('div', { class: 'update-summary-title', text: '本次更新' }) : null,
+    highlights.length
+      ? el('ul', { class: 'update-summary-list' }, highlights.map((text) => el('li', { text })))
+      : null,
+    notesLink,
+  ]);
+}
+
 function updateCard(ctx) {
   const { el, icon, state } = ctx;
   const update = state.update || {};
@@ -331,6 +357,7 @@ function updateCard(ctx) {
           el('div', { class: 'setting-desc', text: hasVersion && pending
             ? '可以现在更新，也可以稍后从左侧“设置”旁的更新提示进入。暂不更新不会影响当前版本使用。'
             : '手动检查会立即请求 GitHub Release；发现新版本后会先询问是否更新。' }),
+          pending ? updateSummary(ctx, update) : null,
         ]),
         el('div', { class: 'setting-ctl' }, [
           pending

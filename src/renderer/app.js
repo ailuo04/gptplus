@@ -361,6 +361,9 @@ const state = {
     currentVersion: null,
     version: null,
     releaseDate: null,
+    highlights: [],
+    notesStatus: 'idle',
+    releaseNotesUrl: null,
     percent: 0,
     error: null,
     rollbackTarget: null,
@@ -1387,7 +1390,27 @@ function openUpdateModal() {
   ]);
   const sync = () => {
     const current = state.update || {};
-    status.replaceChildren(
+    const highlights = Array.isArray(current.highlights) ? current.highlights.slice(0, 4) : [];
+    const summary = highlights.length
+      ? el('div', { class: 'update-summary' }, [
+          el('div', { class: 'update-summary-title', text: '本次更新' }),
+          el('ul', { class: 'update-summary-list' }, highlights.map((text) => el('li', { text }))),
+        ])
+      : null;
+    const notesLink = current.releaseNotesUrl
+      ? el('button', {
+          class: 'update-notes-link',
+          type: 'button',
+          title: '在 GitHub 查看完整更新说明',
+          on: {
+            click: () => {
+              void api.openExternalLink(current.releaseNotesUrl)
+                .catch((err) => toastError(err, '打开完整更新说明失败'));
+            },
+          },
+        }, [el('span', { text: '完整更新说明' }), icon('external', 11)])
+      : null;
+    status.replaceChildren(...[
       el('div', { class: 'note note-warn' }, [
         icon(current.status === 'downloading' ? 'download' : 'zap', 15),
         el('div', { class: 'grow' }, [
@@ -1395,7 +1418,9 @@ function openUpdateModal() {
           el('div', { class: 'faint', text: current.status === 'downloading' ? `下载进度 ${Math.round(current.percent || 0)}%，完成后会自动重启安装。` : '更新会下载并安装新版本，暂不更新不影响使用。' }),
         ]),
       ]),
-    );
+      summary,
+      notesLink,
+    ].filter(Boolean));
     foot.replaceChildren();
     if (current.status === 'available') {
       foot.append(

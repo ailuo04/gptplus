@@ -49,6 +49,8 @@ function subscribe(channel, cb) {
 }
 
 contextBridge.exposeInMainWorld('gptplus', {
+  openExternalLink: (url) => invoke('gptplus:external:open-link', url),
+
   // 状态与提供商
   getStatus: () => invoke('gptplus:status:get'),
   setTheme: (patch) => invoke('gptplus:theme:set', patch),

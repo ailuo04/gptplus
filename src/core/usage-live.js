@@ -70,7 +70,8 @@ function candidateDatabases(home) {
 }
 
 function resolveFromDatabases(home, sessionId) {
-  if (!DatabaseSync) return null;
+  if (!DatabaseSync) return [];
+  const matches = [];
   for (const dbPath of candidateDatabases(home)) {
     if (!fs.existsSync(dbPath)) continue;
     let db = null;
@@ -79,14 +80,14 @@ function resolveFromDatabases(home, sessionId) {
       try { db.exec('PRAGMA busy_timeout=50'); } catch { /* best effort */ }
       const row = db.prepare('SELECT rollout_path FROM threads WHERE id = ?1 LIMIT 1').get(sessionId);
       const resolved = allowedRolloutPath(home, row?.rollout_path);
-      if (resolved) return resolved;
+      if (resolved) matches.push(resolved);
     } catch {
       // 某个数据库正在迁移或 schema 不兼容时，继续查下一个。
     } finally {
       try { db?.close(); } catch { /* ignore */ }
     }
   }
-  return null;
+  return matches;
 }
 
 function resolveByScan(home, sessionId) {
@@ -94,6 +95,7 @@ function resolveByScan(home, sessionId) {
     .map((name) => path.join(home, name))
     .filter((root) => fs.existsSync(root));
   const queue = roots.map((root) => ({ root, depth: 0 }));
+  const matches = [];
   let visited = 0;
   while (queue.length && visited < MAX_SCAN_ENTRIES) {
     const { root, depth } = queue.pop();
@@ -108,14 +110,10 @@ function resolveByScan(home, sessionId) {
       }
       if (!entry.isFile() || !/\.jsonl$/i.test(entry.name) || !entry.name.includes(sessionId)) continue;
       const resolved = allowedRolloutPath(home, target);
-      if (resolved) return resolved;
+      if (resolved) matches.push(resolved);
     }
   }
-  return null;
-}
-
-function resolveRolloutPath(home, sessionId) {
-  return resolveFromDatabases(home, sessionId) || resolveByScan(home, sessionId);
+  return matches;
 }
 
 function numberField(source, key) {
@@ -211,6 +209,47 @@ function readUsageTail(filePath, limit = EVENT_LIMIT) {
   }
 }
 
+/**
+ * 同一会话可能因续接、恢复或客户端重启产生多个 rollout 文件。
+ * 数据库通常只记录主文件，而真实 token_count 可能只出现在续接文件中，
+ * 因此必须比较全部候选，不能拿到第一个文件名命中就返回。
+ */
+function resolveRolloutPath(home, sessionId) {
+  const candidates = [...new Set([
+    ...resolveFromDatabases(home, sessionId),
+    ...resolveByScan(home, sessionId),
+  ].map(canonicalPath))];
+  if (!candidates.length) return null;
+
+  const ranked = candidates.map((candidate) => {
+    let events = [];
+    let mtimeMs = 0;
+    try {
+      events = readUsageTail(candidate, 1);
+      mtimeMs = fs.statSync(candidate).mtimeMs;
+    } catch {
+      // 候选文件正被客户端追加时，下一次轮询可以重新尝试。
+    }
+    const latestEventAt = Date.parse(events.at(-1)?.t || '');
+    return {
+      path: candidate,
+      hasUsage: events.length > 0,
+      latestEventAt: Number.isFinite(latestEventAt) ? latestEventAt : 0,
+      mtimeMs,
+      exactPrimary: path.basename(candidate).toLowerCase() === `${sessionId.toLowerCase()}.jsonl`,
+    };
+  });
+
+  ranked.sort((left, right) => (
+    Number(right.hasUsage) - Number(left.hasUsage)
+    || right.latestEventAt - left.latestEventAt
+    || right.mtimeMs - left.mtimeMs
+    || Number(right.exactPrimary) - Number(left.exactPrimary)
+    || left.path.localeCompare(right.path)
+  ));
+  return ranked[0].path;
+}
+
 function unavailable(sessionId, message) {
   return { status: 'unavailable', session_id: sessionId, message, events: [] };
 }
@@ -221,14 +260,23 @@ function createUsageLiveReader({ codexHome } = {}) {
   function read(sessionId) {
     const id = normalizeSessionId(sessionId);
     if (!id) return unavailable('', '会话 ID 无效');
-    let rollout = pathCache.get(id);
-    if (!rollout || !fs.existsSync(rollout)) {
-      rollout = resolveRolloutPath(home, id);
-      if (rollout) pathCache.set(id, rollout);
+    let rollout = pathCache.get(id) || null;
+    if (rollout && fs.existsSync(rollout)) {
+      try {
+        const cachedEvents = readUsageTail(rollout);
+        if (cachedEvents.length) return { status: 'ok', session_id: id, events: cachedEvents };
+      } catch {
+        // 文件被续接或替换时重新解析全部候选。
+      }
+      // 空缓存不能长期保留：续接文件可能稍后写入首批用量事件。
+      pathCache.delete(id);
     }
+    rollout = resolveRolloutPath(home, id);
     if (!rollout) return unavailable(id, '未找到本机会话记录');
     try {
-      return { status: 'ok', session_id: id, events: readUsageTail(rollout) };
+      const events = readUsageTail(rollout);
+      if (events.length) pathCache.set(id, rollout);
+      return { status: 'ok', session_id: id, events };
     } catch (error) {
       return unavailable(id, `会话记录暂不可读: ${error.message}`);
     }

@@ -421,6 +421,27 @@ test('peer IPC: generated client token never returns to renderer; pasted connect
   assert.equal(statusEvents.at(-1).peer.remoteSync.intervalMinutes, 75);
 });
 
+test('external link IPC opens only http(s) URLs', async (t) => {
+  const { registerIpc } = require(path.join(CORE, 'ipc.js'));
+  const dir = tmpDir('external-link-ipc');
+  cleanup(t, dir);
+  const store = createStore({ configPath: path.join(dir, 'config.json'), secretStorage: createTestSecretStorage() });
+  const handlers = new Map();
+  const opened = [];
+  registerIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    shell: { openExternal: async (url) => { opened.push(url); } },
+    dialog: {},
+    ctx: { store, log: () => {}, plugins: null, onLogEvent: () => () => {} },
+  });
+
+  const open = handlers.get('gptplus:external:open-link');
+  assert.equal(await open({}, 'https://github.com/ailuo04/gptplus/releases/tag/v1.6.5'), true);
+  assert.deepEqual(opened, ['https://github.com/ailuo04/gptplus/releases/tag/v1.6.5']);
+  await assert.rejects(() => open({}, 'file:///C:/Windows/System32/calc.exe'), /只允许打开 http\(s\) 链接/);
+  await assert.rejects(() => open({}, 'javascript:alert(1)'), /只允许打开 http\(s\) 链接/);
+});
+
 test('peer sync: new/default-off, complete disappearance/recovery preserves local preference; failures preserve models', async (t) => {
   const dir = tmpDir('peer-sync');
   cleanup(t, dir);

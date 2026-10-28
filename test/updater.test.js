@@ -3,7 +3,12 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { setupAutoUpdater, cleanupInstalledUpdateCache, listRollbackReleases } = require('../src/main/updater.js');
+const {
+  setupAutoUpdater,
+  cleanupInstalledUpdateCache,
+  listRollbackReleases,
+  extractUpdateHighlights,
+} = require('../src/main/updater.js');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
@@ -51,6 +56,38 @@ function createTimers() {
   };
 }
 
+function releaseFetch(body) {
+  return async () => ({ ok: true, json: async () => ({ body }) });
+}
+
+test('更新摘要只保留精简要点并排除兼容性与验证章节', () => {
+  const markdown = [
+    '# gpt++ v1.6.5',
+    '',
+    '## 软件内更新摘要',
+    '- **新模型默认启用**，并开启推理。',
+    '- 修复 [用量状态栏](https://example.com) 三项显示为空。',
+    '3. 更新弹窗展示精简摘要。',
+    '- 保留“完整更新说明”入口。',
+    '- 第五项不应进入软件内摘要。',
+    '',
+    '## 兼容性',
+    '- 不需要迁移配置。',
+    '',
+    '## 验证',
+    '- 全量测试通过。',
+  ].join('\n');
+  assert.deepEqual(extractUpdateHighlights(markdown), [
+    '新模型默认启用，并开启推理。',
+    '修复 用量状态栏 三项显示为空。',
+    '更新弹窗展示精简摘要。',
+    '保留“完整更新说明”入口。',
+  ]);
+
+  const fallback = '## 更新内容\n- 修复 A\n- 改进 B\n## 兼容性\n- 不需要迁移\n';
+  assert.deepEqual(extractUpdateHighlights(fallback), ['修复 A', '改进 B']);
+});
+
 test('历史版本只返回较早稳定版且必须包含安装器和更新元数据', async () => {
   const fetchImpl = async () => ({
     ok: true,
@@ -90,6 +127,7 @@ test('发现更新后只记录版本，用户确认后才下载并安装', async
   const controller = setupAutoUpdater({
     app: { isPackaged: true, getVersion: () => '0.1.0' },
     autoUpdater: updater,
+    fetchImpl: releaseFetch('## 软件内更新摘要\n- 修复用量状态栏。\n- 精简更新说明。\n'),
     onLog: (entry) => logs.push(entry),
   });
 
@@ -99,6 +137,10 @@ test('发现更新后只记录版本，用户确认后才下载并安装', async
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(downloadCalls, 0);
   assert.equal(controller.getState().status, 'available');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(controller.getState().notesStatus, 'ready');
+  assert.deepEqual(controller.getState().highlights, ['修复用量状态栏。', '精简更新说明。']);
+  assert.equal(controller.getState().releaseNotesUrl, 'https://github.com/ailuo04/gptplus/releases/tag/v0.1.1');
 
   await controller.downloadUpdate();
   assert.equal(downloadCalls, 1);
@@ -106,6 +148,26 @@ test('发现更新后只记录版本，用户确认后才下载并安装', async
   await new Promise((resolve) => setTimeout(resolve, 300));
   assert.equal(installed, true);
   assert.ok(logs.some((entry) => entry.msg.includes('等待用户选择')));
+});
+
+test('更新摘要读取失败不会阻塞版本提示和下载', async () => {
+  const updater = createUpdater();
+  let downloadCalls = 0;
+  updater.downloadUpdate = async () => { downloadCalls += 1; };
+  const controller = setupAutoUpdater({
+    app: { isPackaged: true, getVersion: () => '0.1.0' },
+    autoUpdater: updater,
+    fetchImpl: async () => { throw new Error('offline'); },
+  });
+
+  updater.emit('update-available', { version: '0.1.1' });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(controller.getState().status, 'available');
+  assert.equal(controller.getState().notesStatus, 'error');
+  assert.equal(controller.getState().error, null, '摘要失败不能把更新本身标记为失败');
+
+  await controller.downloadUpdate();
+  assert.equal(downloadCalls, 1, '摘要不可用时仍允许用户下载更新');
 });
 
 test('自动更新启动后延迟 20 秒首次检查，之后按设定间隔检查', async () => {
@@ -175,12 +237,14 @@ test('回退到指定历史版本会切换 Release、允许降级并自动安装
   const controller = setupAutoUpdater({
     app: { isPackaged: true, getVersion: () => '0.2.1' },
     autoUpdater: updater,
-    fetchImpl: async () => ({
-      ok: true,
-      json: async () => [{ tag_name: 'v0.1.2', draft: false, prerelease: false, assets: [
-        { name: 'gpt-plus-0.1.2-setup.exe' }, { name: 'latest.yml' },
-      ] }],
-    }),
+    fetchImpl: async (url) => String(url).includes('/tags/v0.1.2')
+      ? { ok: true, json: async () => ({ body: '## 软件内更新摘要\n- 历史版本摘要。\n' }) }
+      : {
+          ok: true,
+          json: async () => [{ tag_name: 'v0.1.2', draft: false, prerelease: false, assets: [
+            { name: 'gpt-plus-0.1.2-setup.exe' }, { name: 'latest.yml' },
+          ] }],
+        },
   });
 
   const state = await controller.rollbackToVersion('0.1.2');

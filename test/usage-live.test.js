@@ -37,6 +37,30 @@ test('live usage reader returns token_count data for the requested local session
   assert.equal(Object.hasOwn(result.events[1], 'text'), false, 'message bodies must not be exposed');
 });
 
+test('live usage reader prefers a continuation rollout that contains token_count events', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gptplus-usage-live-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const sessions = path.join(home, 'sessions', '2026', '10', '28');
+  fs.mkdirSync(sessions, { recursive: true });
+  const id = '01a182d9-259f-7b40-81da-d83babe58651';
+  const primary = path.join(sessions, `${id}.jsonl`);
+  const continuation = path.join(sessions, `rollout-2026-10-28T22-12-16-${id}_01a182da-bfc2-7d03-a302-6f335986f17b.jsonl`);
+  fs.writeFileSync(primary, `${JSON.stringify({ type: 'turn_context', payload: { turn_id: 'turn_empty' } })}\n`);
+  const records = [
+    { type: 'turn_context', payload: { turn_id: 'turn_live' } },
+    { type: 'event_msg', timestamp: '2026-10-28T13:12:20.000Z', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 1200, cached_input_tokens: 900, output_tokens: 80, total_tokens: 1280 }, total_token_usage: { output_tokens: 80 }, model_context_window: 200000 } } },
+  ];
+  fs.writeFileSync(continuation, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+
+  const reader = createUsageLiveReader({ codexHome: home });
+  const result = reader.read(`local:${id}`);
+  assert.equal(result.status, 'ok');
+  assert.equal(result.events.length, 1);
+  assert.equal(result.events[0].cached_input_tokens, 900);
+  assert.equal(result.events[0].context_window, 200000);
+  assert.equal(reader.resolveRolloutPath(id), continuation, '空的主 rollout 不能遮蔽包含用量的续接文件');
+});
+
 test('live usage reader rejects invalid ids and rollout paths outside session folders', (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gptplus-usage-live-'));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
