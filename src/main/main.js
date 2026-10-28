@@ -61,6 +61,14 @@ const {
   resumeUsageStatusline,
   stopUsageStatuslineBridge,
 } = require('../core/chatgpt-statusline.js');
+const {
+  disposeVoiceInput,
+  launchChatGptWithVoiceInput,
+  resumeVoiceInput,
+  startVoiceInputOnPort,
+  stopVoiceInputBridge,
+} = require('../core/voice-input.js');
+const { stopLocalSpeech } = require('../core/local-speech.js');
 
 const isDev = process.argv.includes('--dev');
 const isQuitRequest = process.argv.includes('--quit');
@@ -232,14 +240,32 @@ async function launchChatGptAtLogin(commandLine = process.argv) {
     // 日志里必须区分“已请求唤起”和“客户端真的起来了”：登录时没有界面反馈，
     // 只 spawn explorer 成功并不代表 ChatGPT 主窗口出现。
     const usageStatuslineEnabled = ctx?.plugins?.isActive?.('usage-statusline') !== false;
-    const result = ctx?.gateway && usageStatuslineEnabled
-      ? await launchChatGptWithUsageStatusline({
-          ctx,
-          launchOptions: { preferredPath },
-          wrapperDir: path.join(ctx.paths.APP_DIR, 'cdp'),
-          launch: (options) => launchChatGptAndVerify({ preferredPath, ...options }),
-        })
-      : await launchChatGptAndVerify({ preferredPath });
+    const voiceInputEnabled = ctx?.plugins?.isActive?.('voice-input') === true;
+    let result;
+    if (ctx?.gateway && usageStatuslineEnabled) {
+      result = await launchChatGptWithUsageStatusline({
+        ctx,
+        launchOptions: { preferredPath },
+        wrapperDir: path.join(ctx.paths.APP_DIR, 'cdp'),
+        launch: (options) => launchChatGptAndVerify({ preferredPath, ...options }),
+      });
+      if (result?.ok && voiceInputEnabled && result.cdpPort) {
+        try {
+          await startVoiceInputOnPort({ ctx, cdpPort: result.cdpPort });
+        } catch (error) {
+          ctx?.log?.({ level: 'warn', msg: '语音输入注入失败: ' + error.message });
+        }
+      }
+    } else if (voiceInputEnabled) {
+      result = await launchChatGptWithVoiceInput({
+        ctx,
+        launchOptions: { preferredPath },
+        wrapperDir: path.join(ctx.paths.APP_DIR, 'cdp'),
+        launch: (options) => launchChatGptAndVerify({ preferredPath, ...options }),
+      });
+    } else {
+      result = await launchChatGptAndVerify({ preferredPath });
+    }
     if (result.ok) {
       ctx?.log?.({
         level: 'info',
@@ -270,6 +296,22 @@ async function refreshUsageStatuslineRuntime() {
   }
 }
 
+async function refreshVoiceInputRuntime() {
+  stopVoiceInputBridge();
+  let port = null;
+  try {
+    port = await findChatGptDebugPort();
+  } catch {
+    port = null;
+  }
+  if (!port) return;
+  try {
+    await disposeVoiceInput({ cdpPort: port });
+  } catch (err) {
+    ctx?.log?.({ level: 'warn', msg: '清理 ChatGPT 语音输入失败: ' + err.message });
+  }
+}
+
 async function handlePluginChange(event) {
   const id = event?.plugin?.id;
   if (!ctx?.plugins || !id) return;
@@ -292,7 +334,19 @@ async function handlePluginChange(event) {
     if (ctx.plugins.isActive('usage-statusline')) {
       const result = await resumeUsageStatusline({ ctx, timeoutMs: 8000 });
       if (result && result.ok === false && !result.skipped) {
-        ctx.log?.({ level: 'warn', msg: `用量信息栏插件恢复失败: ${result.error || '未知错误'}` });
+        ctx.log?.({ level: 'warn', msg: '用量信息栏插件恢复失败: ' + (result.error || '未知错误') });
+      }
+    }
+    return;
+  }
+
+  if (id === 'voice-input') {
+    await refreshVoiceInputRuntime();
+    if (!ctx.plugins.isActive('voice-input')) stopLocalSpeech();
+    if (ctx.plugins.isActive('voice-input')) {
+      const result = await resumeVoiceInput({ ctx, timeoutMs: 8000 });
+      if (result && result.ok === false && !result.skipped) {
+        ctx.log?.({ level: 'warn', msg: '语音输入插件恢复失败: ' + (result.error || '未知错误') });
       }
     }
   }
@@ -542,7 +596,8 @@ async function boot() {
   })();
   void gatewayReady
     .then(() => launchChatGptAtLogin())
-    .then(() => resumeUsageStatusline({ ctx }));
+    .then(() => resumeUsageStatusline({ ctx }))
+    .then(() => resumeVoiceInput({ ctx }));
 
   app.on('second-instance', (_event, commandLine) => {
     if (commandLine.includes('--quit')) {
@@ -586,6 +641,8 @@ app.on('before-quit', () => {
     ctx?.taskMonitor?.stop?.();
     ctx?.gateway?.stopSync?.();
     stopUsageStatuslineBridge();
+    stopVoiceInputBridge();
+    stopLocalSpeech();
   } catch {
     /* 退出阶段尽力而为 */
   }
@@ -606,3 +663,4 @@ process.on('uncaughtException', (err) => {
     at: Date.now(), level: 'error', msg: '未捕获异常: ' + diagnostic,
   });
 });
+

@@ -51,6 +51,7 @@ const ICONS = Object.freeze({
   moon: SVG_OPEN + '<path d="M12.8 10.7A5.5 5.5 0 0 1 5.3 3.2 5.6 5.6 0 1 0 12.8 10.7z"/></svg>',
   monitor: SVG_OPEN + '<rect x="2.3" y="2.8" width="11.4" height="8" rx="1.2"/><path d="M6 13.2h4M8 10.8v2.4"/></svg>',
   wechat: SVG_OPEN + '<path d="M2.4 3.1h7.4v5.3H6.1L4 10.4V8.4H2.4z"/><path d="M6.2 8.4h7.4v5.1h-1.5v1.7l-2-1.7H6.2z"/></svg>',
+  mic: SVG_OPEN + '<path d="M8 2.6a2.2 2.2 0 0 1 2.2 2.2v2.7a2.2 2.2 0 0 1-4.4 0V4.8A2.2 2.2 0 0 1 8 2.6Z"/><path d="M3.9 7.5v.4a4.1 4.1 0 0 0 8.2 0v-.4M8 12v1.5"/></svg>',
   message: SVG_OPEN + '<path d="M2.7 3.3h10.6v7.1H6.7L4.1 12.8v-2.4H2.7z"/><path d="M5.3 6.2h5.4M5.3 8.3h3.4"/></svg>',
   qr: SVG_OPEN + '<path d="M2.6 6V2.7H6M10 2.7h3.4V6M13.4 10v3.3H10M6 13.3H2.6V10"/><path d="M5.2 5.2h1.6v1.6H5.2zM9.2 9.2h1.6v1.6H9.2z"/>',
   play: SVG_OPEN + '<path d="M5.2 3.2l7 4.8-7 4.8z"/>',
@@ -817,7 +818,7 @@ const RELOAD_PLAN = {
     [loadWeixin, '微信连接配置'],
     [loadStatus, '全局状态'],
   ],
-  plugins: [[loadPlugins, '插件列表'], [loadStatus, '全局状态']],
+  plugins: [[loadPlugins, '插件列表'], [loadProviders, '提供商列表'], [loadStatus, '全局状态']],
 };
 
 async function reload(scope = 'providers', options = {}) {
@@ -918,7 +919,7 @@ const VIEW_META = {
     title: '插件市场',
     sub: '按需安装、配置和管理可选功能',
     render: renderPlugins,
-    needs: ['plugins'],
+    needs: ['plugins', 'providers'],
   },
   weixin: {
     title: '微信连接',

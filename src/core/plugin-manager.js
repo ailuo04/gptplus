@@ -9,6 +9,13 @@ const DEFAULT_USAGE_METRICS = Object.freeze({
   context: true,
 });
 
+const DEFAULT_VOICE_CONFIG = Object.freeze({
+  engine: 'local',
+  providerId: '',
+  model: 'whisper-1',
+  language: '',
+});
+
 const BUILTIN_PLUGIN_DEFINITIONS = Object.freeze([
   Object.freeze({
     id: 'weixin',
@@ -40,6 +47,21 @@ const BUILTIN_PLUGIN_DEFINITIONS = Object.freeze([
     configurable: true,
     defaultConfig: { metrics: DEFAULT_USAGE_METRICS },
   }),
+  Object.freeze({
+    id: 'voice-input',
+    name: '语音输入',
+    version: '1.0.0',
+    author: 'gpt++',
+    category: '效率',
+    icon: 'mic',
+    description: '在 ChatGPT 输入框的发送键旁加入麦克风按钮，把语音转成文字。',
+    detail: '默认在本机用 SenseVoice 离线识别，不弹出系统语音浮层；在输入框内长按空格 1.5 秒即可开始录音，松开自动转写。也可以改用支持 /audio/transcriptions 的 OpenAI 兼容提供商。',
+    builtIn: true,
+    defaultInstalled: true,
+    defaultEnabled: true,
+    configurable: true,
+    defaultConfig: DEFAULT_VOICE_CONFIG,
+  }),
 ]);
 
 function isPlainObject(value) {
@@ -67,8 +89,20 @@ function normalizeUsageConfig(raw) {
   };
 }
 
+function normalizeVoiceConfig(raw) {
+  const source = isPlainObject(raw) ? raw : {};
+  const language = String(source.language || '').trim().toLowerCase();
+  return {
+    engine: source.engine === 'provider' ? 'provider' : source.engine === 'system' ? 'system' : 'local',
+    providerId: String(source.providerId || '').trim().slice(0, 128),
+    model: String(source.model || 'whisper-1').trim().slice(0, 128) || 'whisper-1',
+    language: /^[a-z]{2,3}(?:-[a-z]{2,4})?$/.test(language) ? language : '',
+  };
+}
+
 function normalizePluginConfig(definition, raw) {
   if (definition.id === 'usage-statusline') return normalizeUsageConfig(raw);
+  if (definition.id === 'voice-input') return normalizeVoiceConfig(raw);
   return isPlainObject(raw) ? deepCopy(raw) : {};
 }
 
@@ -261,6 +295,9 @@ function createPluginManager({ store, definitions = BUILTIN_PLUGIN_DEFINITIONS }
 module.exports = {
   BUILTIN_PLUGIN_DEFINITIONS,
   DEFAULT_USAGE_METRICS,
+  DEFAULT_VOICE_CONFIG,
   createPluginManager,
   normalizePluginConfig,
+  normalizeVoiceConfig,
 };
+

@@ -112,6 +112,146 @@ function openUsageConfig(ctx, plugin) {
   modal.classList.add('is-plugin-config');
 }
 
+const VOICE_LANGUAGES = [
+  ['', '自动检测'],
+  ['zh', '中文'],
+  ['en', 'English'],
+  ['yue', '粤语'],
+  ['ja', '日本語'],
+  ['ko', '韩语'],
+];
+
+function openVoiceConfig(ctx, plugin) {
+  const current = plugin?.config || {};
+  const providers = (ctx.state.providers || []).filter((provider) => provider && provider.enabled !== false && provider.api !== 'anthropic');
+  const selectedProvider = String(current.providerId || '');
+  const providerOptions = providers.map((provider) => ctx.el('option', {
+    value: provider.id,
+    text: provider.name || provider.id,
+    selected: provider.id === selectedProvider,
+  }));
+  if (!providerOptions.length) {
+    providerOptions.push(ctx.el('option', { value: '', text: '没有可用的提供商', selected: true }));
+  } else if (selectedProvider && !providers.some((provider) => provider.id === selectedProvider)) {
+    providerOptions.push(ctx.el('option', { value: selectedProvider, text: selectedProvider + '（未找到）', selected: true }));
+  }
+
+  const engine = current.engine === 'provider' ? 'provider' : current.engine === 'system' ? 'system' : 'local';
+  const engineSelect = ctx.el('select', {
+    class: 'select',
+    value: engine,
+  }, [
+    ctx.el('option', { value: 'local', text: '本地识别（SenseVoice，离线）', selected: engine === 'local' }),
+    ctx.el('option', { value: 'provider', text: '提供商音频转写', selected: engine === 'provider' }),
+    ctx.el('option', { value: 'system', text: 'Windows 系统听写（会弹出 Win+H 浮层）', selected: engine === 'system' }),
+  ]);
+  const providerSelect = ctx.el('select', { class: 'select' }, providerOptions);
+  const modelInput = ctx.el('input', {
+    class: 'input',
+    type: 'text',
+    value: String(current.model || 'whisper-1'),
+    placeholder: 'whisper-1',
+  });
+  const languageSelect = ctx.el('select', {
+    class: 'select',
+    value: VOICE_LANGUAGES.some(([value]) => value === (current.language || '')) ? (current.language || '') : '',
+  }, VOICE_LANGUAGES.map(([value, label]) => ctx.el('option', {
+    value,
+    text: label,
+    selected: value === (current.language || ''),
+  })));
+
+  const providerField = ctx.el('label', { class: 'field' }, [
+    ctx.el('span', { class: 'label', text: '提供商' }),
+    providerSelect,
+    ctx.el('span', { class: 'hint', text: 'API Key 沿用提供商配置，不会另存；该提供商需要支持 POST /audio/transcriptions。' }),
+  ]);
+  const modelField = ctx.el('label', { class: 'field' }, [
+    ctx.el('span', { class: 'label', text: '转写模型' }),
+    modelInput,
+    ctx.el('span', { class: 'hint', text: '常见值：whisper-1、gpt-4o-mini-transcribe，或提供商自己的转写模型名。' }),
+  ]);
+  const languageField = ctx.el('label', { class: 'field' }, [
+    ctx.el('span', { class: 'label', text: '识别语言' }),
+    languageSelect,
+    ctx.el('span', { class: 'hint', text: '自动检测适合中英混说；指定语言通常更准。' }),
+  ]);
+  const providerFields = ctx.el('div', { class: 'plugin-config-options' }, [providerField, modelField]);
+  const localHint = ctx.el('span', { class: 'hint', text: '首次使用会自动下载约 231 MB 的 SenseVoice 模型；如果已安装 DeepSeek Harness，会直接复用它的模型缓存。录音和识别都在本机完成。输入框内长按空格 1.5 秒即可开始录音，松开自动转写。' });
+  const systemHint = ctx.el('span', { class: 'hint', text: '系统听写会调用 Win+H 并弹出 Windows 语音浮层，不建议日常使用。' });
+  const syncDisabled = () => {
+    const provider = engineSelect.value === 'provider';
+    const local = engineSelect.value === 'local';
+    const system = engineSelect.value === 'system';
+    providerSelect.disabled = !provider;
+    modelInput.disabled = !provider;
+    languageSelect.disabled = system;
+    providerFields.style.display = provider ? '' : 'none';
+    languageField.style.display = system ? 'none' : '';
+    localHint.style.display = local ? '' : 'none';
+    systemHint.style.display = system ? '' : 'none';
+  };
+  engineSelect.addEventListener('change', syncDisabled);
+  syncDisabled();
+
+  const modal = ctx.openModal(
+    ctx.el('section', {
+      class: 'modal plugin-config-modal',
+      attrs: { role: 'dialog', 'aria-modal': 'true', 'aria-label': '配置语音输入' },
+    }, [
+      ctx.el('header', { class: 'modal-head' }, [
+        ctx.el('div', { class: 'modal-title', text: '配置语音输入' }),
+      ]),
+      ctx.el('div', { class: 'modal-body plugin-config-body' }, [
+        ctx.el('p', { class: 'setting-desc', text: '麦克风按钮会注入到 ChatGPT 输入框的模型选择器与发送键之间。默认使用本机 SenseVoice 离线识别；在输入框内长按空格 1.5 秒也能开始录音，松开自动转写。也可以改用提供商音频转写，或保留 Windows 系统听写。' }),
+        ctx.el('label', { class: 'field' }, [
+          ctx.el('span', { class: 'label', text: '输入方式' }),
+          engineSelect,
+          localHint,
+          systemHint,
+        ]),
+        providerFields,
+        languageField,
+      ]),
+      ctx.el('div', { class: 'modal-foot' }, [
+        ctx.el('button', {
+          class: 'btn btn-ghost btn-sm',
+          type: 'button',
+          on: { click: () => ctx.closeModal() },
+        }, [ctx.el('span', { text: '取消' })]),
+        ctx.el('button', {
+          class: 'btn btn-accent btn-sm',
+          type: 'button',
+          on: {
+            click: () => {
+              const engine = engineSelect.value === 'provider' ? 'provider' : engineSelect.value === 'system' ? 'system' : 'local';
+              if (engine === 'provider' && !providerSelect.value) {
+                ctx.toast('请先选择支持音频转写的提供商', 'warn');
+                return;
+              }
+              const config = {
+                engine,
+                providerId: engine === 'provider' ? String(providerSelect.value || '') : String(current.providerId || ''),
+                model: String(modelInput.value || 'whisper-1').trim() || 'whisper-1',
+                language: String(languageSelect.value || ''),
+              };
+              void runPluginAction(
+                ctx,
+                plugin.id,
+                () => ctx.api.setPluginConfig({ id: plugin.id, config }),
+                '语音输入配置已保存',
+              ).then((saved) => {
+                if (saved) ctx.closeModal();
+              });
+            },
+          },
+        }, [ctx.icon('check', 13), ctx.el('span', { text: '保存配置' })]),
+      ]),
+    ]),
+  );
+  modal.classList.add('is-plugin-config');
+}
+
 function configureButton(ctx, plugin) {
   if (!plugin.installed) return null;
   if (plugin.id === 'weixin') {
@@ -126,6 +266,13 @@ function configureButton(ctx, plugin) {
       class: 'btn btn-ghost btn-sm',
       type: 'button',
       on: { click: () => openUsageConfig(ctx, plugin) },
+    }, [ctx.icon('plug', 13), ctx.el('span', { text: '配置' })]);
+  }
+  if (plugin.id === 'voice-input') {
+    return ctx.el('button', {
+      class: 'btn btn-ghost btn-sm',
+      type: 'button',
+      on: { click: () => openVoiceConfig(ctx, plugin) },
     }, [ctx.icon('plug', 13), ctx.el('span', { text: '配置' })]);
   }
   return null;
@@ -205,7 +352,7 @@ function renderPluginCard(ctx, plugin) {
       ctx.el('p', { class: 'plugin-card-detail', text: plugin.detail }),
     ]),
     ctx.el('footer', { class: 'plugin-card-foot' }, [
-      ctx.el('span', { class: 'hint', text: plugin.id === 'weixin' ? '运行状态仍由微信连接页单独控制' : '数据仅在本机处理' }),
+      ctx.el('span', { class: 'hint', text: plugin.id === 'weixin' ? '运行状态仍由微信连接页单独控制' : plugin.id === 'voice-input' ? '麦克风按钮会注入到 ChatGPT 输入框' : '数据仅在本机处理' }),
       ctx.el('div', { class: 'plugin-card-actions' }, actions),
     ]),
   ]);
@@ -233,4 +380,5 @@ export function renderPlugins(root, ctx, actions) {
     ctx.el('div', { class: 'plugin-market-grid' }, plugins.map((plugin) => renderPluginCard(ctx, plugin))),
   );
 }
+
 

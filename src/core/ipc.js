@@ -9,6 +9,7 @@ const { slugForProvider } = require('./model-utils.js');
 const { resolveChatGptExe } = require('./chatgpt-install.js');
 const { relaunchChatGpt } = require('./chatgpt-launch.js');
 const { launchChatGptWithUsageStatusline } = require('./chatgpt-statusline.js');
+const { launchChatGptWithVoiceInput, startVoiceInputOnPort } = require('./voice-input.js');
 const { redactDiagnostic } = require('./redact.js');
 const {
   hashPeerToken,
@@ -1123,8 +1124,27 @@ function registerIpc(deps) {
     let result;
     try {
       const usageStatuslineEnabled = ctx.plugins?.isActive?.('usage-statusline') !== false;
+      const voiceInputEnabled = ctx.plugins?.isActive?.('voice-input') === true;
       if (usageStatuslineEnabled) {
         result = await launchChatGptWithUsageStatusline({
+          ctx,
+          launchOptions: { executablePath: exe },
+          wrapperDir: path.join(ctx.paths.APP_DIR, 'cdp'),
+          launch: ({ cdpPort, wrapperDir }) => relaunchChatGpt({
+            executablePath: exe,
+            cdpPort,
+            wrapperDir,
+          }),
+        });
+        if (result?.ok && voiceInputEnabled && result.cdpPort) {
+          try {
+            await startVoiceInputOnPort({ ctx, cdpPort: result.cdpPort });
+          } catch (error) {
+            ctx.log?.({ level: 'warn', msg: '语音输入注入失败: ' + error.message });
+          }
+        }
+      } else if (voiceInputEnabled) {
+        result = await launchChatGptWithVoiceInput({
           ctx,
           launchOptions: { executablePath: exe },
           wrapperDir: path.join(ctx.paths.APP_DIR, 'cdp'),

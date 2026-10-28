@@ -3208,7 +3208,7 @@ test('模型页：默认模型标注只跟着真正写进配置的 slug', async 
   }
 });
 
-test('插件市场：展示两个内置插件并支持配置、启停与卸载入口', async () => {
+test('插件市场：展示三个内置插件并支持配置、启停与卸载入口', async () => {
   const tmp = copyRendererToTemp();
   try {
     const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
@@ -3219,6 +3219,7 @@ test('插件市场：展示两个内置插件并支持配置、启停与卸载�
       plugins: [
         { id: 'weixin', name: '微信连接', version: '1.0.0', category: '连接', icon: 'wechat', description: '微信描述', detail: '微信详情', builtIn: true, configurable: true, installed: true, enabled: true, active: true, config: {} },
         { id: 'usage-statusline', name: 'ChatGPT 用量信息栏', version: '1.0.0', category: '效率', icon: 'activity', description: '用量描述', detail: '用量详情', builtIn: true, configurable: true, installed: true, enabled: true, active: true, config: { metrics: { speed: true, cache: true, context: true } } },
+        { id: 'voice-input', name: '语音输入', version: '1.0.0', category: '效率', icon: 'mic', description: '语音描述', detail: '语音详情', builtIn: true, configurable: true, installed: true, enabled: true, active: true, config: { engine: 'system', providerId: '', model: 'whisper-1', language: '' } },
       ],
     });
     const calls = [];
@@ -3256,19 +3257,39 @@ test('插件市场：展示两个内置插件并支持配置、启停与卸载�
     pluginsMod.renderPlugins(root, ctx, new FakeNode('div'));
     assert.match(root.allText(), /微信连接/);
     assert.match(root.allText(), /ChatGPT 用量信息栏/);
+    assert.match(root.allText(), /语音输入/);
     assert.match(root.allText(), /已启用/);
     assert.match(root.allText(), /配置/);
     assert.match(root.allText(), /卸载/);
 
     const configButtons = root.findTag('button').filter((node) => node.textContent.includes('配置'));
-    const usageConfig = configButtons.at(-1);
+    assert.equal(configButtons.length, 3, '三个可配置插件都应有配置入口');
+    const usageConfig = configButtons.at(-2);
     assert.ok(usageConfig, '用量插件应有配置入口');
     usageConfig.listeners.click[0]();
-    const modal = calls.find((entry) => entry[0] === 'openModal')?.[1];
-    assert.ok(modal, '配置入口应打开弹窗');
-    assert.match(modal.allText(), /生成速度/);
-    assert.match(modal.allText(), /缓存命中率/);
-    assert.match(modal.allText(), /上下文占用/);
+    const usageModal = calls.filter((entry) => entry[0] === 'openModal').at(-1)?.[1];
+    assert.ok(usageModal, '用量配置入口应打开弹窗');
+    assert.match(usageModal.allText(), /生成速度/);
+    assert.match(usageModal.allText(), /缓存命中率/);
+    assert.match(usageModal.allText(), /上下文占用/);
+    const voiceConfig = configButtons.at(-1);
+    assert.ok(voiceConfig, '语音插件应有配置入口');
+    voiceConfig.listeners.click[0]();
+    const voiceModal = calls.filter((entry) => entry[0] === 'openModal').at(-1)?.[1];
+    assert.ok(voiceModal, '语音配置入口应打开弹窗');
+    assert.match(voiceModal.allText(), /输入方式/);
+    assert.match(voiceModal.allText(), /Windows 系统听写/);
+    assert.match(voiceModal.allText(), /提供商音频转写/);
+    assert.match(voiceModal.allText(), /转写模型/);
+    assert.match(voiceModal.allText(), /识别语言/);
+    const voiceSelects = findNodes(voiceModal, (n) => n.tagName === 'SELECT');
+    assert.ok(voiceSelects.length >= 3, '语音配置应包含输入方式、提供商与语言选择');
+    voiceSelects[0].value = 'provider';
+    const saveVoice = voiceModal.findTag('button').find((n) => n.textContent.includes('保存配置'));
+    assert.ok(saveVoice, '语音配置应有保存按钮');
+    saveVoice.listeners.click[0]();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(calls.some((entry) => entry[0] === 'setPluginConfig' && entry[1].id === 'voice-input' && entry[1].config.engine === 'provider'), '语音插件应保存提供商转写模式');
 
     const uninstall = root.findTag('button').find((node) => node.textContent.includes('卸载'));
     assert.ok(uninstall, '已安装插件应有卸载入口');

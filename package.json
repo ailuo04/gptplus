@@ -1,7 +1,7 @@
 {
   "name": "gptplus",
   "productName": "gpt++",
-  "version": "1.6.1",
+  "version": "1.6.2",
   "description": "为 ChatGPT 桌面客户端管理自定义模型提供商：本地网关 + 模型目录注入",
   "main": "src/main/main.js",
   "private": true,
@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "electron-updater": "^6.8.9",
+    "sherpa-onnx-node": "^2.0.1",
     "undici": "^6.29.0"
   },
   "scripts": {
@@ -55,6 +56,11 @@
     "directories": {
       "output": "dist"
     },
+    "asarUnpack": [
+      "node_modules/sherpa-onnx-node/**",
+      "node_modules/sherpa-onnx-*/**",
+      "src/core/local-speech-worker.js"
+    ],
     "files": [
       "src/**/*",
       "package.json",

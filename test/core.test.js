@@ -251,9 +251,10 @@ test('plugin manager: 内置插件可安装、启停、配置和卸载，并保�
 
   const manager = createPluginManager({ store });
   const initial = manager.list();
-  assert.deepEqual(initial.map((plugin) => plugin.id), ['weixin', 'usage-statusline']);
+  assert.deepEqual(initial.map((plugin) => plugin.id), ['weixin', 'usage-statusline', 'voice-input']);
   assert.ok(initial.every((plugin) => plugin.installed && plugin.enabled));
   assert.deepEqual(manager.get('usage-statusline').config.metrics, { speed: true, cache: true, context: true });
+  assert.deepEqual(manager.get('voice-input').config, { engine: 'local', providerId: '', model: 'whisper-1', language: '' });
 
   manager.setEnabled('weixin', false);
   assert.equal(manager.isActive('weixin'), false);
@@ -2858,3 +2859,4 @@ test('context: 重启后从磁盘回放日志环，使用量统计不再清零�
   const second = run();
   assert.equal(JSON.parse(second.stdout).n, 2, '重复启动不会把历史越滚越多（无重复回放）');
 });
+
