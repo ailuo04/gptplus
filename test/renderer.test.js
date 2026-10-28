@@ -134,15 +134,17 @@ test('app.js 引用的每个 DOM id 都存在于 index.html', () => {
   }
 });
 
-test('导航项与 app.js 的视图表一一对应', () => {
+test('微信连接作为插件市场配置子页，不占用侧栏主导航', () => {
   const html = read(HTML);
   const navViews = [...html.matchAll(/data-view="([^"]+)"/g)].map((m) => m[1]).sort();
-  assert.deepEqual(navViews, ['home', 'models', 'plugins', 'providers', 'settings', 'usage', 'weixin'], '导航视图应与页面实现一致');
+  assert.deepEqual(navViews, ['home', 'models', 'plugins', 'providers', 'settings', 'usage'], '侧栏不应保留微信连接独立入口');
+  assert.doesNotMatch(html, /data-view="weixin"/, '微信连接只能从插件市场配置入口进入');
 
   const src = read(APP);
   const metaBlock = src.slice(src.indexOf('const VIEW_META'), src.indexOf('function renderChrome'));
   const metaViews = [...metaBlock.matchAll(/^\s{2}([a-z]+):\s*\{/gm)].map((m) => m[1]).sort();
-  assert.deepEqual(metaViews, navViews, 'VIEW_META 的键必须与导航的 data-view 完全一致');
+  assert.deepEqual(metaViews, [...navViews, 'weixin'].sort(), '微信连接应保留为插件市场的配置子页');
+  assert.match(src, /state\.view === 'weixin' \? 'plugins' : state\.view/, '进入微信配置页时应保持插件市场导航高亮');
   assert.match(src, /view: 'home'/, '主页应是默认打开的第一个视图');
 });
 
@@ -3219,7 +3221,7 @@ test('插件市场：展示三个内置插件并支持配置、启停与卸载�
       plugins: [
         { id: 'weixin', name: '微信连接', version: '1.0.0', category: '连接', icon: 'wechat', description: '微信描述', detail: '微信详情', builtIn: true, configurable: true, installed: true, enabled: true, active: true, config: {} },
         { id: 'usage-statusline', name: 'ChatGPT 用量信息栏', version: '1.0.0', category: '效率', icon: 'activity', description: '用量描述', detail: '用量详情', builtIn: true, configurable: true, installed: true, enabled: true, active: true, config: { metrics: { speed: true, cache: true, context: true } } },
-        { id: 'voice-input', name: '语音输入', version: '1.0.0', category: '效率', icon: 'mic', description: '语音描述', detail: '语音详情', builtIn: true, configurable: true, installed: true, enabled: true, active: true, config: { engine: 'system', providerId: '', model: 'whisper-1', language: '' } },
+        { id: 'voice-input', name: '语音输入', version: '1.0.0', category: '效率', icon: 'mic', description: '语音描述', detail: '语音详情', builtIn: true, configurable: true, installed: true, enabled: true, active: true, config: { engine: 'system', providerId: '', model: 'whisper-1', language: '', spaceHoldMs: 1000 } },
       ],
     });
     const calls = [];
@@ -3264,6 +3266,8 @@ test('插件市场：展示三个内置插件并支持配置、启停与卸载�
 
     const configButtons = root.findTag('button').filter((node) => node.textContent.includes('配置'));
     assert.equal(configButtons.length, 3, '三个可配置插件都应有配置入口');
+    configButtons[0].listeners.click[0]();
+    assert.ok(calls.some((entry) => entry[0] === 'navigate' && entry[1] === 'weixin'), '微信插件的配置入口应进入微信连接配置页');
     const usageConfig = configButtons.at(-2);
     assert.ok(usageConfig, '用量插件应有配置入口');
     usageConfig.listeners.click[0]();
@@ -3282,14 +3286,20 @@ test('插件市场：展示三个内置插件并支持配置、启停与卸载�
     assert.match(voiceModal.allText(), /提供商音频转写/);
     assert.match(voiceModal.allText(), /转写模型/);
     assert.match(voiceModal.allText(), /识别语言/);
+    assert.match(voiceModal.allText(), /空格长按时长/);
+    assert.match(voiceModal.allText(), /默认 1 秒/);
     const voiceSelects = findNodes(voiceModal, (n) => n.tagName === 'SELECT');
     assert.ok(voiceSelects.length >= 3, '语音配置应包含输入方式、提供商与语言选择');
+    const spaceHoldInput = findNodes(voiceModal, (n) => n.tagName === 'INPUT' && n.attributes.type === 'number')[0];
+    assert.ok(spaceHoldInput, '语音配置应包含空格长按时长输入');
+    assert.equal(spaceHoldInput.value, '1');
+    spaceHoldInput.value = '2.4';
     voiceSelects[0].value = 'provider';
     const saveVoice = voiceModal.findTag('button').find((n) => n.textContent.includes('保存配置'));
     assert.ok(saveVoice, '语音配置应有保存按钮');
     saveVoice.listeners.click[0]();
     await new Promise((resolve) => setImmediate(resolve));
-    assert.ok(calls.some((entry) => entry[0] === 'setPluginConfig' && entry[1].id === 'voice-input' && entry[1].config.engine === 'provider'), '语音插件应保存提供商转写模式');
+    assert.ok(calls.some((entry) => entry[0] === 'setPluginConfig' && entry[1].id === 'voice-input' && entry[1].config.engine === 'provider' && entry[1].config.spaceHoldMs === 2400), '语音插件应保存提供商转写模式和空格长按时长');
 
     const uninstall = root.findTag('button').find((node) => node.textContent.includes('卸载'));
     assert.ok(uninstall, '已安装插件应有卸载入口');
@@ -3340,7 +3350,8 @@ test('微信连接页：状态、连接设置与扫码入口渲染完整', async
         },
       },
     });
-    const ctx = makeCtx(appMod, state);
+    const calls = [];
+    const ctx = makeCtx(appMod, state, calls);
     ctx.api.getWeixinStatus = async () => state.weixin.status;
     const root = new FakeNode('main');
     const actions = new FakeNode('div');
@@ -3359,7 +3370,12 @@ test('微信连接页：状态、连接设置与扫码入口渲染完整', async
     assert.match(text, /发送「新对话」清空/, '页面应提示新对话指令');
     assert.match(text, /图片可直接发给 Codex/, '页面应提示图片输入');
     assert.match(text, /图片会自动回传/, '页面应提示图片回传');
+    assert.match(actions.allText(), /返回插件市场/, '顶部应有返回插件市场入口');
     assert.match(actions.allText(), /刷新状态/, '顶部应有状态刷新入口');
+    const backButton = actions.findTag('button').find((node) => node.textContent.includes('返回插件市场'));
+    assert.ok(backButton, '返回插件市场应是可操作按钮');
+    backButton.listeners.click[0]();
+    assert.ok(calls.some((entry) => entry[0] === 'navigate' && entry[1] === 'plugins'), '返回按钮应导航回插件市场');
     const passwordInput = root.findTag('input').find((n) => n.attributes.type === 'password');
     assert.ok(passwordInput, '登录凭据默认应为密码框');
     assert.equal(passwordInput.value, 'secret-token', '凭据应可编辑');

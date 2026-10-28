@@ -15,6 +15,7 @@ const { findChatGptDebugPort } = require('./chatgpt-launch.js');
 const { stripEndpoint } = require('./base-url.js');
 const { createSystemProxyFetch } = require('./system-proxy.js');
 const { localSpeechStatus, prepareSpeechModel, transcribeLocal } = require('./local-speech.js');
+const { normalizeVoiceSpaceHoldMs } = require('./plugin-manager.js');
 
 const DEFAULT_INJECT_TIMEOUT_MS = 30000;
 const SCRIPT_READY_WAIT_MS = 15000;
@@ -35,10 +36,11 @@ function sleep(ms) {
 
 /**
  * 页面内运行时。这个函数会被 toString() 后注入 ChatGPT 页面，必须完全自包含。
- * @param {'system'|'provider'} engine
+ * @param {'local'|'system'|'provider'} engine
  * @param {number} readyWaitMs
+ * @param {number} spaceHoldMs
  */
-function voicePageRuntime(engine, readyWaitMs, localReady, language) {
+function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs) {
   'use strict';
   var READY_WAIT_MS = Math.max(500, Number(readyWaitMs) || 15000);
   var ENGINE = engine === 'provider' ? 'provider' : engine === 'system' ? 'system' : 'local';
@@ -48,9 +50,10 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language) {
   var PANEL_ID = 'gptplus-voice-panel';
   var STYLE_ID = 'gptplus-voice-input-style';
   var EXT_ATTR = 'data-gptplus-voice-input';
-  var RUNTIME_KEY = 'gptplus-voice-input-v10';
+  var RUNTIME_KEY = 'gptplus-voice-input-v11';
   var MAX_RECORD_MS = 120000;
-  var PTT_HOLD_MS = 1500;
+  var PTT_HOLD_MS = Math.min(5000, Math.max(300, Math.round((Number(spaceHoldMs) || 1000) / 100) * 100));
+  var PTT_HOLD_LABEL = String(PTT_HOLD_MS / 1000).replace(/\.0$/, '');
   var state = {
     wrap: null,
     button: null,
@@ -108,7 +111,9 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language) {
   function text() {
     var zh = isZh();
     return {
-      idle: zh ? (ENGINE === 'local' ? '语音输入（本地识别，长按空格 1.5 秒）' : ENGINE === 'provider' ? '语音输入（提供商转写，长按空格 1.5 秒）' : '语音输入（Windows 系统听写）') : 'Voice input (hold Space for 1.5s)',
+      idle: zh
+        ? (ENGINE === 'local' ? '语音输入（本地识别，长按空格 ' + PTT_HOLD_LABEL + ' 秒）' : ENGINE === 'provider' ? '语音输入（提供商转写，长按空格 ' + PTT_HOLD_LABEL + ' 秒）' : '语音输入（Windows 系统听写）')
+        : (ENGINE === 'system' ? 'Voice input (Windows dictation)' : 'Voice input (hold Space for ' + PTT_HOLD_LABEL + 's)'),
       requesting: zh ? '请允许使用麦克风…' : 'Allow microphone access…',
       preparing: zh ? '正在准备本地识别' : 'Preparing local speech',
       downloading: zh ? '正在下载识别模型' : 'Downloading speech model',
@@ -1081,7 +1086,9 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language) {
         + '#gptplus-voice-input:hover{background:color-mix(in srgb,var(--color-token-text-primary,#dfdfdf) 10%,transparent);color:var(--color-token-text-primary,#dfdfdf)}'
         + '#gptplus-voice-input:focus-visible{outline:2px solid color-mix(in srgb,var(--color-token-text-primary,#dfdfdf) 45%,transparent);outline-offset:1px}'
         + '#gptplus-voice-input-wrap[data-holding="true"] #gptplus-voice-input{color:var(--color-token-text-primary,#1a1c1f);background:color-mix(in srgb,var(--color-token-text-primary,#1a1c1f) 10%,transparent);box-shadow:0 0 0 3px color-mix(in srgb,var(--color-token-text-primary,#1a1c1f) 8%,transparent)}'
-        + '#gptplus-voice-input-wrap[data-holding="true"] #gptplus-voice-input::after{content:"";position:absolute;inset:-2px;border-radius:999px;padding:2px;background:conic-gradient(currentColor var(--gptplus-hold,0deg),transparent 0);-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none;animation:gptplus-voice-hold 1.5s linear forwards}'
+        + '#gptplus-voice-input-wrap[data-holding="true"] #gptplus-voice-input::after{content:"";position:absolute;inset:-2px;border-radius:999px;padding:2px;background:conic-gradient(currentColor var(--gptplus-hold,0deg),transparent 0);-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none;animation:gptplus-voice-hold '
+        + (PTT_HOLD_MS / 1000)
+        + 's linear forwards}'
         + '@keyframes gptplus-voice-hold{from{--gptplus-hold:0deg}to{--gptplus-hold:360deg}}'
         + '#gptplus-voice-input svg{width:16px;height:16px;display:block}'
         + '#gptplus-voice-input-wrap{display:inline-flex;align-items:center;position:relative;margin-inline-start:4px;margin-inline-end:2px;min-width:0}'
@@ -1314,10 +1321,11 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language) {
   });
 }
 
-function buildVoiceInputScript({ readyWaitMs, engine, localReady, language } = {}) {
+function buildVoiceInputScript({ readyWaitMs, engine, localReady, language, spaceHoldMs } = {}) {
   var wait = Math.max(500, Number(readyWaitMs) || SCRIPT_READY_WAIT_MS);
   var mode = engine === 'provider' ? 'provider' : engine === 'system' ? 'system' : 'local';
-  return '(' + voicePageRuntime.toString() + ')(' + JSON.stringify(mode) + ', ' + wait + ', ' + JSON.stringify(localReady === true) + ', ' + JSON.stringify(String(language || '')) + ')';
+  var hold = normalizeVoiceSpaceHoldMs(spaceHoldMs);
+  return '(' + voicePageRuntime.toString() + ')(' + JSON.stringify(mode) + ', ' + wait + ', ' + JSON.stringify(localReady === true) + ', ' + JSON.stringify(String(language || '')) + ', ' + hold + ')';
 }
 
 function voiceConfig(ctx) {
@@ -1328,13 +1336,14 @@ function voiceConfig(ctx) {
     providerId: String(source.providerId || '').trim().slice(0, 128),
     model: String(source.model || 'whisper-1').trim().slice(0, 128) || 'whisper-1',
     language: String(source.language || '').trim().toLowerCase(),
+    spaceHoldMs: normalizeVoiceSpaceHoldMs(source.spaceHoldMs),
   };
 }
 
 function buildScriptSources(config, localReady) {
   return {
-    add: buildVoiceInputScript({ readyWaitMs: SCRIPT_READY_WAIT_MS, engine: config.engine, localReady: localReady, language: config.language }),
-    probe: buildVoiceInputScript({ readyWaitMs: PROBE_READY_WAIT_MS, engine: config.engine, localReady: localReady, language: config.language }),
+    add: buildVoiceInputScript({ readyWaitMs: SCRIPT_READY_WAIT_MS, engine: config.engine, localReady: localReady, language: config.language, spaceHoldMs: config.spaceHoldMs }),
+    probe: buildVoiceInputScript({ readyWaitMs: PROBE_READY_WAIT_MS, engine: config.engine, localReady: localReady, language: config.language, spaceHoldMs: config.spaceHoldMs }),
   };
 }
 
@@ -1349,10 +1358,10 @@ async function ensurePageScript(page, scripts, prepared) {
   return evaluate(page, scripts.probe, { timeoutMs: PROBE_READY_WAIT_MS + 5000 });
 }
 
-async function injectVoiceInput({ cdpPort, target = null, timeoutMs = DEFAULT_INJECT_TIMEOUT_MS, pause = sleep, engine, localReady = false, language = '' } = {}) {
+async function injectVoiceInput({ cdpPort, target = null, timeoutMs = DEFAULT_INJECT_TIMEOUT_MS, pause = sleep, engine, localReady = false, language = '', spaceHoldMs } = {}) {
   var port = Number(cdpPort);
   if (!Number.isInteger(port) || port <= 0) throw new Error('ChatGPT 调试端口无效');
-  var config = { engine: engine === 'provider' ? 'provider' : engine === 'system' ? 'system' : 'local', language: language };
+  var config = { engine: engine === 'provider' ? 'provider' : engine === 'system' ? 'system' : 'local', language: language, spaceHoldMs: spaceHoldMs };
   var scripts = buildScriptSources(config, localReady === true);
   var prepared = new Set();
   var deadline = Date.now() + Math.max(1000, Number(timeoutMs) || DEFAULT_INJECT_TIMEOUT_MS);
@@ -1640,7 +1649,7 @@ async function startVoiceInputOnPort({ ctx, cdpPort, target = null, timeoutMs = 
   stopVoiceInputBridge();
   var config = voiceConfig(ctx);
   var localReady = config.engine === 'local' ? localSpeechStatus().ready : false;
-  await injectVoiceInput({ cdpPort: cdpPort, target: target, timeoutMs: timeoutMs, engine: config.engine, localReady: localReady, language: config.language });
+  await injectVoiceInput({ cdpPort: cdpPort, target: target, timeoutMs: timeoutMs, engine: config.engine, localReady: localReady, language: config.language, spaceHoldMs: config.spaceHoldMs });
   var bridge = startVoiceInputBridge({ cdpPort: cdpPort, ctx: ctx, log: ctx?.log });
   return { ok: true, cdpPort: cdpPort, bridge: !!bridge };
 }

@@ -254,7 +254,7 @@ test('plugin manager: 内置插件可安装、启停、配置和卸载，并保�
   assert.deepEqual(initial.map((plugin) => plugin.id), ['weixin', 'usage-statusline', 'voice-input']);
   assert.ok(initial.every((plugin) => plugin.installed && plugin.enabled));
   assert.deepEqual(manager.get('usage-statusline').config.metrics, { speed: true, cache: true, context: true });
-  assert.deepEqual(manager.get('voice-input').config, { engine: 'local', providerId: '', model: 'whisper-1', language: '' });
+  assert.deepEqual(manager.get('voice-input').config, { engine: 'local', providerId: '', model: 'whisper-1', language: '', spaceHoldMs: 1000 });
 
   manager.setEnabled('weixin', false);
   assert.equal(manager.isActive('weixin'), false);

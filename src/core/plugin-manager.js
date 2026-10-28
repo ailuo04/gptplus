@@ -9,11 +9,16 @@ const DEFAULT_USAGE_METRICS = Object.freeze({
   context: true,
 });
 
+const DEFAULT_VOICE_SPACE_HOLD_MS = 1000;
+const MIN_VOICE_SPACE_HOLD_MS = 300;
+const MAX_VOICE_SPACE_HOLD_MS = 5000;
+
 const DEFAULT_VOICE_CONFIG = Object.freeze({
   engine: 'local',
   providerId: '',
   model: 'whisper-1',
   language: '',
+  spaceHoldMs: DEFAULT_VOICE_SPACE_HOLD_MS,
 });
 
 const BUILTIN_PLUGIN_DEFINITIONS = Object.freeze([
@@ -55,7 +60,7 @@ const BUILTIN_PLUGIN_DEFINITIONS = Object.freeze([
     category: '效率',
     icon: 'mic',
     description: '在 ChatGPT 输入框的发送键旁加入麦克风按钮，把语音转成文字。',
-    detail: '默认在本机用 SenseVoice 离线识别，不弹出系统语音浮层；在输入框内长按空格 1.5 秒即可开始录音，松开自动转写。也可以改用支持 /audio/transcriptions 的 OpenAI 兼容提供商。',
+    detail: '默认在本机用 SenseVoice 离线识别，不弹出系统语音浮层；在输入框内长按空格 1 秒即可开始录音，松开自动转写，长按时长可调整。也可以改用支持 /audio/transcriptions 的 OpenAI 兼容提供商。',
     builtIn: true,
     defaultInstalled: true,
     defaultEnabled: true,
@@ -89,6 +94,14 @@ function normalizeUsageConfig(raw) {
   };
 }
 
+function normalizeVoiceSpaceHoldMs(value) {
+  if (value === undefined || value === null || String(value).trim() === '') return DEFAULT_VOICE_SPACE_HOLD_MS;
+  var numeric = Number(value);
+  if (!Number.isFinite(numeric)) return DEFAULT_VOICE_SPACE_HOLD_MS;
+  var rounded = Math.round(numeric / 100) * 100;
+  return Math.min(MAX_VOICE_SPACE_HOLD_MS, Math.max(MIN_VOICE_SPACE_HOLD_MS, rounded));
+}
+
 function normalizeVoiceConfig(raw) {
   const source = isPlainObject(raw) ? raw : {};
   const language = String(source.language || '').trim().toLowerCase();
@@ -97,6 +110,7 @@ function normalizeVoiceConfig(raw) {
     providerId: String(source.providerId || '').trim().slice(0, 128),
     model: String(source.model || 'whisper-1').trim().slice(0, 128) || 'whisper-1',
     language: /^[a-z]{2,3}(?:-[a-z]{2,4})?$/.test(language) ? language : '',
+    spaceHoldMs: normalizeVoiceSpaceHoldMs(source.spaceHoldMs),
   };
 }
 
@@ -296,8 +310,12 @@ module.exports = {
   BUILTIN_PLUGIN_DEFINITIONS,
   DEFAULT_USAGE_METRICS,
   DEFAULT_VOICE_CONFIG,
+  DEFAULT_VOICE_SPACE_HOLD_MS,
+  MAX_VOICE_SPACE_HOLD_MS,
+  MIN_VOICE_SPACE_HOLD_MS,
   createPluginManager,
   normalizePluginConfig,
   normalizeVoiceConfig,
+  normalizeVoiceSpaceHoldMs,
 };
 

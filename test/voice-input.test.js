@@ -8,7 +8,7 @@ const {
 } = require('../src/core/voice-input.js');
 
 test('voice input: 注入脚本包含内联录音条、波形与本地 WAV 编码', () => {
-  const script = buildVoiceInputScript({ readyWaitMs: 1234, engine: 'local', localReady: true, language: 'zh' });
+  const script = buildVoiceInputScript({ readyWaitMs: 1234, engine: 'local', localReady: true, language: 'zh', spaceHoldMs: 1800 });
   assert.match(script, /gptplus-voice-input/);
   assert.match(script, /gptplus-voice-panel/);
   assert.match(script, /gptplus-voice-wave/);
@@ -19,7 +19,9 @@ test('voice input: 注入脚本包含内联录音条、波形与本地 WAV 编�
   assert.match(script, /OfflineAudioContext/);
   assert.match(script, /16000/);
   assert.match(script, /"local"/);
-  assert.match(script, /PTT_HOLD_MS = 1500/);
+  assert.match(script, /PTT_HOLD_MS = Math\.min/);
+  assert.match(script, /PTT_HOLD_LABEL/);
+  assert.match(script, /, 1800\)$/);
   assert.match(script, /onSpaceDown/);
   assert.match(script, /removeTrailingSpaces/);
   assert.match(script, /position:absolute/);
@@ -38,7 +40,7 @@ test('voice input: provider 脚本仍保留 webm 上传路径', () => {
 test('voice input: 插件配置会兜底到本地识别并规范化字段', () => {
   const config = voiceConfig({
     plugins: {
-      config: () => ({ engine: 'provider', providerId: ' p_demo ', model: ' ', language: 'EN' }),
+      config: () => ({ engine: 'provider', providerId: ' p_demo ', model: ' ', language: 'EN', spaceHoldMs: '2400' }),
     },
   });
   assert.deepEqual(config, {
@@ -46,13 +48,18 @@ test('voice input: 插件配置会兜底到本地识别并规范化字段', () =
     providerId: 'p_demo',
     model: 'whisper-1',
     language: 'en',
+    spaceHoldMs: 2400,
   });
   assert.deepEqual(voiceConfig({ plugins: { config: () => null } }), {
     engine: 'local',
     providerId: '',
     model: 'whisper-1',
     language: '',
+    spaceHoldMs: 1000,
   });
+  assert.equal(voiceConfig({ plugins: { config: () => ({ spaceHoldMs: 100 }) } }).spaceHoldMs, 300);
+  assert.equal(voiceConfig({ plugins: { config: () => ({ spaceHoldMs: 9000 }) } }).spaceHoldMs, 5000);
+  assert.equal(voiceConfig({ plugins: { config: () => ({ spaceHoldMs: null }) } }).spaceHoldMs, 1000);
 });
 
 test('voice input: 转写走 OpenAI 兼容 /audio/transcriptions 并复用提供商鉴权', async () => {

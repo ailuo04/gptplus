@@ -554,6 +554,11 @@ export function renderWeixin(root, ctx, actions) {
     el('button', {
       class: 'btn btn-ghost btn-sm',
       type: 'button',
+      on: { click: () => ctx.navigate('plugins') },
+    }, [icon('box', 13), el('span', { text: '返回插件市场' })]),
+    el('button', {
+      class: 'btn btn-ghost btn-sm',
+      type: 'button',
       on: { click: () => void refreshStatus() },
     }, [icon('refresh', 13), el('span', { text: '刷新状态' })]),
   );

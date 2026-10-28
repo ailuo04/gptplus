@@ -938,13 +938,12 @@ const VIEW_META = {
 function renderChrome() {
   const s = state.status;
   const weixinPlugin = state.plugins.find((plugin) => plugin.id === 'weixin');
-  const weixinNav = dom.nav.querySelector('[data-plugin-nav="weixin"]');
-  if (weixinNav) weixinNav.hidden = !!weixinPlugin && !weixinPlugin.installed;
   if (state.view === 'weixin' && weixinPlugin && !weixinPlugin.installed) state.view = 'plugins';
 
   // 导航
+  const activeNavView = state.view === 'weixin' ? 'plugins' : state.view;
   for (const btn of dom.nav.querySelectorAll('.nav-item')) {
-    btn.classList.toggle('is-active', btn.dataset.view === state.view);
+    btn.classList.toggle('is-active', btn.dataset.view === activeNavView);
   }
   const activeNav = dom.nav.querySelector('.nav-item.is-active');
   if (activeNav) {
