@@ -52,6 +52,7 @@ const { ensureApiVersion } = require('../base-url.js');
 
 const DONE_FRAME = 'data: [DONE]\n\n';
 const MAX_BODY_BYTES = 32 * 1024 * 1024; // codex 的 instructions + 历史可能很大
+const MAX_RELIABLE_GENERATION_SPEED = 600;
 
 // ---------------------------------------------------------------------------
 // 小工具
@@ -138,19 +139,23 @@ function normalizeUsage(raw) {
 }
 
 /**
- * 平均生成速度（tok/s）：输出 Token / 本次上游请求总耗时。
+ * 生成速度（tok/s）：输出 Token / 首个输出片段到请求结束的耗时。
  *
- * 不能只取首个流片段到结束的时间：部分中转会把思考或正文缓冲到接近结束时
- * 才一次性下发，此时总输出 Token 不变、分母却只剩几百毫秒，会得到上千 tok/s。
- * 整次请求耗时虽然包含首字等待，但它是所有上游都能可靠提供的统一口径。
+ * 首包等待和排队时间不计入分母，这样与中转控制台的口径一致。部分中转会把
+ * 内容缓冲到接近结束时才一次性下发，此时尾窗极短，结果会失真；超过合理上限
+ * 的样本不写入状态栏。
  */
-function generationSpeed(rawUsage, elapsedMs) {
+function generationSpeed(rawUsage, elapsedMs, firstOutputMs) {
   const usage = normalizeUsage(rawUsage);
   const output = usage ? usage.output_tokens : 0;
   const totalMs = Number(elapsedMs);
   if (!(output > 0) || !(totalMs > 0)) return null;
-  if (!(totalMs >= 50)) return null;
-  return output / (totalMs / 1000);
+  const firstOutput = Number(firstOutputMs);
+  if (!(firstOutput > 0 && firstOutput < totalMs)) return null;
+  const activeMs = totalMs - firstOutput;
+  if (!(activeMs >= 50)) return null;
+  const speed = output / (activeMs / 1000);
+  return speed > 0 && speed < MAX_RELIABLE_GENERATION_SPEED ? speed : null;
 }
 
 /** 无 tokenizer 时的混合文本估算：CJK/emoji 近似 1 Token，其余字符约 4 个 1 Token。 */

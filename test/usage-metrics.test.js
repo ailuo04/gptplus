@@ -74,6 +74,27 @@ test('estimated gateway usage is marked without hiding otherwise usable values',
   assert.equal(value.contextEstimated, true);
 });
 
+test('an explicitly unavailable request speed does not fall back to rollout estimates', () => {
+  const start = Date.parse('2026-10-29T02:00:00.000Z');
+  const events = [
+    { t: new Date(start).toISOString(), turn_id: 'turn_1', turn_output_tokens: 10, input_tokens: 100, output_tokens: 10, total_tokens: 110, context_window: 1000 },
+    { t: new Date(start + 1000).toISOString(), turn_id: 'turn_1', turn_output_tokens: 20, input_tokens: 100, output_tokens: 20, total_tokens: 120, context_window: 1000 },
+  ];
+  const request = {
+    at: start + 1500,
+    speed: null,
+    speedAvailable: false,
+    inputTokens: 100,
+    cachedInputTokens: 0,
+    outputTokens: 20,
+    totalTokens: 120,
+    cacheUsageAvailable: false,
+  };
+
+  const value = computeUsageSnapshot(events, request, start + 2000);
+  assert.equal(value.speed, null, '明确不可用的网关速度不能回退到误导性的估算值');
+});
+
 test('a newly completed request is shown before its rollout event is written', () => {
   const stale = '2026-10-29T02:00:00.000Z';
   const events = [{

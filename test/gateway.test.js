@@ -62,13 +62,24 @@ test('协议归一化保留图片、系统约束、工具历史及原始 thinkin
   assert.throws(() => normalizeRequest({ messages: [], tools: [{ type: 'web_search_20250305', name: 'web_search' }] }, 'anthropic'), /服务端/);
 });
 
-test('平均生成速度按完整请求耗时计算，缓冲流不会用极短尾窗放大', () => {
-  const usage = { output_tokens: 2308, input_tokens: 1, total_tokens: 2309 };
-  assert.equal(Math.round(generationSpeed(usage, 79811)), 29);
-  assert.equal(Math.round(generationSpeed(usage, 10000)), 231);
-  assert.equal(Math.round(generationSpeed(usage, 10000, 9980)), 231, '旧的首帧参数不能再把速度放大');
-  assert.equal(generationSpeed(usage, 40), null);
-  assert.equal(generationSpeed({ output_tokens: 0 }, 10000), null);
+test('生成速度按首包后的耗时计算，并与中转面板正常样本一致', () => {
+  const samples = [
+    { output: 1427, elapsed: 8669, firstOutput: 3490, expected: 275.8 },
+    { output: 1009, elapsed: 7009, firstOutput: 3806, expected: 315.6 },
+    { output: 1608, elapsed: 9282, firstOutput: 3120, expected: 261.3 },
+    { output: 2842, elapsed: 57740, firstOutput: 1710, expected: 51.3 },
+    { output: 4112, elapsed: 92000, firstOutput: 1670, expected: 45.7 },
+    { output: 555, elapsed: 26130, firstOutput: 1690, expected: 22.9 },
+  ];
+  for (const sample of samples) {
+    const speed = generationSpeed({ output_tokens: sample.output }, sample.elapsed, sample.firstOutput);
+    assert.ok(Number.isFinite(speed), JSON.stringify(sample));
+    assert.ok(Math.abs(speed - sample.expected) < 1, `${speed} != ${sample.expected}`);
+  }
+  assert.equal(generationSpeed({ output_tokens: 60 }, 10000), null, '缺少首包时间时不伪造速度');
+  assert.equal(generationSpeed({ output_tokens: 60 }, 1050, 1000), null, '尾窗不足 50ms 时丢弃');
+  assert.equal(generationSpeed({ output_tokens: 972 }, 32159, 31099), null, '上千 tok/s 的缓冲异常样本应丢弃');
+  assert.equal(generationSpeed({ output_tokens: 0 }, 10000, 1000), null);
 });
 
 test('usage normalization supports common provider aliases and repairs inconsistent totals', () => {
@@ -190,7 +201,7 @@ test('gateway: 单次请求记录首段文本时间与速度，并可由 thread-
   assert.ok(final.firstOutputMs >= 150, `firstOutputMs=${final.firstOutputMs}`);
   assert.ok(final.firstTextMs >= 150, `firstTextMs=${final.firstTextMs}`);
   assert.ok(final.speed > 100 && final.speed < 400, `speed=${final.speed}`);
-  assert.ok(Math.abs(final.speed - 60 / (final.ms / 1000)) < 1e-6);
+  assert.ok(Math.abs(final.speed - 60 / ((final.ms - final.firstOutputMs) / 1000)) < 1e-6);
 
   const live = await postJson(`http://127.0.0.1:${new URL(base).port}/thread-usage-live`, { session_id: 'thread_speed_12345678' });
   assert.equal(live.status, 200, live.text);
@@ -248,7 +259,7 @@ test('gateway: 最近的请求速度不会被高频日志挤出环形缓存', as
   assert.equal(gw.getRequestSpeed(sessionId)?.speed, speed);
 });
 
-test('gateway: 思考片段先于正文时仍按完整上游请求耗时计算', async (t) => {
+test('gateway: 思考片段先于正文时从首个输出片段开始计时', async (t) => {
   const upstream = await startMockUpstream((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
     const send = (value) => res.write(`data: ${JSON.stringify(value)}\n\n`);
@@ -283,11 +294,10 @@ test('gateway: 思考片段先于正文时仍按完整上游请求耗时计算',
   const final = logs.filter((entry) => entry.final === true).at(-1);
   assert.ok(final.firstOutputMs >= 50, `firstOutputMs=${final.firstOutputMs}`);
   assert.ok(final.firstTextMs > final.firstOutputMs, `firstTextMs=${final.firstTextMs} firstOutputMs=${final.firstOutputMs}`);
-  assert.ok(Math.abs(final.speed - 60 / (final.ms / 1000)) < 1e-6);
-  assert.ok(final.speed < 60 / ((final.ms - final.firstOutputMs) / 1000), '不能只按首个流片段的尾窗计时');
+  assert.ok(Math.abs(final.speed - 60 / ((final.ms - final.firstOutputMs) / 1000)) < 1e-6);
 });
 
-test('gateway: 上游缓冲到结束时才吐字，平均速度不会虚高', async (t) => {
+test('gateway: 上游缓冲到结束时才吐字，异常速度不进入状态栏', async (t) => {
   const upstream = await startMockUpstream((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
     const send = (value) => res.write(`data: ${JSON.stringify(value)}\n\n`);
@@ -297,7 +307,7 @@ test('gateway: 上游缓冲到结束时才吐字，平均速度不会虚高', as
       setTimeout(() => {
         send({
           choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-          usage: { prompt_tokens: 10, completion_tokens: 60, total_tokens: 70 },
+          usage: { prompt_tokens: 10, completion_tokens: 120, total_tokens: 130 },
         });
         res.write('data: [DONE]\n\n');
         res.end();
@@ -318,8 +328,12 @@ test('gateway: 上游缓冲到结束时才吐字，平均速度不会虚高', as
   assert.equal(response.status, 200, response.text);
   const final = logs.filter((entry) => entry.final === true).at(-1);
   assert.ok(final.ms - final.firstOutputMs < 200, `active=${final.ms - final.firstOutputMs}`);
-  assert.ok(Math.abs(final.speed - 60 / (final.ms / 1000)) < 1e-6);
-  assert.ok(final.speed < 300, `speed=${final.speed}`);
+  assert.equal(final.speed, undefined, '不可信的短尾窗速度应被丢弃');
+
+  const request = gw.getRequestSpeed('thread_buffered_speed_1');
+  assert.ok(request, '不可信速度仍应保留请求快照');
+  assert.equal(request.speed, null);
+  assert.equal(request.speedAvailable, false);
 });
 
 test('转换适配器拒绝坏 JSON、无终结事件及无效非流式响应', async () => {

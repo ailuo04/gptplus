@@ -173,7 +173,7 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
     }
     node.dataset.hidden = String(Object.keys(parts).length === 0);
     const details = [];
-    if (parts.speed) details.push("平均生成速度 " + speed + " tok/s" + (value?.speedEstimated ? "（估算）" : ""));
+    if (parts.speed) details.push("首包后生成速度 " + speed + " tok/s" + (value?.speedEstimated ? "（估算）" : ""));
     if (parts.cache) details.push("缓存命中 " + cache + (value?.cacheEstimated ? "（估算）" : ""));
     if (parts.context) details.push("上下文占用 " + context + (value?.contextEstimated ? "（估算）" : ""));
     if (parts.context && value?.window > 0) details.push("窗口 " + value.window);

@@ -55,8 +55,9 @@ function computeUsageSnapshot(events, request, now = Date.now()) {
     return totalSeconds > 0 ? recent.reduce((sum, item) => sum + item.delta, 0) / totalSeconds : null;
   }
 
+  const requestSpeedUnavailable = matched && request?.speedAvailable === false;
   const requestSpeed = matched ? value(request && request.speed) : null;
-  const fallbackSpeed = requestSpeed === null ? eventSpeed() : null;
+  const fallbackSpeed = requestSpeed === null && !requestSpeedUnavailable ? eventSpeed() : null;
   const speed = requestSpeed !== null && requestSpeed > 0 ? requestSpeed : fallbackSpeed;
   const speedEstimated = requestSpeed !== null
     ? matched && request?.estimatedUsage === true

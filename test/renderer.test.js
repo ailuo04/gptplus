@@ -3333,6 +3333,7 @@ test('插件市场：展示三个内置插件并支持配置、启停与卸载�
     const usageModal = calls.filter((entry) => entry[0] === 'openModal').at(-1)?.[1];
     assert.ok(usageModal, '用量配置入口应打开弹窗');
     assert.match(usageModal.allText(), /生成速度/);
+    assert.match(usageModal.allText(), /首包后的生成速度/);
     assert.match(usageModal.allText(), /缓存命中率/);
     assert.match(usageModal.allText(), /上下文占用/);
     const voiceConfig = configButtons.at(-1);

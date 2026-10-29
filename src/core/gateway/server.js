@@ -276,10 +276,11 @@ function createGateway(deps = {}) {
   function requestSnapshot(entry) {
     if (!entry || entry.final !== true || Number(entry.status) !== 200 || !entry.sessionId) return null;
     const speed = Number(entry.speed);
-    if (!(speed > 0)) return null;
+    const speedAvailable = speed > 0;
     const tokens = normalizeUsage(entry.tokens);
     return {
-      speed,
+      speed: speedAvailable ? speed : null,
+      speedAvailable,
       at: entry.at,
       ms: entry.ms,
       firstOutputMs: entry.firstOutputMs,
@@ -799,7 +800,7 @@ function createGateway(deps = {}) {
       if (finalLogged) return null;
       finalLogged = true;
       const ms = entry.ms ?? Date.now() - started;
-      const speed = entry.speed ?? generationSpeed(entry.tokens, ms);
+      const speed = entry.speed ?? generationSpeed(entry.tokens, ms, entry.firstOutputMs);
       const sentEffort = effectiveReasoningEffort(built, body);
       const final = logEntry({
         level: 'info',
