@@ -42,6 +42,7 @@ const {
   buildResponseObject,
   countLoopToolItems,
   estimateUsage,
+  extractResponseEstimateText,
   extractErrorMessage,
   extractResponseText,
   generationSpeed,
@@ -57,6 +58,7 @@ const {
 } = require('./responses.js');
 
 const RING_SIZE = 200;
+const MAX_SESSION_REQUEST_SNAPSHOTS = 64;
 const DEFAULT_PORT = 18120;
 const DEFAULT_HOST = '127.0.0.1';
 const REQUEST_TIMEOUT_MS = 15 * 60 * 1000; // 长思考模型可能要十几分钟
@@ -97,6 +99,13 @@ function effectiveReasoningEffort(built, body) {
     if (typeof direct === 'string' && direct.trim()) return direct.trim().toLowerCase();
   }
   return null;
+}
+
+function estimateParsedOutput(parsed) {
+  const parts = [parsed?.text, parsed?.reasoning];
+  for (const item of Array.isArray(parsed?.reasoningItems) ? parsed.reasoningItems : []) parts.push(item?.text);
+  for (const call of Array.isArray(parsed?.toolCalls) ? parsed.toolCalls : []) parts.push(call?.name, call?.arguments);
+  return parts.filter(Boolean).join('\n');
 }
 
 function isTransientUpstreamStatus(status) {
@@ -231,6 +240,7 @@ function createGateway(deps = {}) {
 
   /** @type {any[]} 最近 200 条 */
   const ring = [];
+  const requestSnapshots = new Map();
   const listeners = new Set();
 
   const state = {
@@ -263,6 +273,39 @@ function createGateway(deps = {}) {
     return state.token || storeToken() || '';
   }
 
+  function requestSnapshot(entry) {
+    if (!entry || entry.final !== true || Number(entry.status) !== 200 || !entry.sessionId) return null;
+    const speed = Number(entry.speed);
+    if (!(speed > 0)) return null;
+    const tokens = normalizeUsage(entry.tokens);
+    return {
+      speed,
+      at: entry.at,
+      ms: entry.ms,
+      firstOutputMs: entry.firstOutputMs,
+      firstTextMs: entry.firstTextMs,
+      inputTokens: tokens?.input_tokens || 0,
+      cachedInputTokens: tokens?.input_tokens_details?.cached_tokens || 0,
+      cacheWriteTokens: tokens?.input_tokens_details?.cache_write_tokens || 0,
+      outputTokens: tokens?.output_tokens || 0,
+      totalTokens: tokens?.total_tokens || 0,
+      cacheUsageAvailable: entry.cacheUsageAvailable === true,
+      estimatedUsage: entry.estimatedUsage === true,
+      model: entry.upstreamModel || entry.model || '',
+    };
+  }
+
+  function rememberRequestSnapshot(entry) {
+    const id = String(entry?.sessionId || '').trim().replace(/^local:/, '');
+    const snapshot = requestSnapshot(entry);
+    if (!id || !snapshot) return;
+    requestSnapshots.delete(id);
+    requestSnapshots.set(id, snapshot);
+    while (requestSnapshots.size > MAX_SESSION_REQUEST_SNAPSHOTS) {
+      requestSnapshots.delete(requestSnapshots.keys().next().value);
+    }
+  }
+
   function logEntry(entry) {
     const cfg = configSnapshot();
     const peerSecrets = (cfg.remoteSync?.connections || []).map((connection) => ({
@@ -271,6 +314,7 @@ function createGateway(deps = {}) {
     const full = redactDiagnostic({ at: Date.now(), level: 'info', ...entry }, [...(cfg.providers || []), ...peerSecrets]);
     ring.push(full);
     if (ring.length > RING_SIZE) ring.splice(0, ring.length - RING_SIZE);
+    rememberRequestSnapshot(full);
     try {
       if (typeof externalLog === 'function') externalLog(full);
     } catch {
@@ -290,21 +334,13 @@ function createGateway(deps = {}) {
   function latestRequestSpeed(sessionId) {
     const id = String(sessionId || '').trim().replace(/^local:/, '');
     if (!id) return null;
+    const cached = requestSnapshots.get(id);
+    if (cached) return cached;
     for (let index = ring.length - 1; index >= 0; index -= 1) {
       const entry = ring[index];
       if (entry.final !== true || Number(entry.status) !== 200 || entry.sessionId !== id) continue;
-      const speed = Number(entry.speed);
-      if (!(speed > 0)) continue;
-      const tokens = normalizeUsage(entry.tokens);
-      return {
-        speed,
-        at: entry.at,
-        ms: entry.ms,
-        firstOutputMs: entry.firstOutputMs,
-        firstTextMs: entry.firstTextMs,
-        outputTokens: tokens?.output_tokens || 0,
-        model: entry.upstreamModel || entry.model || '',
-      };
+      const snapshot = requestSnapshot(entry);
+      if (snapshot) return snapshot;
     }
     return null;
   }
@@ -763,7 +799,7 @@ function createGateway(deps = {}) {
       if (finalLogged) return null;
       finalLogged = true;
       const ms = entry.ms ?? Date.now() - started;
-      const speed = entry.speed ?? generationSpeed(entry.tokens, ms, entry.firstOutputMs);
+      const speed = entry.speed ?? generationSpeed(entry.tokens, ms);
       const sentEffort = effectiveReasoningEffort(built, body);
       const final = logEntry({
         level: 'info',
@@ -816,7 +852,7 @@ function createGateway(deps = {}) {
       }
       if (pipe) {
         return {
-          tokens: normalizeUsage(pipe.usage) || estimateUsage(body, pipe.outputText),
+          tokens: normalizeUsage(pipe.usage) || estimateUsage(body, pipe.estimateText || pipe.outputText),
           cacheUsageAvailable: hasCacheUsage(pipe.usage),
           estimatedUsage: !pipe.usage || undefined,
           events: pipe.events,
@@ -948,7 +984,7 @@ function createGateway(deps = {}) {
             level: 'info',
             msg: `完成 ${slug} -> ${route.modelId} (${Date.now() - started}ms)`,
             status: 200,
-            tokens: normalizeUsage(json.usage) || estimateUsage(body, extractResponseText(json.output)),
+            tokens: normalizeUsage(json.usage) || estimateUsage(body, extractResponseEstimateText(json.output)),
             estimatedUsage: !json.usage || undefined,
             cacheUsageAvailable: hasCacheUsage(json.usage),
           });
@@ -974,7 +1010,7 @@ function createGateway(deps = {}) {
           level: 'info',
           msg: `完成 ${slug} -> ${route.modelId} (${Date.now() - started}ms)`,
           status: 200,
-          tokens: normalizeUsage(parsed.usage) || estimateUsage(body, parsed.text),
+          tokens: normalizeUsage(parsed.usage) || estimateUsage(body, estimateParsedOutput(parsed)),
           estimatedUsage: !parsed.usage || undefined,
           cacheUsageAvailable: hasCacheUsage(parsed.usage),
         });
@@ -986,7 +1022,7 @@ function createGateway(deps = {}) {
       // 透传模式：上游报文逐字节转发，不做内部事件重建（见 adapters/responses.js）；
       // pipe 只收集日志要用的信息（usage / responseId / 失败事件 / 工具调用数）。
       pipe = adapter.passthrough
-        ? { usage: null, outputText: '', responseId: null, events: 0, completed: false, terminal: false, failed: null, toolCalls: 0, firstOutputAt: null, firstTextAt: null }
+        ? { usage: null, outputText: '', estimateText: '', responseId: null, events: 0, completed: false, terminal: false, failed: null, toolCalls: 0, firstOutputAt: null, firstTextAt: null }
         : null;
       stream = adapter.passthrough ? null : createOutputStream(protocol, res, { model: slug, ...outputOptions }) || new ResponsesStream({ res, model: slug });
       if (stream) stream.start();
@@ -1070,7 +1106,7 @@ function createGateway(deps = {}) {
             level: 'info',
             msg: `完成 ${slug} -> ${route.modelId} (${Date.now() - started}ms)`,
             status: 200,
-            tokens: normalizeUsage(pipe.usage) || estimateUsage(body, pipe.outputText),
+            tokens: normalizeUsage(pipe.usage) || estimateUsage(body, pipe.estimateText || pipe.outputText),
             cacheUsageAvailable: hasCacheUsage(pipe.usage),
             estimatedUsage: !pipe.usage || undefined,
             events: pipe.events,
@@ -1159,6 +1195,7 @@ function createGateway(deps = {}) {
     getRequestSpeed: latestRequestSpeed,
     resetLogs: () => {
       ring.length = 0;
+      requestSnapshots.clear();
     },
     router,
   };

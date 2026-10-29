@@ -15,6 +15,9 @@ try {
 const INITIAL_WINDOW_BYTES = 512 * 1024;
 const MAX_WINDOW_BYTES = 8 * 1024 * 1024;
 const EVENT_LIMIT = 24;
+const TAIL_CACHE_EVENTS = 128;
+const MAX_CACHED_READERS = 64;
+const DEFAULT_RESOLUTION_TTL_MS = 1000;
 const MAX_SCAN_ENTRIES = 8192;
 const MAX_SCAN_DEPTH = 4;
 
@@ -126,19 +129,56 @@ function usageEvent(record, turnId) {
   const info = record.payload.info;
   const last = info?.last_token_usage;
   if (!last || typeof last !== 'object') return null;
+  const inputTokens = numberField(last, 'input_tokens');
+  const outputTokens = numberField(last, 'output_tokens');
+  const totalTokens = numberField(last, 'total_tokens');
   const event = {
     t: typeof record.timestamp === 'string' ? record.timestamp : '',
-    input_tokens: numberField(last, 'input_tokens'),
+    input_tokens: inputTokens,
     cached_input_tokens: numberField(last, 'cached_input_tokens'),
-    output_tokens: numberField(last, 'output_tokens'),
+    output_tokens: outputTokens,
     reasoning_output_tokens: numberField(last, 'reasoning_output_tokens'),
-    total_tokens: numberField(last, 'total_tokens'),
+    total_tokens: totalTokens || inputTokens + outputTokens,
     context_window: numberField(info, 'model_context_window'),
     turn_output_tokens: numberField(info?.total_token_usage, 'output_tokens'),
+    cache_usage_available: Object.prototype.hasOwnProperty.call(last, 'cached_input_tokens'),
   };
   if (turnId) event.turn_id = turnId;
   if (!(event.input_tokens || event.output_tokens || event.total_tokens)) return null;
   return event;
+}
+
+function consumeUsageRecord(record, state) {
+  const type = record?.type;
+  const payload = record?.payload || {};
+  const eventType = payload.type;
+  const turnId = typeof payload.turn_id === 'string' && payload.turn_id ? payload.turn_id : null;
+
+  if (type === 'turn_context') {
+    if (turnId && state.currentTurnId !== turnId) {
+      state.segmentStart = state.events.length;
+      state.currentTurnId = turnId;
+    }
+    return;
+  }
+  if (type !== 'event_msg') return;
+  if (eventType === 'task_started' || eventType === 'turn_started') {
+    state.segmentStart = state.events.length;
+    state.currentTurnId = turnId;
+    return;
+  }
+  if (['task_complete', 'turn_complete', 'turn_completed', 'task_failed', 'turn_aborted', 'task_aborted'].includes(eventType)) {
+    if (turnId) {
+      for (let index = state.segmentStart; index < state.events.length; index += 1) {
+        if (!state.events[index].turn_id) state.events[index].turn_id = turnId;
+      }
+    }
+    state.segmentStart = state.events.length;
+    state.currentTurnId = null;
+    return;
+  }
+  const event = usageEvent(record, state.currentTurnId);
+  if (event) state.events.push(event);
 }
 
 function readUsageWindow(filePath, start, out) {
@@ -151,43 +191,13 @@ function readUsageWindow(filePath, start, out) {
     const lines = buffer.toString('utf8').split('\n');
     if (start > 0) lines.shift();
 
-    let currentTurnId = null;
-    let segmentStart = 0;
+    const state = { currentTurnId: null, segmentStart: 0, events: out };
     for (const raw of lines) {
       const line = raw.trim();
       if (!line || (!line.includes('"event_msg"') && !line.includes('"turn_context"'))) continue;
       let record;
       try { record = JSON.parse(line); } catch { continue; }
-      const type = record?.type;
-      const payload = record?.payload || {};
-      const eventType = payload.type;
-      const turnId = typeof payload.turn_id === 'string' && payload.turn_id ? payload.turn_id : null;
-
-      if (type === 'turn_context') {
-        if (turnId && currentTurnId !== turnId) {
-          segmentStart = out.length;
-          currentTurnId = turnId;
-        }
-        continue;
-      }
-      if (type !== 'event_msg') continue;
-      if (eventType === 'task_started' || eventType === 'turn_started') {
-        segmentStart = out.length;
-        currentTurnId = turnId;
-        continue;
-      }
-      if (['task_complete', 'turn_complete', 'turn_completed', 'task_failed', 'turn_aborted', 'task_aborted'].includes(eventType)) {
-        if (turnId) {
-          for (let index = segmentStart; index < out.length; index += 1) {
-            if (!out[index].turn_id) out[index].turn_id = turnId;
-          }
-        }
-        segmentStart = out.length;
-        currentTurnId = null;
-        continue;
-      }
-      const event = usageEvent(record, currentTurnId);
-      if (event) out.push(event);
+      consumeUsageRecord(record, state);
     }
   } finally {
     fs.closeSync(fd);
@@ -210,11 +220,81 @@ function readUsageTail(filePath, limit = EVENT_LIMIT) {
 }
 
 /**
+ * rollout 在生成期间会持续追加。状态栏每秒读取一次，不能每次都重新解析
+ * 尾部 512 KB；首次建立缓存后只消费新增字节，文件被截断或替换时再重建。
+ */
+function createIncrementalUsageTail(limit = EVENT_LIMIT) {
+  const states = new Map();
+
+  const identity = (stat) => `${stat.dev || 0}:${stat.ino || 0}:${stat.birthtimeMs || 0}`;
+  const remember = (filePath, state) => {
+    states.delete(filePath);
+    states.set(filePath, state);
+    while (states.size > MAX_CACHED_READERS) states.delete(states.keys().next().value);
+  };
+
+  function build(filePath, stat) {
+    const events = readUsageTail(filePath, Math.max(limit, TAIL_CACHE_EVENTS));
+    return {
+      id: identity(stat),
+      offset: stat.size,
+      pending: Buffer.alloc(0),
+      events,
+      currentTurnId: events.at(-1)?.turn_id || null,
+      segmentStart: events.length,
+    };
+  }
+
+  function read(filePath) {
+    const stat = fs.statSync(filePath);
+    let state = states.get(filePath);
+    if (!state || stat.size < state.offset || identity(stat) !== state.id) {
+      state = build(filePath, stat);
+      remember(filePath, state);
+    }
+
+    if (stat.size > state.offset) {
+      const fd = fs.openSync(filePath, 'r');
+      try {
+        const length = stat.size - state.offset;
+        const chunk = Buffer.alloc(length);
+        if (length) fs.readSync(fd, chunk, 0, length, state.offset);
+        state.offset = stat.size;
+        const combined = state.pending.length ? Buffer.concat([state.pending, chunk]) : chunk;
+        let cursor = 0;
+        let newline = combined.indexOf(0x0a, cursor);
+        while (newline !== -1) {
+          const line = combined.subarray(cursor, newline).toString('utf8').replace(/\r$/, '').trim();
+          cursor = newline + 1;
+          if (line && (line.includes('"event_msg"') || line.includes('"turn_context"'))) {
+            try { consumeUsageRecord(JSON.parse(line), state); } catch { /* 跳过写入中的坏行 */ }
+          }
+          newline = combined.indexOf(0x0a, cursor);
+        }
+        state.pending = combined.subarray(cursor);
+      } finally {
+        fs.closeSync(fd);
+      }
+
+      const excess = state.events.length - TAIL_CACHE_EVENTS;
+      if (excess > 0) {
+        state.events.splice(0, excess);
+        state.segmentStart = Math.max(0, state.segmentStart - excess);
+      }
+      remember(filePath, state);
+    }
+    return state.events.slice(-limit);
+  }
+
+  return read;
+}
+
+/**
  * 同一会话可能因续接、恢复或客户端重启产生多个 rollout 文件。
  * 数据库通常只记录主文件，而真实 token_count 可能只出现在续接文件中，
  * 因此必须比较全部候选，不能拿到第一个文件名命中就返回。
  */
-function resolveRolloutPath(home, sessionId) {
+function resolveRolloutPath(home, sessionId, readCandidateEvents = (candidate) => readUsageTail(candidate, 1)) {
   const candidates = [...new Set([
     ...resolveFromDatabases(home, sessionId),
     ...resolveByScan(home, sessionId),
@@ -225,7 +305,7 @@ function resolveRolloutPath(home, sessionId) {
     let events = [];
     let mtimeMs = 0;
     try {
-      events = readUsageTail(candidate, 1);
+      events = readCandidateEvents(candidate);
       mtimeMs = fs.statSync(candidate).mtimeMs;
     } catch {
       // 候选文件正被客户端追加时，下一次轮询可以重新尝试。
@@ -254,28 +334,46 @@ function unavailable(sessionId, message) {
   return { status: 'unavailable', session_id: sessionId, message, events: [] };
 }
 
-function createUsageLiveReader({ codexHome } = {}) {
+function createUsageLiveReader({ codexHome, resolutionTtlMs = DEFAULT_RESOLUTION_TTL_MS } = {}) {
   const home = path.resolve(String(codexHome || ''));
   const pathCache = new Map();
+  const readTail = createIncrementalUsageTail(EVENT_LIMIT);
+  const ttl = Number.isFinite(Number(resolutionTtlMs)) && Number(resolutionTtlMs) >= 0
+    ? Number(resolutionTtlMs)
+    : DEFAULT_RESOLUTION_TTL_MS;
+  const rememberPath = (id, rollout, now) => {
+    pathCache.delete(id);
+    pathCache.set(id, { path: rollout, checkedAt: now });
+    while (pathCache.size > MAX_CACHED_READERS) pathCache.delete(pathCache.keys().next().value);
+  };
+
   function read(sessionId) {
     const id = normalizeSessionId(sessionId);
     if (!id) return unavailable('', '会话 ID 无效');
-    let rollout = pathCache.get(id) || null;
-    if (rollout && fs.existsSync(rollout)) {
+    const now = Date.now();
+    const cached = pathCache.get(id);
+    let rollout = cached?.path || null;
+    const fresh = cached && now - cached.checkedAt < ttl && (!rollout || fs.existsSync(rollout));
+    if (fresh && rollout) {
       try {
-        const cachedEvents = readUsageTail(rollout);
+        const cachedEvents = readTail(rollout);
         if (cachedEvents.length) return { status: 'ok', session_id: id, events: cachedEvents };
       } catch {
-        // 文件被续接或替换时重新解析全部候选。
+        // 文件被续接或替换时，立即重新解析全部候选。
       }
-      // 空缓存不能长期保留：续接文件可能稍后写入首批用量事件。
-      pathCache.delete(id);
+    } else if (fresh && !rollout) {
+      return unavailable(id, '未找到本机会话记录');
     }
-    rollout = resolveRolloutPath(home, id);
-    if (!rollout) return unavailable(id, '未找到本机会话记录');
+
+    // 同一会话可能出现新的续接文件；即使旧路径仍可读，也要定期重新比较候选。
+    rollout = resolveRolloutPath(home, id, (candidate) => readTail(candidate).slice(-1));
+    if (!rollout) {
+      rememberPath(id, null, now);
+      return unavailable(id, '未找到本机会话记录');
+    }
     try {
-      const events = readUsageTail(rollout);
-      if (events.length) pathCache.set(id, rollout);
+      const events = readTail(rollout);
+      rememberPath(id, rollout, now);
       return { status: 'ok', session_id: id, events };
     } catch (error) {
       return unavailable(id, `会话记录暂不可读: ${error.message}`);

@@ -2981,6 +2981,17 @@ test('使用量页：完整 Token 列、兼容缓存字段与 usage 来源', asy
           total_tokens: 90,
         },
       },
+      {
+        at: now - 2, providerId: 'p_demo0001', providerName: '梦幻API',
+        model: 'p_demo0001__cache-unknown', upstreamModel: 'cache-unknown',
+        status: 200, ms: 800, cacheUsageAvailable: false,
+        tokens: {
+          input_tokens: 50,
+          input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
+          output_tokens: 5,
+          total_tokens: 55,
+        },
+      },
     ];
     const root = new FakeNode('main');
     usageMod.renderUsage(root, makeCtx(appMod, fixtureState({ logs })), new FakeNode('div'));
@@ -2996,7 +3007,7 @@ test('使用量页：完整 Token 列、兼容缓存字段与 usage 来源', asy
     assert.match(text, /来源/);
     const rows = findNodes(root, (n) => String(n.className || '').split(/\s+/).includes('usage-table-row'));
     const requestRows = rows.filter((n) => !String(n.className || '').split(/\s+/).includes('usage-table-head'));
-    assert.equal(requestRows.length, 2, '两条有 usage 的成功请求都应展示在明细中');
+    assert.equal(requestRows.length, 3, '三条有 usage 的成功请求都应展示在明细中');
 
     const estimated = requestRows.find((n) => n.textContent.includes('estimated-model'));
     assert.ok(estimated, '最近请求应展示渠道与模型名');
@@ -3022,6 +3033,11 @@ test('使用量页：完整 Token 列、兼容缓存字段与 usage 来源', asy
     assert.equal(upstreamCells[10], '90', '上游请求应展示 total_tokens');
     assert.equal(upstreamCells[11], '上游', '非估算 usage 请求应显示上游来源');
     assert.match(upstream.childNodes[11].className, /\bchip-ok\b/);
+
+    const unknownCache = requestRows.find((n) => n.textContent.includes('cache-unknown'));
+    assert.ok(unknownCache, '缓存字段缺失的请求也应保留明细');
+    const unknownCacheCells = unknownCache.childNodes.map((cell) => cell.textContent);
+    assert.equal(unknownCacheCells[5], '—', '上游未提供缓存字段时不能显示成 0.0%');
     assert.doesNotMatch(text, /p_demo0001__/);
     assert.match(text, /缓存命中率/);
   } finally {

@@ -79,10 +79,16 @@ function hasCacheUsage(raw) {
     raw &&
     typeof raw === 'object' &&
     (raw.input_tokens_details?.cached_tokens != null ||
+      raw.input_tokens_details?.cached_input_tokens != null ||
       raw.prompt_tokens_details?.cached_tokens != null ||
+      raw.cached_input_tokens != null ||
+      raw.cached_tokens != null ||
       raw.cache_read_input_tokens != null ||
       raw.prompt_cache_hit_tokens != null ||
-      raw.cache_creation_input_tokens != null)
+      raw.cache_creation_input_tokens != null ||
+      raw.cache_creation_tokens != null ||
+      raw.input_tokens_details?.cache_creation_tokens != null ||
+      raw.input_tokens_details?.cache_write_tokens != null)
   );
 }
 
@@ -97,59 +103,90 @@ function normalizeUsage(raw) {
   const output = asNumber(raw.output_tokens ?? raw.completion_tokens);
   const cached = asNumber(
     raw.input_tokens_details?.cached_tokens ??
+      raw.input_tokens_details?.cached_input_tokens ??
       raw.prompt_tokens_details?.cached_tokens ??
-      raw.cache_read_input_tokens ?? raw.prompt_cache_hit_tokens,
+      raw.cached_input_tokens ??
+      raw.cached_tokens ??
+      raw.cache_read_input_tokens ??
+      raw.prompt_cache_hit_tokens,
   );
   const cacheWrite = asNumber(
-    raw.input_tokens_details?.cache_write_tokens ?? raw.cache_creation_input_tokens,
+    raw.input_tokens_details?.cache_write_tokens ??
+      raw.input_tokens_details?.cache_creation_tokens ??
+      raw.cache_creation_input_tokens ??
+      raw.cache_creation_tokens,
   );
   const reasoning = asNumber(
-    raw.output_tokens_details?.reasoning_tokens ?? raw.completion_tokens_details?.reasoning_tokens,
+    raw.output_tokens_details?.reasoning_tokens ??
+      raw.completion_tokens_details?.reasoning_tokens ??
+      raw.reasoning_tokens,
   );
-  const total = asNumber(raw.total_tokens, input + output);
+  const computedTotal = input + output;
+  const reportedTotal = asNumber(raw.total_tokens, 0);
+  const total = reportedTotal >= computedTotal ? reportedTotal : computedTotal;
+  const normalizedCached = input > 0 ? Math.min(cached, input) : cached;
+  const normalizedCacheWrite = input > 0
+    ? Math.min(cacheWrite, Math.max(0, input - normalizedCached))
+    : cacheWrite;
   return {
     input_tokens: input,
-    input_tokens_details: { cached_tokens: cached, cache_write_tokens: cacheWrite },
+    input_tokens_details: { cached_tokens: normalizedCached, cache_write_tokens: normalizedCacheWrite },
     output_tokens: output,
-    output_tokens_details: { reasoning_tokens: reasoning },
-    total_tokens: total || input + output,
+    output_tokens_details: { reasoning_tokens: output > 0 ? Math.min(reasoning, output) : reasoning },
+    total_tokens: total,
   };
 }
 
 /**
- * 生成速度（tok/s）：输出 Token / 首个输出片段之后的耗时。
- * 首个输出片段包括思考、正文和工具参数，因此思考 Token 与思考耗时使用
- * 同一个时间窗口；拿不到首个输出计时时才退回整请求耗时。
+ * 平均生成速度（tok/s）：输出 Token / 本次上游请求总耗时。
+ *
+ * 不能只取首个流片段到结束的时间：部分中转会把思考或正文缓冲到接近结束时
+ * 才一次性下发，此时总输出 Token 不变、分母却只剩几百毫秒，会得到上千 tok/s。
+ * 整次请求耗时虽然包含首字等待，但它是所有上游都能可靠提供的统一口径。
  */
-function generationSpeed(rawUsage, elapsedMs, firstOutputMs) {
+function generationSpeed(rawUsage, elapsedMs) {
   const usage = normalizeUsage(rawUsage);
   const output = usage ? usage.output_tokens : 0;
   const totalMs = Number(elapsedMs);
   if (!(output > 0) || !(totalMs > 0)) return null;
-  const first = Number(firstOutputMs);
-  const activeMs = Number.isFinite(first) && first > 0 && first < totalMs ? totalMs - first : totalMs;
-  if (!(activeMs >= 50)) return null;
-  return output / (activeMs / 1000);
+  if (!(totalMs >= 50)) return null;
+  return output / (totalMs / 1000);
+}
+
+/** 无 tokenizer 时的混合文本估算：CJK/emoji 近似 1 Token，其余字符约 4 个 1 Token。 */
+function estimateTextTokens(value) {
+  if (typeof value !== 'string' || !value) return 0;
+  let cjk = 0;
+  let other = 0;
+  for (const character of value) {
+    const code = character.codePointAt(0);
+    if ((code >= 0x3400 && code <= 0x9fff) || (code >= 0x3040 && code <= 0x30ff) ||
+        (code >= 0xac00 && code <= 0xd7af) || (code >= 0x20000 && code <= 0x2fa1f) || code > 0xffff) {
+      cjk += 1;
+    } else {
+      other += 1;
+    }
+  }
+  return cjk + Math.ceil(other / 4);
 }
 
 /** 上游没给 usage 时的粗略估算（仅用于日志/展示，标注 estimated）。 */
 function estimateUsage(body, outputText) {
-  const chars = (value) => (typeof value === 'string' ? value.length : 0);
-  let inputChars = chars(body?.instructions);
+  const textTokens = (value) => estimateTextTokens(value);
+  let inputTokens = textTokens(body?.instructions);
   const input = body?.input;
-  if (typeof input === 'string') inputChars += input.length;
+  if (typeof input === 'string') inputTokens += textTokens(input);
   else if (Array.isArray(input)) {
     for (const item of input) {
-      if (typeof item === 'string') inputChars += item.length;
-      else if (item && typeof item.content === 'string') inputChars += item.content.length;
+      if (typeof item === 'string') inputTokens += textTokens(item);
+      else if (item && typeof item.content === 'string') inputTokens += textTokens(item.content);
       else if (item && Array.isArray(item.content)) {
-        for (const part of item.content) inputChars += chars(part?.text) + chars(part?.output);
-      } else inputChars += chars(item?.arguments) + chars(item?.output);
+        for (const part of item.content) inputTokens += textTokens(part?.text) + textTokens(part?.output);
+      } else inputTokens += textTokens(item?.arguments) + textTokens(item?.output);
     }
   }
-  const outChars = chars(outputText);
-  const inputTokens = Math.max(1, Math.round(inputChars / 4));
-  const outputTokens = Math.max(1, Math.round(outChars / 4));
+  inputTokens = Math.max(1, inputTokens);
+  const outputTokens = Math.max(1, textTokens(outputText));
   return {
     input_tokens: inputTokens,
     input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
@@ -316,7 +353,14 @@ class ResponsesStream {
   }
 
   get reasoningText() {
-    return this._reasoning ? this._reasoning.text : '';
+    const completed = this._items
+      .filter((entry) => entry.item.type === 'reasoning')
+      .flatMap((entry) => [
+        ...(entry.item.summary || []).map((part) => part?.text || ''),
+        ...(entry.item.content || []).map((part) => part?.text || ''),
+      ])
+      .join('');
+    return completed + (this._reasoning ? this._reasoning.text : '');
   }
 
   _send(type, extra) {
@@ -571,6 +615,11 @@ class ResponsesStream {
     if (this._finished) return this;
     this._finished = true;
     const outputText = this.text;
+    const estimateText = [
+      outputText,
+      this.reasoningText,
+      ...[...this._tools.values()].flatMap((tool) => [tool.name, tool.args]),
+    ].filter(Boolean).join('\n');
     if (usage) this.setUsage(usage);
     const pending = [];
     if (this._reasoning) pending.push({ kind: 'reasoning', outputIndex: this._reasoning.outputIndex });
@@ -588,7 +637,7 @@ class ResponsesStream {
     }
 
     if (!this._usage) {
-      this._usage = estimateUsage(requestBody, outputText);
+      this._usage = estimateUsage(requestBody, estimateText);
       this._usageEstimated = true;
     }
     const output = this._items
@@ -857,6 +906,8 @@ async function pipeResponsesSse(upstream, res, out) {
       && typeof json?.delta === 'string' && json.delta;
     const toolAdded = type === 'response.output_item.added'
       && (json?.item?.type === 'function_call' || json?.item?.type === 'custom_tool_call');
+    const outputDelta = textDelta || reasoningDelta || toolDelta;
+    if (outputDelta) out.estimateText = (out.estimateText || '') + outputDelta;
     // 首个输出片段：思考、正文、工具参数都要算。思考 Token 已经计入 usage.output_tokens，
     // 分母必须从思考开始时起算，否则 tok/s 会虚高。
     if (!out.firstOutputAt && (textDelta || reasoningDelta || toolDelta || toolAdded)) {
@@ -872,6 +923,7 @@ async function pipeResponsesSse(upstream, res, out) {
       out.terminal = true;
       out.usage = json?.response?.usage || null;
       out.outputText = extractResponseText(json?.response?.output);
+      out.estimateText = extractResponseEstimateText(json?.response?.output) || out.estimateText || '';
       out.toolCalls = countLoopToolItems(json?.response?.output);
     } else if (type === 'response.failed') {
       const err = json?.response?.error;
@@ -931,6 +983,29 @@ function extractResponseText(output) {
     if (!item || item.type === 'reasoning' || !Array.isArray(item.content)) return [];
     return item.content.map((part) => part && (part.text || part.refusal)).filter(Boolean);
   }).join('');
+}
+
+/** 无 usage 时用于估算全部生成内容，包含可见正文、思考与工具参数。 */
+function extractResponseEstimateText(output) {
+  if (!Array.isArray(output)) return '';
+  const parts = [];
+  for (const item of output) {
+    if (!item || typeof item !== 'object') continue;
+    if (item.type === 'message') {
+      for (const part of Array.isArray(item.content) ? item.content : []) {
+        if (part && (part.text || part.refusal)) parts.push(part.text || part.refusal);
+      }
+    } else if (item.type === 'reasoning') {
+      for (const part of [...(item.summary || []), ...(item.content || [])]) {
+        if (part && typeof part.text === 'string') parts.push(part.text);
+      }
+    } else if (item.type === 'function_call' || item.type === 'custom_tool_call') {
+      if (item.name) parts.push(item.name);
+      if (item.arguments) parts.push(item.arguments);
+      if (item.input) parts.push(item.input);
+    }
+  }
+  return parts.filter(Boolean).join('\n');
 }
 
 /**
@@ -1107,6 +1182,7 @@ module.exports = {
   buildResponseObject,
   countLoopToolItems,
   estimateUsage,
+  extractResponseEstimateText,
   extractErrorMessage,
   extractResponseText,
   generationSpeed,

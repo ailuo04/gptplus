@@ -468,7 +468,15 @@ class ChatCompletionsStream {
     if (this._finished) return this;
     this._finished = true;
     this.finishReason = finishReason;
-    if (!this._usage) { this._usage = estimateUsage(requestBody, this._text); this._usageEstimated = true; }
+    if (!this._usage) {
+      const estimateText = [
+        this._text,
+        this._reasoning,
+        ...[...this._tools.values()].flatMap((tool) => [tool.name, tool.args]),
+      ].filter(Boolean).join('\n');
+      this._usage = estimateUsage(requestBody, estimateText);
+      this._usageEstimated = true;
+    }
     const choice = { index: 0, delta: {}, finish_reason: finishReasonForChat(finishReason, this._tools.size > 0) };
     const payload = { id: this.id, object: 'chat.completion.chunk', created: this.created, model: this.model, choices: [choice] };
     this._send(payload);
@@ -489,6 +497,7 @@ class AnthropicMessagesStream {
     this._cacheUsageAvailable = false;
     this._finished = false;
     this._text = '';
+    this._reasoning = '';
     this._active = null;
     this._nextIndex = 0;
     this._tools = new Map();
@@ -519,7 +528,7 @@ class AnthropicMessagesStream {
     return state;
   }
   textDelta(delta) { if (!delta) return; this._text += delta; const state = this._ensure('text'); this._send({ type: 'content_block_delta', index: state.index, delta: { type: 'text_delta', text: delta } }); }
-  reasoningDelta(delta) { if (!delta) return; const state = this._ensure('thinking'); this._send({ type: 'content_block_delta', index: state.index, delta: { type: 'thinking_delta', thinking: delta } }); }
+  reasoningDelta(delta) { if (!delta) return; this._reasoning += delta; const state = this._ensure('thinking'); this._send({ type: 'content_block_delta', index: state.index, delta: { type: 'thinking_delta', thinking: delta } }); }
   reasoningSignature(delta) { if (!delta) return; const state = this._ensure('thinking'); this._send({ type: 'content_block_delta', index: state.index, delta: { type: 'signature_delta', signature: delta } }); }
   reasoningDone() { if (this._active?.type === 'thinking') this._closeActive(); }
   textDone() { if (this._active?.type === 'text') this._closeActive(); }
@@ -537,7 +546,15 @@ class AnthropicMessagesStream {
   complete({ requestBody, finishReason } = {}) {
     if (this._finished) return this;
     const tools = [...this._tools.values()].map((state) => ({ ...state, input: parseToolArguments(state.args || '{}') }));
-    if (!this._usage) { this._usage = estimateUsage(requestBody, this._text); this._usageEstimated = true; }
+    if (!this._usage) {
+      const estimateText = [
+        this._text,
+        this._reasoning,
+        ...[...this._tools.values()].flatMap((tool) => [tool.name, tool.args]),
+      ].filter(Boolean).join('\n');
+      this._usage = estimateUsage(requestBody, estimateText);
+      this._usageEstimated = true;
+    }
     this._closeActive();
     for (const tool of tools) {
       const index = this._nextIndex++;

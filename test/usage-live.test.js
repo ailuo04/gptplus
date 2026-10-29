@@ -5,11 +5,12 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { createUsageLiveReader } = require('../src/core/usage-live.js');
+const { createUsageLiveReader, usageEvent } = require('../src/core/usage-live.js');
 const { buildUsageStatuslineScript } = require('../src/core/usage-statusline.js');
 const {
   launchChatGptWithUsageStatusline,
   resumeUsageStatusline,
+  startUsageStatuslineBridge,
   usageStatuslineEndpoint,
 } = require('../src/core/chatgpt-statusline.js');
 
@@ -61,6 +62,53 @@ test('live usage reader prefers a continuation rollout that contains token_count
   assert.equal(reader.resolveRolloutPath(id), continuation, '空的主 rollout 不能遮蔽包含用量的续接文件');
 });
 
+test('live usage reader incrementally exposes newly appended token_count events', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gptplus-usage-live-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const sessions = path.join(home, 'sessions', '2026', '10', '29');
+  fs.mkdirSync(sessions, { recursive: true });
+  const id = 'thread_incremental_1';
+  const file = path.join(sessions, `${id}.jsonl`);
+  const first = [
+    { type: 'turn_context', payload: { turn_id: 'turn_live' } },
+    { type: 'event_msg', timestamp: '2026-10-29T01:00:00.000Z', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, output_tokens: 10, total_tokens: 110 }, total_token_usage: { output_tokens: 10 }, model_context_window: 1000 } } },
+  ];
+  fs.writeFileSync(file, first.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const reader = createUsageLiveReader({ codexHome: home });
+  assert.equal(reader.read(id).events.at(-1).turn_output_tokens, 10);
+
+  const next = { type: 'event_msg', timestamp: '2026-10-29T01:00:01.000Z', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, output_tokens: 20, total_tokens: 120 }, total_token_usage: { output_tokens: 30 }, model_context_window: 1000 } } };
+  fs.appendFileSync(file, `${JSON.stringify(next)}\n`, 'utf8');
+  const updated = reader.read(id);
+  assert.equal(updated.events.length, 2);
+  assert.equal(updated.events.at(-1).turn_output_tokens, 30);
+  assert.equal(updated.events.filter((event) => event.output_tokens === 10).length, 1, '旧事件不能被重复解析');
+});
+
+test('live usage reader refreshes path resolution when a newer continuation appears', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gptplus-usage-live-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const sessions = path.join(home, 'sessions', '2026', '10', '29');
+  fs.mkdirSync(sessions, { recursive: true });
+  const id = 'thread_continuation_2';
+  const primary = path.join(sessions, `${id}.jsonl`);
+  fs.writeFileSync(primary, [
+    JSON.stringify({ type: 'turn_context', payload: { turn_id: 'turn_old' } }),
+    JSON.stringify({ type: 'event_msg', timestamp: '2026-10-29T01:00:00.000Z', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, output_tokens: 10, total_tokens: 110 }, total_token_usage: { output_tokens: 10 }, model_context_window: 1000 } } }),
+  ].join('\n') + '\n');
+  const reader = createUsageLiveReader({ codexHome: home, resolutionTtlMs: 0 });
+  assert.equal(reader.read(id).events.at(-1).turn_output_tokens, 10);
+
+  const continuation = path.join(sessions, `rollout-2026-10-29T01-00-01-${id}.jsonl`);
+  fs.writeFileSync(continuation, [
+    JSON.stringify({ type: 'turn_context', payload: { turn_id: 'turn_new' } }),
+    JSON.stringify({ type: 'event_msg', timestamp: '2026-10-29T01:00:02.000Z', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, output_tokens: 20, total_tokens: 120 }, total_token_usage: { output_tokens: 20 }, model_context_window: 1000 } } }),
+  ].join('\n') + '\n');
+  const updated = reader.read(id);
+  assert.equal(updated.events.at(-1).turn_output_tokens, 20);
+  assert.equal(reader.resolveRolloutPath(id), continuation);
+});
+
 test('live usage reader rejects invalid ids and rollout paths outside session folders', (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gptplus-usage-live-'));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
@@ -71,6 +119,22 @@ test('live usage reader rejects invalid ids and rollout paths outside session fo
   assert.equal(reader.read('../thread_12345678').status, 'unavailable');
   assert.equal(reader.read('constructor').status, 'unavailable');
   assert.equal(reader.read('thread_12345678').status, 'unavailable');
+});
+
+test('usage event derives total Tokens when the rollout omits total_tokens', () => {
+  const event = usageEvent({
+    type: 'event_msg',
+    timestamp: '2026-10-29T02:00:00.000Z',
+    payload: {
+      type: 'token_count',
+      info: {
+        last_token_usage: { input_tokens: 100, cached_input_tokens: 40, output_tokens: 20 },
+        model_context_window: 1000,
+      },
+    },
+  }, 'turn_1');
+
+  assert.equal(event.total_tokens, 120);
 });
 
 test('usage statusline script retains the composer placement, icons, and valid syntax', () => {
@@ -87,13 +151,16 @@ test('usage statusline script retains the composer placement, icons, and valid s
   assert.match(script, /if \(!document\.body\)/, 'must wait for body before observing');
   assert.match(script, /__gptplusUsageStatusline/);
   assert.match(script, /READY_WAIT_MS = 2000/);
-  assert.match(script, /gptplus-usage-statusline-v4/);
-  assert.match(script, /request\?\.speed/);
+  assert.match(script, /SYNC_INTERVAL_MS = 1000/);
+  assert.match(script, /gptplus-usage-statusline-v7/);
+  assert.match(script, /request\.speed/);
   assert.match(script, /function apply\(id, events, request\)/);
-  assert.match(script, /requestAt >= time - STALE_MS/);
-  assert.match(script, /color:" \+ textColor \+ "!important/);
-  assert.match(script, /gptplus-usage-item svg\{flex:0 0 auto;opacity:1\}/);
-  assert.match(script, /data-stale=.*gptplus-usage-item\{opacity:\.55\}/);
+  assert.match(script, /requestTime >= latestTime - 15000/);
+  assert.match(script, /opacity:1!important/);
+  assert.match(script, /color:var\(--color-token-text-primary,#000\)!important/);
+  assert.ok(script.includes('html[data-theme=\\"light\\"] #gptplus-codex-usage-statusline'));
+  assert.match(script, /gptplus-usage-item svg\{flex:0 0 auto\}/);
+  assert.doesNotMatch(script, /data-stale=.*gptplus-usage-item\{opacity:\.55\}/);
   assert.doesNotMatch(script, /fetch\(endpoint/);
 });
 
@@ -137,12 +204,18 @@ test('statusline launch starts the gateway first and shares one CDP injection pa
 
 test('statusline launch starts a data bridge when a live usage reader is available', async () => {
   const bridged = [];
+  let subscriptions = 0;
   const result = await launchChatGptWithUsageStatusline({
     ctx: {
       store: { get: () => ({ gateway: {} }) },
       gateway: {
         getState: () => ({ running: true, port: 18120, host: '127.0.0.1' }),
         start: async () => {},
+        on: (event) => {
+          assert.equal(event, 'log');
+          subscriptions += 1;
+          return () => {};
+        },
       },
       usageLive: { read: (id) => ({ status: 'ok', session_id: id, events: [] }) },
       log: () => {},
@@ -161,9 +234,97 @@ test('statusline launch starts a data bridge when a live usage reader is availab
   assert.equal(bridged[0].cdpPort, 9333);
   assert.equal(typeof bridged[0].read, 'function');
   assert.equal(typeof bridged[0].requestSpeed, 'function');
+  assert.equal(typeof bridged[0].subscribe, 'function');
+  bridged[0].subscribe(() => {});
+  assert.equal(subscriptions, 1);
   assert.deepEqual(bridged[0].read('thread_12345678'), {
     status: 'ok', session_id: 'thread_12345678', events: [],
   });
+});
+
+test('statusline bridge pushes a completed gateway request even when rollout is not ready', async () => {
+  const applied = [];
+  const bridge = startUsageStatuslineBridge({
+    cdpPort: 9335,
+    read: () => { throw new Error('rollout is still being written'); },
+    requestSpeed: () => ({
+      at: Date.now(), speed: 25, inputTokens: 400, cachedInputTokens: 300,
+      outputTokens: 50, totalTokens: 450, cacheUsageAvailable: true,
+    }),
+    listTargetsImpl: async () => [{
+      id: 'page-1', type: 'page', title: 'Codex', url: 'app://-/index.html',
+    }],
+    evaluateImpl: async (_page, expression) => {
+      if (expression.includes('context?.()')) return { id: 'thread_gateway_only', hidden: false };
+      applied.push(expression);
+      return true;
+    },
+    visibleIntervalMs: 5,
+    hiddenIntervalMs: 5,
+  });
+  try {
+    const deadline = Date.now() + 1000;
+    while (!applied.length && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  } finally {
+    bridge.stop();
+  }
+  assert.equal(applied.length > 0, true, 'rollout 未就绪时也应推送网关请求数据');
+  assert.match(applied[0], /thread_gateway_only/);
+  assert.match(applied[0], /"speed":25/);
+  assert.match(applied[0], /null, \{"at"/);
+});
+
+test('statusline bridge wakes immediately when a gateway request completes', async () => {
+  let request = null;
+  let notify = null;
+  let contextCalls = 0;
+  const applied = [];
+  const bridge = startUsageStatuslineBridge({
+    cdpPort: 9336,
+    read: () => ({ status: 'unavailable', session_id: 'thread_event_driven', events: [] }),
+    requestSpeed: () => request,
+    subscribe: (callback) => {
+      notify = callback;
+      return () => { notify = null; };
+    },
+    listTargetsImpl: async () => [{
+      id: 'page-2', type: 'page', title: 'Codex', url: 'app://-/index.html',
+    }],
+    evaluateImpl: async (_page, expression) => {
+      if (expression.includes('context?.()')) {
+        contextCalls += 1;
+        return { id: 'thread_event_driven', hidden: false };
+      }
+      applied.push(expression);
+      return true;
+    },
+    visibleIntervalMs: 5000,
+    hiddenIntervalMs: 5000,
+  });
+  try {
+    const initialDeadline = Date.now() + 500;
+    while ((contextCalls < 1 || typeof notify !== 'function') && Date.now() < initialDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(typeof notify, 'function');
+    request = {
+      at: Date.now(), speed: 25, inputTokens: 400, cachedInputTokens: 300,
+      outputTokens: 50, totalTokens: 450, cacheUsageAvailable: true,
+    };
+    const started = Date.now();
+    notify({ final: true, status: 200, sessionId: 'thread_event_driven' });
+    const deadline = started + 500;
+    while (!applied.length && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.ok(applied.length > 0, '完成事件应立即唤醒数据推送');
+    assert.ok(Date.now() - started < 500, '不应等待下一轮 5 秒轮询');
+    assert.match(applied[0], /"speed":25/);
+  } finally {
+    bridge.stop();
+  }
 });
 
 test('statusline gateway endpoint supports loopback binding and rejects a stopped gateway', () => {

@@ -84,16 +84,16 @@ function modelBreakdownKey(entry) {
 
 function hasCacheUsage(entry) {
   const usage = entry?.tokens && typeof entry.tokens === 'object' ? entry.tokens : {};
-  return entry?.cacheUsageAvailable === true ||
-    Object.prototype.hasOwnProperty.call(usage, 'cached_tokens') ||
+  if (entry?.cacheUsageAvailable === false) return false;
+  if (entry?.cacheUsageAvailable === true) return true;
+  const explicit = Object.prototype.hasOwnProperty.call(usage, 'cached_tokens') ||
     Object.prototype.hasOwnProperty.call(usage, 'cache_read_input_tokens') ||
     Object.prototype.hasOwnProperty.call(usage, 'cache_creation_input_tokens') ||
     Object.prototype.hasOwnProperty.call(usage, 'cache_write_tokens') ||
-    Object.prototype.hasOwnProperty.call(usage.input_tokens_details || {}, 'cached_tokens') ||
-    Object.prototype.hasOwnProperty.call(usage.input_tokens_details || {}, 'cache_write_tokens') ||
     Object.prototype.hasOwnProperty.call(usage.prompt_tokens_details || {}, 'cached_tokens') ||
     cachedTokenCount(entry) > 0 ||
     cacheWriteTokenCount(entry) > 0;
+  return explicit;
 }
 
 function cacheHitRate(entry) {

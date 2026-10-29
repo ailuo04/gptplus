@@ -1,5 +1,7 @@
 'use strict';
 
+const { buildUsageStatuslineStyle, computeUsageSnapshot, mergeUsageCacheEntry } = require('./usage-metrics.js');
+
 function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
   const readyWait = Math.max(500, Number(readyWaitMs) || 12000);
   const selectedMetrics = {
@@ -14,10 +16,12 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
   const ID = "gptplus-codex-usage-statusline";
   const STYLE_ID = "gptplus-codex-usage-statusline-style";
   const EXT_ATTR = "data-gptplus-usage-statusline";
-  const STALE_MS = 120000;
   const CIRCUMFERENCE = 37.7;
-  const SYNC_INTERVAL_MS = 5000;
-  const runtimeKey = "gptplus-usage-statusline-v4";
+  const SYNC_INTERVAL_MS = 1000;
+  const runtimeKey = "gptplus-usage-statusline-v7";
+  const STYLE_TEXT = ${JSON.stringify(buildUsageStatuslineStyle())};
+  const computeUsageSnapshot = ${computeUsageSnapshot.toString()};
+  const mergeUsageCacheEntry = ${mergeUsageCacheEntry.toString()};
   if (globalThis.__gptplusUsageStatuslineRuntime === runtimeKey && globalThis.__gptplusUsageStatusline) {
     return { ok: true, installed: true, reused: true };
   }
@@ -62,8 +66,8 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
 
   function ringIcon() {
     const icon = svgIcon([
-      { tag: "circle", attrs: { cx: "8", cy: "8", r: "6", "stroke-opacity": ".3" } },
-      { tag: "circle", attrs: { cx: "8", cy: "8", r: "6", "stroke-dasharray": "0 " + CIRCUMFERENCE, transform: "rotate(-90 8 8)" } },
+      { tag: "circle", attrs: { cx: "8", cy: "8", r: "6", "stroke-width": "1", "stroke-opacity": "1" } },
+      { tag: "circle", attrs: { cx: "8", cy: "8", r: "6", "stroke-width": "2.2", "stroke-dasharray": "0 " + CIRCUMFERENCE, transform: "rotate(-90 8 8)" } },
     ]);
     return { svg: icon.svg, ring: icon.created[1] };
   }
@@ -143,67 +147,6 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
     return node;
   }
 
-  function percent(numerator, denominator) {
-    if (!(denominator > 0) || !(numerator >= 0)) return null;
-    return Math.min(100, Math.max(0, numerator / denominator * 100));
-  }
-
-  function latestTurn(events) {
-    if (!Array.isArray(events) || !events.length) return [];
-    let start = events.length - 1;
-    const id = events[start].turn_id;
-    if (typeof id === "string" && id) while (start > 0 && events[start - 1].turn_id === id) start -= 1;
-    return events.slice(start);
-  }
-
-  function cacheRate(events) {
-    let input = 0;
-    let cached = 0;
-    for (const event of latestTurn(events)) {
-      const value = Number(event.input_tokens) || 0;
-      if (value > 0) {
-        input += value;
-        cached += Math.max(0, Math.min(Number(event.cached_input_tokens) || 0, value));
-      }
-    }
-    return input > 0 ? percent(cached, input) : null;
-  }
-
-  function speedRate(events) {
-    const segment = latestTurn(events);
-    const rates = [];
-    for (let i = 1; i < segment.length; i += 1) {
-      const before = segment[i - 1];
-      const current = segment[i];
-      const delta = (Number(current.turn_output_tokens) || 0) - (Number(before.turn_output_tokens) || 0);
-      const seconds = (Date.parse(current.t) - Date.parse(before.t)) / 1000;
-      if (delta <= 0 || seconds < 0.5 || seconds > 120) continue;
-      rates.push(delta / seconds);
-    }
-    if (!rates.length) return null;
-    const recent = rates.slice(-3);
-    return recent.reduce((sum, value) => sum + value, 0) / recent.length;
-  }
-
-  function snapshot(events, request) {
-    if (!Array.isArray(events) || !events.length) return null;
-    const latest = events[events.length - 1];
-    const time = Date.parse(latest.t);
-    const requestSpeed = Number(request?.speed);
-    const requestAt = Number(request?.at);
-    // 网关按「整轮输出 Token / 首个输出片段后的耗时」计算，思考阶段也计入；
-    // rollout 事件间隔包含工具执行时间，只作为没有网关数据时的兜底。
-    const useRequest = Number.isFinite(requestSpeed) && requestSpeed > 0
-      && (!Number.isFinite(time) || !Number.isFinite(requestAt) || requestAt >= time - STALE_MS);
-    return {
-      speed: useRequest ? requestSpeed : speedRate(events),
-      cache: cacheRate(events),
-      context: percent(Number(latest.total_tokens), Number(latest.context_window)),
-      stale: Number.isFinite(time) ? Date.now() - time > STALE_MS : false,
-      window: Number(latest.context_window) || 0,
-    };
-  }
-
   function render(value) {
     const node = state.node;
     if (!node?.isConnected) return;
@@ -212,7 +155,13 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
     const speed = value?.speed == null ? "--" : String(Math.max(0, Math.round(value.speed)));
     const cache = value?.cache == null ? "--" : value.cache.toFixed(1) + "%";
     const context = value?.context == null ? "--" : Math.round(value.context) + "%";
-    const fingerprint = [speed, cache, context, value?.stale === true, value?.window || 0].join("|");
+    const fingerprint = [
+      speed, cache, context,
+      value?.speedEstimated === true,
+      value?.cacheEstimated === true,
+      value?.contextEstimated === true,
+      value?.window || 0,
+    ].join("|");
     if (fingerprint === state.fingerprint) return;
     state.fingerprint = fingerprint;
     if (parts.speed) parts.speed.textContent = labels.speed(speed);
@@ -222,12 +171,11 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
       const filled = value?.context == null ? 0 : value.context / 100 * CIRCUMFERENCE;
       parts.ring.setAttribute("stroke-dasharray", filled.toFixed(2) + " " + CIRCUMFERENCE);
     }
-    node.dataset.stale = String(value?.stale === true);
     node.dataset.hidden = String(Object.keys(parts).length === 0);
     const details = [];
-    if (parts.speed) details.push("生成速度 " + speed + " tok/s");
-    if (parts.cache) details.push("缓存命中 " + cache);
-    if (parts.context) details.push("上下文占用 " + context);
+    if (parts.speed) details.push("平均生成速度 " + speed + " tok/s" + (value?.speedEstimated ? "（估算）" : ""));
+    if (parts.cache) details.push("缓存命中 " + cache + (value?.cacheEstimated ? "（估算）" : ""));
+    if (parts.context) details.push("上下文占用 " + context + (value?.contextEstimated ? "（估算）" : ""));
     if (parts.context && value?.window > 0) details.push("窗口 " + value.window);
     node.title = details.join(" · ");
     node.setAttribute("aria-label", labels.aria + "：" + details.join("，"));
@@ -246,18 +194,18 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
     state.threadId = id;
     ensureNode(card);
     const cached = state.cache.get(id);
-    render(snapshot(cached?.events, cached?.request));
+    render(computeUsageSnapshot(cached?.events, cached?.request));
     return { id, changed: id !== previous };
   }
 
   function apply(id, events, request) {
     if (state.disposed) return false;
     const key = String(id || "").trim();
-    if (!key || !Array.isArray(events)) return false;
-    state.cache.set(key, {
-      events: events.slice(-24),
-      request: request && typeof request === "object" ? request : null,
-    });
+    if (!key) return false;
+    const previous = state.cache.get(key);
+    const merged = mergeUsageCacheEntry(previous, events, request);
+    if (!merged) return false;
+    state.cache.set(key, merged);
     while (state.cache.size > 32) state.cache.delete(state.cache.keys().next().value);
     sync();
     return true;
@@ -280,8 +228,7 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
       const style = document.createElement("style");
       style.id = STYLE_ID;
       style.setAttribute(EXT_ATTR, "true");
-      const textColor = "color-mix(in srgb,var(--color-token-text-primary,#dfdfdf) 82%,transparent)";
-      style.textContent = "#" + ID + "{display:flex;align-items:center;justify-content:center;gap:24px;box-sizing:border-box;width:100%;margin:6px 0 0;padding:0 10px;font:inherit;font-size:12px;line-height:17px;color:" + textColor + ";user-select:none;cursor:default}#" + ID + "[data-hidden=\\\"true\\\"]{display:none}#" + ID + " .gptplus-usage-item{display:inline-flex;align-items:center;gap:5px;white-space:nowrap;font-variant-numeric:tabular-nums;transition:opacity .2s}#" + ID + " .gptplus-usage-item,#" + ID + " .gptplus-usage-value,#" + ID + " .gptplus-usage-item svg{color:" + textColor + "!important}#" + ID + " .gptplus-usage-value{font-weight:500}#" + ID + " .gptplus-usage-item svg{flex:0 0 auto;opacity:1}#" + ID + "[data-stale=\\\"true\\\"] .gptplus-usage-item{opacity:.55}";
+      style.textContent = STYLE_TEXT;
       document.head?.appendChild(style);
     }
     document.getElementById(ID)?.remove();
