@@ -1726,6 +1726,37 @@ test('provider-client: 按 Anthropic 与 Responses 协议构造最小生成请�
   assert.equal(requests[1].body.model, 'gpt-test');
 });
 
+test('provider-client: 模型测试不会用上游拒绝的极小输出上限', async (t) => {
+  let requestBody = null;
+  const { server, url } = await startServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    requestBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    if (requestBody.max_output_tokens < 16) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'Upstream request failed' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ id: 'resp_test', status: 'completed', output: [] }));
+  });
+  closeServer(t, server);
+  const dir = tmpDir('pc-model-min-output');
+  cleanup(t, dir);
+  const store = createStore({ configPath: path.join(dir, 'config.json') });
+  const provider = store.upsertProvider({
+    name: 'fapi-compatible', baseUrl: url, apiKey: 'sk-test', api: 'responses',
+    models: [{ id: 'gpt-test' }],
+  });
+  const client = createProviderClient({ store });
+
+  const result = await client.testProviderModels(provider.id, ['gpt-test']);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.results[0].ok, true);
+  assert.ok(requestBody.max_output_tokens >= 16);
+});
+
 test('provider-client: 401 / 非 JSON / 连接失败 / 未知 id 都返回结构化结果', async (t) => {
   const dir = tmpDir('pc-err');
   cleanup(t, dir);

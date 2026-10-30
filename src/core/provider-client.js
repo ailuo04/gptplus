@@ -2,6 +2,7 @@
 // 提供商连通性测试 / 远端模型拉取（契约见 spec.md 第 8 节）。
 // 纯 Node CommonJS，自动跟随 Windows 系统代理，绝不把异常抛给调用方。
 const DEFAULT_TIMEOUT = 10000;
+const MODEL_TEST_MAX_OUTPUT_TOKENS = 64;
 
 const { stripEndpoint } = require('./base-url.js');
 const { redactDiagnostic } = require('./redact.js');
@@ -274,7 +275,7 @@ function createProviderClient({ store, timeoutMs = DEFAULT_TIMEOUT, fetchImpl } 
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), limit);
       try {
-        const body = { input: 'Reply OK.', max_output_tokens: 1, stream: false };
+        const body = { input: 'Reply OK.', max_output_tokens: MODEL_TEST_MAX_OUTPUT_TOKENS, stream: false };
         const builder = provider.api === 'anthropic'
           ? buildAnthropicRequest
           : provider.api === 'responses' ? buildResponsesRequest : buildChatRequest;
