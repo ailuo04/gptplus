@@ -54,7 +54,7 @@ const { createWindowLifecycle } = require('./window-lifecycle.js');
 const { TRAY_ICON_DATA_URL } = require('./tray-icon.js');
 const { setupAutoUpdater, cleanupInstalledUpdateCache } = require('./updater.js');
 const { autoUpdater } = require('electron-updater');
-const { launchChatGptAndVerify, findChatGptDebugPort } = require('../core/chatgpt-launch.js');
+const { launchChatGptAndVerify, relaunchChatGpt, findChatGptDebugPort } = require('../core/chatgpt-launch.js');
 const {
   disposeUsageStatusline,
   launchChatGptWithUsageStatusline,
@@ -247,7 +247,7 @@ async function launchChatGptAtLogin(commandLine = process.argv) {
         ctx,
         launchOptions: { preferredPath },
         wrapperDir: path.join(ctx.paths.APP_DIR, 'cdp'),
-        launch: (options) => launchChatGptAndVerify({ preferredPath, ...options }),
+        launch: (options) => relaunchChatGpt({ preferredPath, ...options }),
       });
       if (result?.ok && voiceInputEnabled && result.cdpPort) {
         try {

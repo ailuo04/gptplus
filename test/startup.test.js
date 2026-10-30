@@ -36,17 +36,39 @@ function setup(options = {}) {
   };
   const sandbox = {
     app,
+    path,
     process: { platform: options.platform || 'win32', argv: options.argv || ['gpt-plus.exe', '--gptplus-startup'] },
     isDev: options.isDev === true,
     isSmoke: options.isSmoke === true,
     ctx: {
       store: { get: () => config, update: (fn) => fn(config) },
       log: (entry) => logs.push(entry),
+      ...(options.activePlugins ? {
+        gateway: {},
+        paths: { APP_DIR: 'C:\\gptplus' },
+        plugins: { isActive: (id) => options.activePlugins.includes(id) },
+      } : {}),
     },
     launchChatGptAndVerify: async (launchOptions) => {
       calls.push({ type: 'launch', preferredPath: launchOptions.preferredPath });
       if (options.launchError) throw new Error(options.launchError);
       return options.launchResult || { ok: true, exe: 'C:\\ChatGPT.exe', pid: 1234 };
+    },
+    relaunchChatGpt: async (launchOptions) => {
+      calls.push({
+        type: 'relaunch',
+        preferredPath: launchOptions.preferredPath,
+        cdpPort: launchOptions.cdpPort,
+        wrapperDir: launchOptions.wrapperDir,
+      });
+      if (options.launchError) throw new Error(options.launchError);
+      return options.launchResult || { ok: true, exe: 'C:\\ChatGPT.exe', pid: 1234, cdpPort: launchOptions.cdpPort };
+    },
+    launchChatGptWithUsageStatusline: async ({ launch, launchOptions, wrapperDir }) => {
+      return launch({ ...launchOptions, cdpPort: 9229, wrapperDir });
+    },
+    launchChatGptWithVoiceInput: async ({ launch, launchOptions, wrapperDir }) => {
+      return launch({ ...launchOptions, cdpPort: 9229, wrapperDir });
     },
   };
   const api = vm.runInNewContext(`${startupSource}\n({
@@ -58,6 +80,23 @@ function setup(options = {}) {
 
 test('Windows login marker launches ChatGPT even though wasOpenedAtLogin is false', async () => {
   const { api, calls } = setup();
+  await api.launch();
+  assert.deepEqual(calls, [{ type: 'launch', preferredPath: null }]);
+});
+
+test('login launch restarts ChatGPT with CDP when the usage statusline is active', async () => {
+  const { api, calls } = setup({ activePlugins: ['usage-statusline'] });
+  await api.launch();
+  assert.deepEqual(calls, [{
+    type: 'relaunch',
+    preferredPath: null,
+    cdpPort: 9229,
+    wrapperDir: 'C:\\gptplus\\cdp',
+  }]);
+});
+
+test('login launch keeps normal activation when no CDP plugin is active', async () => {
+  const { api, calls } = setup({ activePlugins: [] });
   await api.launch();
   assert.deepEqual(calls, [{ type: 'launch', preferredPath: null }]);
 });
