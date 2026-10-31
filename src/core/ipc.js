@@ -186,24 +186,53 @@ function registerIpc(deps) {
   };
 
   // ---- 状态 ----
+  const pluginWithRuntime = (plugin) => plugin && plugin.id === 'chatgpt-plugin-catalog'
+    ? { ...plugin, catalogStatus: ctx.chatgptPluginRecovery?.status?.() || null } : plugin;
+
+  async function changeCatalogPlugin(enabled, persist) {
+    const recovery = ctx.chatgptPluginRecovery;
+    if (!recovery) throw new Error('ChatGPT 插件目录修复功能不可用');
+    const previous = plugins.get('chatgpt-plugin-catalog');
+    if (enabled && !previous.installed) throw new Error('请先安装插件');
+    const result = await recovery.setEnabled(enabled);
+    try {
+      return pluginWithRuntime(persist());
+    } catch (err) {
+      if (result.changed) {
+        try { result.rollback(); }
+        catch (rollbackError) {
+          throw new Error('插件状态保存失败，配置回退也失败，请检查 Codex 配置及备份：' + rollbackError.message);
+        }
+      }
+      throw err;
+    }
+  }
+
   handle('gptplus:status:get', () => ctx.status());
-  handle('gptplus:plugin:list', () => plugins ? plugins.list() : []);
+  handle('gptplus:plugin:list', () => plugins ? plugins.list().map(pluginWithRuntime) : []);
   handle('gptplus:plugin:install', (id) => {
     if (!plugins) throw new Error('插件管理器不可用');
-    return plugins.install(id);
+    if (id === 'chatgpt-plugin-catalog' && plugins.get(id).installed) return pluginWithRuntime(plugins.get(id));
+    return pluginWithRuntime(plugins.install(id));
   });
   handle('gptplus:plugin:uninstall', async (id) => {
     if (!plugins) throw new Error('插件管理器不可用');
     const plugin = plugins.get(id);
     if (plugin.id === 'weixin') await ctx.weixinConnect?.stop?.({ persist: false });
-    return plugins.uninstall(id);
+    if (plugin.id === 'chatgpt-plugin-catalog') {
+      return changeCatalogPlugin(false, () => plugins.uninstall(id));
+    }
+    return pluginWithRuntime(plugins.uninstall(id));
   });
   handle('gptplus:plugin:enabled:set', async (patch = {}) => {
     if (!plugins) throw new Error('插件管理器不可用');
     const id = String(patch.id || '').trim();
     const enabled = patch.enabled === true;
     if (!enabled && id === 'weixin') await ctx.weixinConnect?.stop?.({ persist: false });
-    return plugins.setEnabled(id, enabled);
+    if (id === 'chatgpt-plugin-catalog') {
+      return changeCatalogPlugin(enabled, () => plugins.setEnabled(id, enabled));
+    }
+    return pluginWithRuntime(plugins.setEnabled(id, enabled));
   });
   handle('gptplus:plugin:config:set', (patch = {}) => {
     if (!plugins) throw new Error('插件管理器不可用');

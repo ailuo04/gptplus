@@ -18,6 +18,7 @@ const { slugForProvider, orderModels, modelKey } = require('./model-utils.js');
 const { redactDiagnostic } = require('./redact.js');
 const { createRemoteProviders, createRemoteSync, remoteProviderId } = require('./peer-sharing.js');
 const { createPluginManager } = require('./plugin-manager.js');
+const { createChatGptPluginRecovery } = require('./chatgpt-plugin-recovery.js');
 
 /**
  * @param {{ onStatus?: (s:any)=>void, onLog?: (e:any)=>void, appVersion?: string,
@@ -49,6 +50,9 @@ async function createContext(opts = {}) {
   usageStore.load();
   const usageLive = createUsageLiveReader({ codexHome: paths.CODEX_HOME });
   const plugins = createPluginManager({ store });
+  const chatgptPluginRecovery = createChatGptPluginRecovery({
+    codexHome: paths.CODEX_HOME, configPath: paths.CODEX_CONFIG_PATH, appDir: paths.APP_DIR, backup: codex.backup,
+  });
   // 兼容升级前的混合日志：把旧日志里的终结请求迁移到独立统计文件。
   usageStore.importLogs(logStore.all());
   const listeners = new Set();
@@ -286,6 +290,7 @@ async function createContext(opts = {}) {
     usageTrend: () => usageStore.trend(),
     usageLive,
     plugins,
+    chatgptPluginRecovery,
     clearUsage: (mode = 'all') => {
       const preserveTrend = mode === 'details';
       if (mode !== 'all' && !preserveTrend) throw new Error('无效的数据清空模式');

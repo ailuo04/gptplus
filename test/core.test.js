@@ -251,8 +251,10 @@ test('plugin manager: 内置插件可安装、启停、配置和卸载，并保�
 
   const manager = createPluginManager({ store });
   const initial = manager.list();
-  assert.deepEqual(initial.map((plugin) => plugin.id), ['weixin', 'usage-statusline', 'voice-input']);
-  assert.ok(initial.every((plugin) => plugin.installed && plugin.enabled));
+  assert.deepEqual(initial.map((plugin) => plugin.id), ['weixin', 'usage-statusline', 'chatgpt-plugin-catalog', 'voice-input']);
+  assert.ok(initial.filter((plugin) => plugin.id !== 'chatgpt-plugin-catalog').every((plugin) => plugin.installed && plugin.enabled));
+  assert.equal(manager.get('chatgpt-plugin-catalog').installed, false, '目录修复需要用户明确安装并启用');
+  assert.equal(manager.get('chatgpt-plugin-catalog').enabled, false);
   assert.deepEqual(manager.get('usage-statusline').config.metrics, { speed: true, cache: true, context: true });
   assert.deepEqual(manager.get('voice-input').config, { engine: 'local', providerId: '', model: 'whisper-1', language: '', spaceHoldMs: 1000 });
 

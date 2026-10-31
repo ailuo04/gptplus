@@ -3571,3 +3571,59 @@ test('微信连接页：启动/停止会调用主进程并刷新状态卡', asyn
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('插件市场：目录修复需明确确认，显示本地缓存状态与授权边界', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const pluginsMod = await import(pathToFileURL(path.join(tmp, 'views', 'plugins.js')).href);
+    installFakeDom();
+    const state = fixtureState({ view: 'plugins', plugins: [{
+      id: 'chatgpt-plugin-catalog', name: 'ChatGPT 插件目录修复', version: '1.0.0', category: '工具', icon: 'box',
+      description: '注册本机缓存', detail: '不会恢复远程公共目录或原有已安装记录', builtIn: true,
+      installed: true, enabled: false, active: false, config: {},
+      catalogStatus: { configured: false, catalogAvailable: true, catalogCount: 120, error: '' },
+    }] });
+    const calls = [];
+    const ctx = makeCtx(appMod, state, calls);
+    ctx.api.setPluginEnabled = async (patch) => {
+      calls.push(['setPluginEnabled', patch]);
+      const next = { ...state.plugins[0], enabled: patch.enabled, active: patch.enabled,
+        catalogStatus: { configured: patch.enabled, catalogAvailable: true, catalogCount: 120, error: '' } };
+      state.plugins = [next];
+      return next;
+    };
+    const root = new FakeNode('main');
+    pluginsMod.renderPlugins(root, ctx, new FakeNode('div'));
+    assert.match(root.allText(), /本机缓存：120 个条目/);
+    const toggle = root.findTag('button').find((node) => node.attributes['aria-label'] === '启用ChatGPT 插件目录修复');
+    assert.ok(toggle);
+    toggle.listeners.click[0]();
+    assert.equal(calls.filter((entry) => entry[0] === 'setPluginEnabled').length, 0, '确认前不得修改 Codex 配置');
+    const modal = calls.filter((entry) => entry[0] === 'openModal').at(-1)?.[1];
+    assert.ok(modal);
+    assert.match(modal.allText(), /备份 Codex 配置/);
+    assert.match(modal.allText(), /不能恢复远程公共目录或原有安装记录/);
+    assert.match(modal.allText(), /仍需正常登录和授权/);
+    const confirmRepair = modal.findTag('button').find((node) => node.textContent.includes('备份并启用'));
+    confirmRepair.listeners.click[0]();
+    assert.equal(confirmRepair.disabled, true, '复制进行时禁止重复提交');
+    assert.match(confirmRepair.allText(), /复制和校验中/);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(calls.some((entry) => entry[0] === 'setPluginEnabled' && entry[1].enabled === true));
+    assert.ok(calls.some((entry) => entry[0] === 'markRelaunchNeeded'));
+    const enabled = new FakeNode('main');
+    pluginsMod.renderPlugins(enabled, ctx, new FakeNode('div'));
+    assert.match(enabled.allText(), /本地市场已注册（120 个条目）/);
+    assert.match(enabled.allText(), /检查并修复/);
+    state.plugins[0].catalogStatus = { configured: false, catalogAvailable: false, catalogCount: 0, error: '未找到 ChatGPT 的本机插件目录' };
+    const missing = new FakeNode('main');
+    pluginsMod.renderPlugins(missing, ctx, new FakeNode('div'));
+    assert.match(missing.allText(), /未找到 ChatGPT 的本机插件目录/);
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});

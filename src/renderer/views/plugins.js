@@ -273,6 +273,48 @@ function openVoiceConfig(ctx, plugin) {
   modal.classList.add('is-plugin-config');
 }
 
+function openCatalogEnableConfirmation(ctx, plugin) {
+  const submitLabel = ctx.el('span', { text: '备份并启用' });
+  const submit = ctx.el('button', { class: 'btn btn-accent btn-sm', type: 'button', on: { click: () => {
+    if (viewState.busy.has(plugin.id)) return;
+    submit.disabled = true;
+    submitLabel.textContent = '复制和校验中…';
+    void runPluginAction(ctx, plugin.id,
+      () => ctx.api.setPluginEnabled({ id: plugin.id, enabled: true }),
+      '本地市场已注册，请重启 ChatGPT 并在「个人」中选择安装',
+    ).then((saved) => {
+      if (saved) { ctx.markRelaunchNeeded?.(); ctx.closeModal(); }
+      else { submit.disabled = false; submitLabel.textContent = '备份并启用'; }
+    });
+  } } }, [ctx.icon('check', 13), submitLabel]);
+  const modal = ctx.openModal(ctx.el('section', {
+    class: 'modal plugin-config-modal',
+    attrs: { role: 'dialog', 'aria-modal': 'true', 'aria-label': '启用 ChatGPT 插件目录修复' },
+  }, [
+    ctx.el('header', { class: 'modal-head' }, [ctx.el('div', { class: 'modal-title', text: '启用插件目录修复' })]),
+    ctx.el('div', { class: 'modal-body plugin-config-body' }, [
+      ctx.el('p', { class: 'setting-desc', text: '将 ChatGPT 已同步的插件示例复制到 gpt++ 数据目录并注册为独立本地市场。启用前会备份 Codex 配置；停用时只移除 gpt++ 写入的配置。' }),
+      ctx.el('p', { class: 'setting-desc', text: '重启 ChatGPT 后请在「个人」中的本地市场选择并安装插件，开启新会话使用。此功能不能恢复远程公共目录或原有安装记录，联网插件仍需正常登录和授权。' }),
+      ctx.el('p', { class: 'setting-desc', text: '首次复制和校验可能需要几十秒，请保持 gpt++ 运行。' }),
+    ]),
+    ctx.el('div', { class: 'modal-foot' }, [
+      ctx.el('button', { class: 'btn btn-ghost btn-sm', type: 'button', on: { click: () => ctx.closeModal() } }, [ctx.el('span', { text: '取消' })]),
+      submit,
+    ]),
+  ]));
+  modal.classList.add('is-plugin-config');
+}
+
+function catalogStatusText(plugin) {
+  const status = plugin.catalogStatus;
+  if (!status) return '刷新市场以检查本机缓存与配置状态';
+  if (status.error) return status.error;
+  if (status.needsMigration) return '旧版目录或本地副本不可用，请点击检查并修复';
+  if (plugin.enabled && !status.configured) return '本地配置未生效，请点击检查并修复';
+  const count = status.catalogCount || 0;
+  return plugin.enabled ? `本地市场已注册（${count} 个条目）；重启 ChatGPT 后在「个人」选择安装` : `本机缓存：${count} 个条目；启用后复制并注册`;
+}
+
 function configureButton(ctx, plugin) {
   if (!plugin.installed) return null;
   if (plugin.id === 'weixin') {
@@ -313,12 +355,19 @@ function renderPluginCard(ctx, plugin) {
           title: plugin.enabled ? `停用${plugin.name}` : `启用${plugin.name}`,
         },
         on: {
-          click: () => void runPluginAction(
-            ctx,
-            plugin.id,
-            () => ctx.api.setPluginEnabled({ id: plugin.id, enabled: !plugin.enabled }),
-            plugin.enabled ? `${plugin.name}已停用` : `${plugin.name}已启用`,
-          ),
+          click: () => {
+            if (plugin.id === 'chatgpt-plugin-catalog' && !plugin.enabled) {
+              openCatalogEnableConfirmation(ctx, plugin);
+              return;
+            }
+            void runPluginAction(
+              ctx, plugin.id,
+              () => ctx.api.setPluginEnabled({ id: plugin.id, enabled: !plugin.enabled }),
+              plugin.id === 'chatgpt-plugin-catalog'
+                ? '已移除 gpt++ 插件目录配置，请重启 ChatGPT'
+                : plugin.enabled ? `${plugin.name}已停用` : `${plugin.name}已启用`,
+            ).then((saved) => { if (saved && plugin.id === 'chatgpt-plugin-catalog') ctx.markRelaunchNeeded?.(); });
+          },
         },
       }, [ctx.el('span', { class: 'switch-thumb' })])
     : null;
@@ -333,7 +382,7 @@ function renderPluginCard(ctx, plugin) {
             ctx,
             plugin.id,
             () => ctx.api.uninstallPlugin(plugin.id),
-            `${plugin.name}已卸载，配置已保留`,
+            plugin.id === 'chatgpt-plugin-catalog' ? '已卸载并移除 gpt++ 插件目录配置，请重启 ChatGPT' : `${plugin.name}已卸载，配置已保留`,
           ),
         },
       }, [ctx.icon('trash', 13), ctx.el('span', { text: '卸载' })])
@@ -352,7 +401,16 @@ function renderPluginCard(ctx, plugin) {
       }, [ctx.icon('download', 13), ctx.el('span', { text: '安装' })]);
 
   const configure = configureButton(ctx, plugin);
-  const actions = [configure, action].filter(Boolean);
+  const repair = plugin.id === 'chatgpt-plugin-catalog' && plugin.enabled
+    ? ctx.el('button', {
+        class: 'btn btn-ghost btn-sm', type: 'button', disabled: busy ? true : null,
+        on: { click: () => void runPluginAction(ctx, plugin.id,
+          () => ctx.api.setPluginEnabled({ id: plugin.id, enabled: true }),
+          '本地市场已检查，请重启 ChatGPT 并在「个人」中选择安装',
+        ).then((saved) => { if (saved) ctx.markRelaunchNeeded?.(); }) },
+      }, [ctx.icon('refresh', 13), ctx.el('span', { text: busy ? '复制和校验中…' : '检查并修复' })])
+    : null;
+  const actions = [configure, repair, action].filter(Boolean);
   return ctx.el('article', { class: 'plugin-card' }, [
     ctx.el('header', { class: 'plugin-card-head' }, [
       ctx.el('div', { class: 'plugin-card-mark' }, [ctx.icon(plugin.icon, 20)]),
@@ -371,9 +429,11 @@ function renderPluginCard(ctx, plugin) {
     ctx.el('div', { class: 'plugin-card-body' }, [
       ctx.el('p', { class: 'plugin-card-description', text: plugin.description }),
       ctx.el('p', { class: 'plugin-card-detail', text: plugin.detail }),
-    ]),
+      plugin.id === 'chatgpt-plugin-catalog'
+        ? ctx.el('p', { class: 'plugin-card-detail', text: catalogStatusText(plugin) }) : null,
+    ].filter(Boolean)),
     ctx.el('footer', { class: 'plugin-card-foot' }, [
-      ctx.el('span', { class: 'hint', text: plugin.id === 'weixin' ? '扫码登录与运行状态在配置页管理' : plugin.id === 'voice-input' ? '麦克风按钮会注入到 ChatGPT 输入框' : '数据仅在本机处理' }),
+      ctx.el('span', { class: 'hint', text: plugin.id === 'weixin' ? '扫码登录与运行状态在配置页管理' : plugin.id === 'voice-input' ? '麦克风按钮会注入到 ChatGPT 输入框' : plugin.id === 'chatgpt-plugin-catalog' ? '本地市场；不更改登录授权' : '数据仅在本机处理' }),
       ctx.el('div', { class: 'plugin-card-actions' }, actions),
     ]),
   ]);

@@ -527,7 +527,10 @@ async function boot() {
   });
 
   ctx.plugins?.onChange?.((event) => {
-    broadcast('gptplus:plugin:change', event);
+    const publicEvent = event?.plugin?.id === 'chatgpt-plugin-catalog'
+      ? { ...event, plugin: { ...event.plugin, catalogStatus: ctx.chatgptPluginRecovery?.status?.() || null } }
+      : event;
+    broadcast('gptplus:plugin:change', publicEvent);
     broadcast('gptplus:status', ctx.status());
     void handlePluginChange(event).catch((err) => {
       ctx.log?.({ level: 'warn', msg: `插件运行时切换失败: ${err.message}` });
