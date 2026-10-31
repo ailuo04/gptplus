@@ -256,6 +256,29 @@ function createChatGptPluginRecovery({ codexHome, configPath, appDir, backup } =
       error: available ? '' : found.error };
   }
 
+  // Only expose entries from our registered snapshot, never from an arbitrary path.
+  function publicCatalog() {
+    const existing = section(readFile(configPath).text);
+    if (!existing.present || existing.legacy || !inspectSnapshot(existing.source).valid) {
+      throw new Error('本地插件市场尚未注册或快照不可用');
+    }
+    const manifest = readManifest(existing.source, MARKETPLACE_ID);
+    const plugins = manifest.data.plugins.map((item) => {
+      const file = path.join(existing.source, 'plugins', item.name, '.codex-plugin', 'plugin.json');
+      let metadata;
+      try { metadata = JSON.parse(fs.readFileSync(file, 'utf8')); }
+      catch { metadata = {}; }
+      const text = (value) => typeof value === 'string' ? value.trim().slice(0, 300) : '';
+      return {
+        name: item.name,
+        displayName: text(metadata?.interface?.displayName) || item.name,
+        description: text(metadata?.interface?.shortDescription) || text(metadata?.description),
+        category: text(item.category) || text(metadata?.interface?.category) || 'Other',
+      };
+    });
+    return { marketplacePath: path.join(existing.source, '.agents', 'plugins', 'marketplace.json'), plugins };
+  }
+
   function writeChanged(before, text) {
     if (text === before.text) return { changed: false, backupPath: '' };
     const backupPath = before.exists ? backup() : '';
@@ -317,7 +340,7 @@ function createChatGptPluginRecovery({ codexHome, configPath, appDir, backup } =
     return { ...writeChanged(before, prefix + suffix), ...status() };
   }
 
-  return { status, setEnabled, sourcePath, manifestPath, snapshotRoot };
+  return { status, setEnabled, publicCatalog, sourcePath, manifestPath, snapshotRoot };
 }
 
 module.exports = { createChatGptPluginRecovery, MARKETPLACE_ID, BEGIN, END };

@@ -231,6 +231,23 @@ test('插件目录修复：迁移旧版注册为独立市场，保留缓存和�
   assert.equal(fs.readFileSync(f.configPath, 'utf8'), original);
 });
 
+test('插件目录修复：公开页只读取已注册快照的插件元数据', async (t) => {
+  const f = fixture(t, 'model = "keep"\n');
+  assert.throws(() => f.recovery.publicCatalog(), /尚未注册/);
+  const info = path.join(f.recovery.sourcePath, 'plugins', 'linear', '.codex-plugin', 'plugin.json');
+  fs.writeFileSync(info, JSON.stringify({ name: 'linear', description: 'Issue tracking', interface: { displayName: 'Linear', shortDescription: 'Local example' } }));
+  await f.recovery.setEnabled(true);
+  const snapshot = registeredSource(f.configPath);
+  const catalog = f.recovery.publicCatalog();
+  assert.equal(catalog.marketplacePath, path.join(snapshot, '.agents', 'plugins', 'marketplace.json'));
+  assert.deepEqual(catalog.plugins[0], { name: 'linear', displayName: 'Linear', description: 'Local example', category: 'Other' });
+  assert.equal(catalog.plugins.length, 2);
+  fs.writeFileSync(info, JSON.stringify({ name: 'linear', interface: { displayName: 'Changed source' } }));
+  assert.equal(f.recovery.publicCatalog().plugins[0].displayName, 'Linear', '应读取已注册快照，而不是变化后的原缓存');
+  await f.recovery.setEnabled(false);
+  assert.throws(() => f.recovery.publicCatalog(), /尚未注册/);
+});
+
 test('插件目录修复：原缓存丢失后仍可使用已注册的完整本地副本', async (t) => {
   const f = fixture(t, 'model = "original"\n');
   await f.recovery.setEnabled(true);

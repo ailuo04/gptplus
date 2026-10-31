@@ -10,6 +10,8 @@ const { resolveChatGptExe } = require('./chatgpt-install.js');
 const { relaunchChatGpt } = require('./chatgpt-launch.js');
 const { launchChatGptWithUsageStatusline } = require('./chatgpt-statusline.js');
 const { launchChatGptWithVoiceInput, startVoiceInputOnPort } = require('./voice-input.js');
+const { findAvailablePort } = require('./cdp.js');
+const { startPublicCatalogOnPort } = require('./chatgpt-public-catalog.js');
 const { redactDiagnostic } = require('./redact.js');
 const {
   hashPeerToken,
@@ -1160,6 +1162,7 @@ function registerIpc(deps) {
     try {
       const usageStatuslineEnabled = ctx.plugins?.isActive?.('usage-statusline') !== false;
       const voiceInputEnabled = ctx.plugins?.isActive?.('voice-input') === true;
+      const publicCatalogEnabled = ctx.plugins?.isActive?.('chatgpt-plugin-catalog') === true;
       if (usageStatuslineEnabled) {
         result = await launchChatGptWithUsageStatusline({
           ctx,
@@ -1189,8 +1192,22 @@ function registerIpc(deps) {
             wrapperDir,
           }),
         });
+      } else if (publicCatalogEnabled) {
+        const cdpPort = await findAvailablePort(9229);
+        result = await relaunchChatGpt({ executablePath: exe, cdpPort, wrapperDir: path.join(ctx.paths.APP_DIR, 'cdp') });
+        if (result?.ok) result.cdpPort = cdpPort;
       } else {
         result = await relaunchChatGpt({ executablePath: exe });
+      }
+      if (result?.ok && publicCatalogEnabled && result.cdpPort) {
+        try {
+          const catalogResult = await startPublicCatalogOnPort({ ctx, cdpPort: result.cdpPort });
+          result.publicCatalogInjected = catalogResult?.ok === true;
+        } catch (error) {
+          result.publicCatalogInjected = false;
+          result.publicCatalogError = error.message;
+          ctx.log?.({ level: 'warn', msg: '公开页本地插件列表加载失败: ' + error.message });
+        }
       }
     } catch (error) {
       result = { ok: false, error: error.message };

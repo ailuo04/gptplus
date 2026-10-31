@@ -61,14 +61,8 @@ const {
   resumeUsageStatusline,
   stopUsageStatuslineBridge,
 } = require('../core/chatgpt-statusline.js');
-const {
-  disposeVoiceInput,
-  launchChatGptWithVoiceInput,
-  resumeVoiceInput,
-  startVoiceInputOnPort,
-  stopVoiceInputBridge,
-} = require('../core/voice-input.js');
-const { stopLocalSpeech } = require('../core/local-speech.js');
+const { findAvailablePort } = require('../core/cdp.js');
+const { startPublicCatalogOnPort, resumePublicCatalog, disposePublicCatalog, stopPublicCatalogBridge } = require('../core/chatgpt-public-catalog.js');
 
 const isDev = process.argv.includes('--dev');
 const isQuitRequest = process.argv.includes('--quit');
@@ -92,6 +86,16 @@ if (isSmoke) {
   // core/paths.js 读这个变量决定数据目录（纯 Node 模块，不依赖 electron）
   process.env.GPTPLUS_HOME = path.join(sandbox, 'gptplus');
 }
+
+// 语音模块会在加载时读取 paths.js；必须先完成冒烟测试目录隔离。
+const {
+  disposeVoiceInput,
+  launchChatGptWithVoiceInput,
+  resumeVoiceInput,
+  startVoiceInputOnPort,
+  stopVoiceInputBridge,
+} = require('../core/voice-input.js');
+const { stopLocalSpeech } = require('../core/local-speech.js');
 
 // 单实例（冒烟测试允许多开）
 if (!isSmoke && !app.requestSingleInstanceLock()) {
@@ -241,6 +245,7 @@ async function launchChatGptAtLogin(commandLine = process.argv) {
     // 只 spawn explorer 成功并不代表 ChatGPT 主窗口出现。
     const usageStatuslineEnabled = ctx?.plugins?.isActive?.('usage-statusline') !== false;
     const voiceInputEnabled = ctx?.plugins?.isActive?.('voice-input') === true;
+    const publicCatalogEnabled = ctx?.plugins?.isActive?.('chatgpt-plugin-catalog') === true;
     let result;
     if (ctx?.gateway && usageStatuslineEnabled) {
       result = await launchChatGptWithUsageStatusline({
@@ -263,8 +268,16 @@ async function launchChatGptAtLogin(commandLine = process.argv) {
         wrapperDir: path.join(ctx.paths.APP_DIR, 'cdp'),
         launch: (options) => launchChatGptAndVerify({ preferredPath, ...options }),
       });
+    } else if (publicCatalogEnabled) {
+      const cdpPort = await findAvailablePort(9229);
+      result = await launchChatGptAndVerify({ preferredPath, cdpPort, wrapperDir: path.join(ctx.paths.APP_DIR, 'cdp') });
+      if (result?.ok) result.cdpPort = cdpPort;
     } else {
       result = await launchChatGptAndVerify({ preferredPath });
+    }
+    if (result?.ok && publicCatalogEnabled && result.cdpPort) {
+      try { await startPublicCatalogOnPort({ ctx, cdpPort: result.cdpPort }); }
+      catch (error) { ctx?.log?.({ level: 'warn', msg: '公开页本地插件列表加载失败: ' + error.message }); }
     }
     if (result.ok) {
       ctx?.log?.({
@@ -325,6 +338,19 @@ async function handlePluginChange(event) {
     if (cfg.enabled === true && String(cfg.token || '').trim()) {
       const result = await ctx.weixinConnect?.autoStart?.();
       if (result && result.ok === false) ctx.log?.({ level: 'warn', msg: `微信插件自动恢复失败: ${result.error}` });
+    }
+    return;
+  }
+
+  if (id === 'chatgpt-plugin-catalog') {
+    try {
+      if (ctx.plugins.isActive(id)) await resumePublicCatalog({ ctx });
+      else {
+        const port = await findChatGptDebugPort();
+        if (port) await disposePublicCatalog({ cdpPort: port });
+      }
+    } catch (error) {
+      ctx.log?.({ level: 'warn', msg: '公开页本地插件列表更新失败: ' + error.message });
     }
     return;
   }
@@ -600,7 +626,9 @@ async function boot() {
   void gatewayReady
     .then(() => launchChatGptAtLogin())
     .then(() => resumeUsageStatusline({ ctx }))
-    .then(() => resumeVoiceInput({ ctx }));
+    .then(() => resumeVoiceInput({ ctx }))
+    .then(() => resumePublicCatalog({ ctx }))
+    .catch((error) => ctx?.log?.({ level: 'warn', msg: '恢复插件页面失败: ' + error.message }));
 
   app.on('second-instance', (_event, commandLine) => {
     if (commandLine.includes('--quit')) {
@@ -644,6 +672,7 @@ app.on('before-quit', () => {
     ctx?.taskMonitor?.stop?.();
     ctx?.gateway?.stopSync?.();
     stopUsageStatuslineBridge();
+    stopPublicCatalogBridge();
     stopVoiceInputBridge();
     stopLocalSpeech();
   } catch {

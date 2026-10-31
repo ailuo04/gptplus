@@ -60,7 +60,7 @@ const BUILTIN_PLUGIN_DEFINITIONS = Object.freeze([
     category: '工具',
     icon: 'box',
     description: '将 ChatGPT 已同步的插件示例复制为独立本地市场，供你选择安装。',
-    detail: '启用时备份并修改 Codex 配置；重启 ChatGPT 后在「个人」中的本地市场选择安装。远程公共目录、原有已安装记录不会恢复，联网插件仍需正常登录授权。',
+    detail: '启用时备份并修改 Codex 配置；从 gpt++ 重启 ChatGPT 后在「公开」中显示本地示例，点击详情自行安装。远程公共目录、原有已安装记录不会恢复，联网插件仍需正常登录授权。',
     builtIn: true,
     defaultInstalled: false,
     defaultEnabled: false,

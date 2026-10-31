@@ -281,7 +281,7 @@ function openCatalogEnableConfirmation(ctx, plugin) {
     submitLabel.textContent = '复制和校验中…';
     void runPluginAction(ctx, plugin.id,
       () => ctx.api.setPluginEnabled({ id: plugin.id, enabled: true }),
-      '本地市场已注册，请重启 ChatGPT 并在「个人」中选择安装',
+      '本地市场已注册，请从 gpt++ 重启 ChatGPT 后在「公开」查看本地示例',
     ).then((saved) => {
       if (saved) { ctx.markRelaunchNeeded?.(); ctx.closeModal(); }
       else { submit.disabled = false; submitLabel.textContent = '备份并启用'; }
@@ -294,7 +294,7 @@ function openCatalogEnableConfirmation(ctx, plugin) {
     ctx.el('header', { class: 'modal-head' }, [ctx.el('div', { class: 'modal-title', text: '启用插件目录修复' })]),
     ctx.el('div', { class: 'modal-body plugin-config-body' }, [
       ctx.el('p', { class: 'setting-desc', text: '将 ChatGPT 已同步的插件示例复制到 gpt++ 数据目录并注册为独立本地市场。启用前会备份 Codex 配置；停用时只移除 gpt++ 写入的配置。' }),
-      ctx.el('p', { class: 'setting-desc', text: '重启 ChatGPT 后请在「个人」中的本地市场选择并安装插件，开启新会话使用。此功能不能恢复远程公共目录或原有安装记录，联网插件仍需正常登录和授权。' }),
+      ctx.el('p', { class: 'setting-desc', text: '请从 gpt++ 重启 ChatGPT；本地示例会显示在插件页「公开」中，点击条目打开详情并自行安装。此功能不能恢复远程公共目录或原有安装记录，联网插件仍需正常登录和授权。' }),
       ctx.el('p', { class: 'setting-desc', text: '首次复制和校验可能需要几十秒，请保持 gpt++ 运行。' }),
     ]),
     ctx.el('div', { class: 'modal-foot' }, [
@@ -312,7 +312,7 @@ function catalogStatusText(plugin) {
   if (status.needsMigration) return '旧版目录或本地副本不可用，请点击检查并修复';
   if (plugin.enabled && !status.configured) return '本地配置未生效，请点击检查并修复';
   const count = status.catalogCount || 0;
-  return plugin.enabled ? `本地市场已注册（${count} 个条目）；重启 ChatGPT 后在「个人」选择安装` : `本机缓存：${count} 个条目；启用后复制并注册`;
+  return plugin.enabled ? `本地市场已注册（${count} 个条目）；从 gpt++ 重启 ChatGPT 后在「公开」查看本地示例` : `本机缓存：${count} 个条目；启用后复制并注册`;
 }
 
 function configureButton(ctx, plugin) {
@@ -406,7 +406,7 @@ function renderPluginCard(ctx, plugin) {
         class: 'btn btn-ghost btn-sm', type: 'button', disabled: busy ? true : null,
         on: { click: () => void runPluginAction(ctx, plugin.id,
           () => ctx.api.setPluginEnabled({ id: plugin.id, enabled: true }),
-          '本地市场已检查，请重启 ChatGPT 并在「个人」中选择安装',
+          '本地市场已检查，请从 gpt++ 重启 ChatGPT 后在「公开」查看本地示例',
         ).then((saved) => { if (saved) ctx.markRelaunchNeeded?.(); }) },
       }, [ctx.icon('refresh', 13), ctx.el('span', { text: busy ? '复制和校验中…' : '检查并修复' })])
     : null;

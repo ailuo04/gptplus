@@ -8,6 +8,12 @@ const vm = require('node:vm');
 
 // Run the real startup functions without booting Electron or touching the Windows registry.
 const mainSource = fs.readFileSync(path.join(__dirname, '../src/main/main.js'), 'utf8');
+test('冒烟测试在语音模块读取路径前隔离数据目录', () => {
+  const isolation = mainSource.indexOf("process.env.GPTPLUS_HOME = path.join(sandbox, 'gptplus')");
+  const voiceImport = mainSource.indexOf("require('../core/voice-input.js')");
+  const speechImport = mainSource.indexOf("require('../core/local-speech.js')");
+  assert.ok(isolation >= 0 && voiceImport > isolation && speechImport > isolation);
+});
 const startupSource = mainSource.slice(
   mainSource.indexOf('function readStartupSettings()'),
   mainSource.indexOf('function createTray()'),

@@ -1488,12 +1488,16 @@ async function relaunchChatGpt() {
       // 重启完成后再收一次时间戳：重启过程中若有新写入，新的 ChatGPT 进程已经会读到它。
       state.relaunchNeeded = false;
       observedWriteAt = Math.max(observedWriteAt, Date.now());
-      if (res.injected === false) {
+      if (res.publicCatalogInjected === false) {
+        const message = `ChatGPT 已重启，但公开页本地插件列表加载失败：${res.publicCatalogError || '无法连接调试端口'}`;
+        toast(message, 'warn', 7000);
+        logLocal('warn', message);
+      } else if (res.injected === false) {
         toast(`ChatGPT 已重启，但输入框用量栏注入失败：${res.injectError || '无法连接调试端口'}`, 'warn', 7000);
       } else {
         toast('已重启 ChatGPT 客户端：新的模型清单已加载', 'ok');
       }
-      logLocal(res.injected === false ? 'warn' : 'info', res.injected === false
+      if (res.publicCatalogInjected !== false) logLocal(res.injected === false ? 'warn' : 'info', res.injected === false
         ? `ChatGPT 已重启，但输入框用量栏注入失败：${res.injectError || '无法连接调试端口'}`
         : '已重启 ChatGPT 客户端并加载新的模型清单');
       return true;
