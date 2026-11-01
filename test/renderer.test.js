@@ -3603,6 +3603,7 @@ test('插件市场：目录修复需明确确认，显示本地缓存状态与�
     const modal = calls.filter((entry) => entry[0] === 'openModal').at(-1)?.[1];
     assert.ok(modal);
     assert.match(modal.allText(), /备份 Codex 配置/);
+    assert.match(modal.allText(), /在「个人」中的本地市场选择并安装插件/);
     assert.match(modal.allText(), /不能恢复远程公共目录或原有安装记录/);
     assert.match(modal.allText(), /仍需正常登录和授权/);
     const confirmRepair = modal.findTag('button').find((node) => node.textContent.includes('备份并启用'));
@@ -3615,6 +3616,7 @@ test('插件市场：目录修复需明确确认，显示本地缓存状态与�
     const enabled = new FakeNode('main');
     pluginsMod.renderPlugins(enabled, ctx, new FakeNode('div'));
     assert.match(enabled.allText(), /本地市场已注册（120 个条目）/);
+    assert.match(enabled.allText(), /在「个人」选择安装/);
     assert.match(enabled.allText(), /检查并修复/);
     state.plugins[0].catalogStatus = { configured: false, catalogAvailable: false, catalogCount: 0, error: '未找到 ChatGPT 的本机插件目录' };
     const missing = new FakeNode('main');

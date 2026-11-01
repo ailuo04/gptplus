@@ -56,7 +56,7 @@ function setup(options = {}) {
       } : {}),
     },
     launchChatGptAndVerify: async (launchOptions) => {
-      calls.push({ type: 'launch', preferredPath: launchOptions.preferredPath });
+      calls.push({ type: 'launch', preferredPath: launchOptions.preferredPath, ...('cdpPort' in launchOptions ? { cdpPort: launchOptions.cdpPort } : {}) });
       if (options.launchError) throw new Error(options.launchError);
       return options.launchResult || { ok: true, exe: 'C:\\ChatGPT.exe', pid: 1234 };
     },
@@ -105,6 +105,13 @@ test('login launch keeps normal activation when no CDP plugin is active', async 
   const { api, calls } = setup({ activePlugins: [] });
   await api.launch();
   assert.deepEqual(calls, [{ type: 'launch', preferredPath: null }]);
+});
+
+test('login launch uses the native personal marketplace without CDP when only catalog recovery is active', async () => {
+  const { api, calls, logs } = setup({ activePlugins: ['chatgpt-plugin-catalog'] });
+  await api.launch();
+  assert.deepEqual(calls, [{ type: 'launch', preferredPath: null }]);
+  assert.equal(logs.some((entry) => entry.level === 'warn'), false);
 });
 
 test('registering startup writes the Windows login marker and reads the same arguments', () => {
