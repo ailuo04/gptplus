@@ -126,7 +126,9 @@ function publicCatalogPage(catalog) {
     let anchor = tablist;
     // Keep injected DOM outside React's tablist wrapper when it has its own
     // siblings (such as the native category list), so a rerender cannot remove it.
-    while (anchor.parentElement && (!anchor.nextElementSibling || anchor.nextElementSibling === panel) && anchor.parentElement !== document.body) {
+    while (anchor.parentElement && anchor.parentElement !== document.body) {
+      const next = anchor.nextElementSibling === panel ? panel.nextElementSibling : anchor.nextElementSibling;
+      if (next) break;
       anchor = anchor.parentElement;
     }
     if (!anchor.parentElement) return;

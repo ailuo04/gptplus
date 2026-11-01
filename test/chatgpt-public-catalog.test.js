@@ -129,6 +129,24 @@ test('重复注入会清理旧列表和观察器', () => {
 });
 
 
+test('标签栏有原生兄弟节点时，重复更新不会来回移动本地列表', async () => {
+  const f = fixture();
+  const tabs = f.anchor.querySelector('[role="tablist"]');
+  const nativeList = new Element('section');
+  f.anchor.append(nativeList);
+  vm.runInContext(buildPublicCatalogScript(catalog), f.context);
+  const panel = f.document.getElementById('gptplus-public-local-catalog');
+  assert.equal(tabs.nextElementSibling, panel);
+  assert.equal(panel.nextElementSibling, nativeList);
+  for (let i = 0; i < 3; i += 1) {
+    f.observers[0].callback();
+    await new Promise((resolve) => setTimeout(resolve, 70));
+    assert.equal(tabs.nextElementSibling, panel);
+    assert.equal(panel.nextElementSibling, nativeList);
+  }
+  f.context.__gptplusPublicCatalog.dispose();
+});
+
 test('公开页桥接在页面重载后重新注入，停用后不再注入', async (t) => {
   t.after(stopPublicCatalogBridge);
   let installed = false;
