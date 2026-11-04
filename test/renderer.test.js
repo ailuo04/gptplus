@@ -3664,3 +3664,119 @@ test('使用量页：缓存统计纳入真实零命中、排除未知并按输�
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('自定义生图：安全配置、默认优先边界、付费验证入口与重启提示', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const pluginsMod = await import(pathToFileURL(path.join(tmp, 'views', 'plugins.js')).href);
+    installFakeDom();
+    const plugin = { id: 'custom-imagegen', name: '自定义生图', icon: 'image', version: '1.0.0', category: '创作',
+      builtIn: true, configurable: true, installed: true, enabled: true, config: {
+        baseUrl: 'https://images.example/v1', hasKey: true, model: 'image-model', preferDefault: true,
+      }, imageStatus: { configured: true, enabled: true, builtinSkillDisabled: true, automaticSelectionGuaranteed: false } };
+    const state = fixtureState({ view: 'plugins', plugins: [plugin] });
+    const calls = [], ctx = makeCtx(appMod, state, calls);
+    ctx.markRelaunchNeeded = () => calls.push(['restart']);
+    ctx.api.setPluginConfig = async (patch) => { calls.push(['setPluginConfig', patch]); return { ...plugin, config: { ...patch.config, hasKey: true, apiKey: undefined } }; };
+    ctx.api.verifyImagePlugin = async () => { calls.push(['verifyImagePlugin']); return { ok: true, model: 'image-model', count: 1, formats: ['png'] }; };
+    const root = new FakeNode('main');
+    pluginsMod.renderPlugins(root, ctx, new FakeNode('div'));
+    assert.match(root.allText(), /自动优先/);
+    root.findTag('button').find((n) => n.textContent.includes('配置')).listeners.click[0]();
+    const modal = calls.filter((c) => c[0] === 'openModal').at(-1)[1];
+    assert.match(modal.allText(), /不能保证|不保证/);
+    assert.match(modal.allText(), /重启/);
+    assert.match(modal.allText(), /计费|费用/);
+    const input = (label) => findNodes(modal, (n) => n.tagName === 'INPUT' && n.attributes['aria-label'] === label)[0];
+    assert.equal(input('API Key').attributes.type, 'password');
+    assert.equal(input('API Key').value, '');
+    assert.equal(input('API URL').value, 'https://images.example/v1');
+    assert.equal(input('模型名').value, 'image-model');
+    assert.equal(input('设为默认生图（自动优先）').checked, true);
+    assert.equal(calls.filter((c) => c[0] === 'verifyImagePlugin').length, 0, 'opening config must never generate billable images');
+    input('模型名').value = 'new-model';
+    input('设为默认生图（自动优先）').checked = false;
+    modal.findTag('button').find((n) => n.textContent.includes('保存配置')).listeners.click[0]();
+    await new Promise((resolve) => setImmediate(resolve));
+    const saved = calls.find((c) => c[0] === 'setPluginConfig')[1];
+    assert.equal(saved.config.apiKey, '', 'blank key asks main process to preserve the existing encrypted key');
+    assert.equal(saved.config.model, 'new-model');
+    assert.equal(saved.config.preferDefault, false);
+    assert.ok(calls.some((c) => c[0] === 'restart'));
+    assert.equal(calls.filter((c) => c[0] === 'verifyImagePlugin').length, 0, 'saving settings must never trigger paid generation');
+  } finally {
+    delete globalThis.document; delete globalThis.window; delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('自定义生图：启用前明确确认技能设置修改，停用后提示重启', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const pluginsMod = await import(pathToFileURL(path.join(tmp, 'views', 'plugins.js')).href);
+    installFakeDom();
+    const plugin = { id: 'custom-imagegen', name: '自定义生图', icon: 'image', version: '1.0.0', category: '创作',
+      installed: true, enabled: false, config: { baseUrl: 'https://images.example/v1', model: 'model', hasKey: true, preferDefault: true } };
+    const state = fixtureState({ view: 'plugins', plugins: [plugin] });
+    const calls = [], ctx = makeCtx(appMod, state, calls);
+    ctx.markRelaunchNeeded = () => calls.push(['restart']);
+    ctx.api.setPluginEnabled = async (patch) => { calls.push(['setPluginEnabled', patch]); return { ...plugin, enabled: patch.enabled }; };
+    const root = new FakeNode('main'); pluginsMod.renderPlugins(root, ctx, new FakeNode('div'));
+    root.findTag('button').find((n) => n.attributes.role === 'switch').listeners.click[0]();
+    assert.equal(calls.filter((c) => c[0] === 'setPluginEnabled').length, 0);
+    const modal = calls.filter((c) => c[0] === 'openModal').at(-1)?.[1];
+    assert.ok(modal, 'enable should explain and confirm managed user configuration changes');
+    assert.match(modal.allText(), /备份/);
+    assert.match(modal.allText(), /内置.*技能/);
+    modal.findTag('button').find((n) => n.textContent.includes('备份并启用')).listeners.click[0]();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(calls.some((c) => c[0] === 'setPluginEnabled' && c[1].enabled === true));
+    assert.ok(calls.some((c) => c[0] === 'restart'));
+  } finally {
+    delete globalThis.document; delete globalThis.window; delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('自定义生图配置：可设置截图中的尺寸、比例、画质和背景，并保存到插件配置', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const pluginsMod = await import(pathToFileURL(path.join(tmp, 'views', 'plugins.js')).href);
+    installFakeDom();
+    const plugin = { id: 'custom-imagegen', name: '自定义生图', icon: 'image', version: '1.0.0', category: '创作',
+      builtIn: true, configurable: true, installed: true, enabled: true, config: {
+        baseUrl: 'https://images.example/v1', hasKey: true, model: 'image-model', preferDefault: true,
+        resolution: '4K', aspectRatio: '3:4', quality: 'high', background: 'transparent',
+      }, imageStatus: { configured: true, enabled: true, builtinSkillDisabled: true, automaticSelectionGuaranteed: false } };
+    const state = fixtureState({ view: 'plugins', plugins: [plugin] });
+    const calls = [], ctx = makeCtx(appMod, state, calls);
+    ctx.markRelaunchNeeded = () => calls.push(['restart']);
+    ctx.api.setPluginConfig = async (patch) => { calls.push(['setPluginConfig', patch]); return plugin; };
+    const root = new FakeNode('main'); pluginsMod.renderPlugins(root, ctx, new FakeNode('div'));
+    root.findTag('button').find((n) => n.textContent.includes('配置')).listeners.click[0]();
+    const modal = calls.filter((c) => c[0] === 'openModal').at(-1)[1];
+    const groups = findNodes(modal, (n) => n.tagName === 'FIELDSET');
+    assert.equal(groups.length, 4, '应显示尺寸、比例、画质、背景四项设置');
+    assert.deepEqual(groups.map((group) => group.findTag('input').find((n) => n.checked)?.value), ['4K', '3:4', 'high', 'transparent']);
+    assert.match(modal.allText(), /3072 × 4096/);
+    for (const [index, value] of ['2K', '16:9', 'medium', 'opaque'].entries()) {
+      const radio = groups[index].findTag('input').find((n) => n.value === value);
+      assert.ok(radio, '截图选项应可选择：' + value);
+      radio.checked = true; radio.listeners.change[0]();
+    }
+    assert.match(modal.allText(), /2048 × 1152/);
+    modal.findTag('button').find((n) => n.textContent.includes('保存配置')).listeners.click[0]();
+    await new Promise((resolve) => setImmediate(resolve));
+    const saved = calls.find((c) => c[0] === 'setPluginConfig')[1].config;
+    assert.equal(saved.resolution, '2K');
+    assert.equal(saved.aspectRatio, '16:9');
+    assert.equal(saved.quality, 'medium');
+    assert.equal(saved.background, 'opaque');
+  } finally {
+    delete globalThis.document; delete globalThis.window; delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});

@@ -21,7 +21,16 @@ const DEFAULT_VOICE_CONFIG = Object.freeze({
   spaceHoldMs: DEFAULT_VOICE_SPACE_HOLD_MS,
 });
 
+const DEFAULT_IMAGE_CONFIG = Object.freeze({ baseUrl: '', apiKey: '', model: '', preferDefault: true, resolution: '1K', aspectRatio: '1:1', quality: 'auto', background: 'auto' });
+
 const BUILTIN_PLUGIN_DEFINITIONS = Object.freeze([
+  Object.freeze({
+    id: 'custom-imagegen', name: '自定义生图', version: '1.0.0', author: 'gpt++',
+    category: '创作', icon: 'image', builtIn: true, defaultInstalled: false, defaultEnabled: false, configurable: true,
+    description: '使用你自己的 URL、API Key 和模型生成图片，配套安装可自动匹配的生图技能。',
+    detail: '支持 OpenAI 兼容 Images API。可停用内置 imagegen 技能以自动优先；不代表关闭底层工具或保证模型每次自动选择。执行器固定调用你的服务，失败不回退。',
+    defaultConfig: DEFAULT_IMAGE_CONFIG,
+  }),
   Object.freeze({
     id: 'weixin',
     name: '微信连接',
@@ -128,7 +137,22 @@ function normalizeVoiceConfig(raw) {
   };
 }
 
+function normalizeImageConfig(raw) {
+  const source = isPlainObject(raw) ? raw : {};
+  return {
+    baseUrl: String(source.baseUrl || '').trim().slice(0, 2048),
+    apiKey: String(source.apiKey || '').trim().slice(0, 8192),
+    model: String(source.model || '').trim().slice(0, 256),
+    preferDefault: source.preferDefault !== false,
+    resolution: ['1K', '2K', '4K'].includes(source.resolution) ? source.resolution : '1K',
+    aspectRatio: ['1:1', '4:3', '3:4', '16:9', '9:16'].includes(source.aspectRatio) ? source.aspectRatio : '1:1',
+    quality: ['low', 'medium', 'high', 'auto'].includes(source.quality) ? source.quality : 'auto',
+    background: ['auto', 'opaque', 'transparent'].includes(source.background) ? source.background : 'auto',
+  };
+}
+
 function normalizePluginConfig(definition, raw) {
+  if (definition.id === 'custom-imagegen') return normalizeImageConfig(raw);
   if (definition.id === 'usage-statusline') return normalizeUsageConfig(raw);
   if (definition.id === 'voice-input') return normalizeVoiceConfig(raw);
   return isPlainObject(raw) ? deepCopy(raw) : {};
@@ -169,7 +193,9 @@ function publicPlugin(definition, state) {
     installed: state.installed,
     enabled: state.enabled,
     active: state.installed && state.enabled,
-    config: deepCopy(state.config),
+    config: definition.id === 'custom-imagegen'
+      ? { baseUrl: state.config.baseUrl, model: state.config.model, preferDefault: state.config.preferDefault, resolution: state.config.resolution, aspectRatio: state.config.aspectRatio, quality: state.config.quality, background: state.config.background, hasKey: !!state.config.apiKey }
+      : deepCopy(state.config),
   };
 }
 
@@ -294,7 +320,8 @@ function createPluginManager({ store, definitions = BUILTIN_PLUGIN_DEFINITIONS }
   function setConfig(id, rawConfig) {
     return update(id, (current) => ({
       ...current,
-      config: normalizePluginConfig(definition(id), rawConfig),
+      config: normalizePluginConfig(definition(id), id === 'custom-imagegen'
+        ? { ...rawConfig, apiKey: String(rawConfig?.apiKey || '').trim() || current.config.apiKey } : rawConfig),
     }), 'configure');
   }
 
@@ -329,6 +356,8 @@ module.exports = {
   MIN_VOICE_SPACE_HOLD_MS,
   createPluginManager,
   normalizePluginConfig,
+  normalizeImageConfig,
+  DEFAULT_IMAGE_CONFIG,
   normalizeVoiceConfig,
   normalizeVoiceSpaceHoldMs,
 };

@@ -529,7 +529,9 @@ async function boot() {
   });
 
   ctx.plugins?.onChange?.((event) => {
-    const publicEvent = event?.plugin?.id === 'chatgpt-plugin-catalog'
+    const publicEvent = event?.plugin?.id === 'custom-imagegen'
+      ? { ...event, plugin: { ...event.plugin, imageStatus: ctx.imagegenSkill?.status?.() || null } }
+      : event?.plugin?.id === 'chatgpt-plugin-catalog'
       ? { ...event, plugin: { ...event.plugin, catalogStatus: ctx.chatgptPluginRecovery?.status?.() || null } }
       : event;
     broadcast('gptplus:plugin:change', publicEvent);

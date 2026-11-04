@@ -3443,3 +3443,22 @@ html.is-theme-switching .logs {
   .plugin-card-foot { align-items: flex-start; flex-direction: column; padding: var(--sp-3); }
   .plugin-card-actions { width: 100%; justify-content: flex-start; }
 }
+
+/* 自定义生图：与插件设置一致的分段选项，保存的是执行器默认参数。 */
+.modal.imagegen-config-modal { width: min(560px, calc(100vw - 48px)); max-height: min(90vh, 860px); }
+.imagegen-generation-settings { display: flex; flex-direction: column; gap: 12px; padding: 14px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--bg-inset); }
+.imagegen-generation-settings h3 { margin: 0; color: var(--fg); font-size: var(--fs-body); font-weight: 650; }
+.imagegen-option-group { min-width: 0; margin: 0; padding: 0; border: 0; }
+.imagegen-option-group legend { margin-bottom: 7px; padding: 0; }
+.imagegen-options { display: flex; gap: 3px; padding: 3px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg-panel); }
+.imagegen-choice { display: flex; flex: 1 1 0; min-width: 0; position: relative; cursor: pointer; }
+.imagegen-choice input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.imagegen-choice span { display: flex; align-items: center; justify-content: center; flex: 1; min-height: 31px; padding: 4px 9px; border: 1px solid transparent; border-radius: 5px; color: var(--fg-dim); font-size: var(--fs-body); white-space: nowrap; }
+.imagegen-choice:hover span { color: var(--fg); background: var(--bg-hover); }
+.imagegen-choice input:checked + span { color: var(--accent-hi); border-color: var(--accent-line); background: var(--accent-soft); }
+.imagegen-choice input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 1px; }
+.imagegen-options.is-ratios { flex-wrap: wrap; gap: 6px; padding: 0; border: 0; background: transparent; }
+.is-ratios .imagegen-choice { flex: 0 1 auto; }
+.is-ratios .imagegen-choice span { min-width: 56px; border-color: var(--line); background: var(--bg-panel); }
+.imagegen-dimensions { margin: 0; font-variant-numeric: tabular-nums; }
+.imagegen-generation-settings > .hint { margin: 0; }

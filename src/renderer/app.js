@@ -42,6 +42,7 @@ const ICONS = Object.freeze({
   chevronDown: SVG_OPEN + '<path d="M4.4 6.4L8 10l3.6-3.6"/></svg>',
   chevronUp: SVG_OPEN + '<path d="M4.4 9.6L8 6l3.6 3.6"/></svg>',
   activity: SVG_OPEN + '<path d="M1.7 8h2.8l1.9-4.3 3 8.6 1.8-4.3h3.1"/></svg>',
+  image: SVG_OPEN + '<rect x="2" y="2" width="12" height="12" rx="2"/><circle cx="5.5" cy="5.5" r="1"/><path d="M2 11l4-4 3 3 2-2 3 3"/></svg>',
   box: SVG_OPEN + '<path d="M2.5 5.4L8 2.7l5.5 2.7v5.2L8 13.3l-5.5-2.7z"/><path d="M2.5 5.4L8 8.1l5.5-2.7M8 8.1v5.2"/></svg>',
   lock: SVG_OPEN + '<rect x="3.3" y="7" width="9.4" height="6.2" rx="1.2"/><path d="M5.2 7V5.1a2.8 2.8 0 0 1 5.6 0V7"/></svg>',
   dot: SVG_FILL + '<circle cx="8" cy="8" r="3"/></svg>',

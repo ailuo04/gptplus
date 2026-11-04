@@ -112,6 +112,143 @@ function openUsageConfig(ctx, plugin) {
   modal.classList.add('is-plugin-config');
 }
 
+function imageStatusText(plugin) {
+  if (!plugin.enabled) return '未启用；保存配置后启用，重启 ChatGPT 并开启新对话。';
+  const status = plugin.imageStatus;
+  if (status?.error) return '技能配置异常：' + status.error;
+  if (!status?.configured || !status.enabled) return '技能配置尚未生效，请重新保存配置或停用后启用。';
+  if (plugin.config?.preferDefault && status.builtinSkillDisabled) return '自动优先已配置：内置 imagegen 技能已停用；请重启 ChatGPT 并开启新对话。';
+  if (plugin.config?.preferDefault) return '自动优先：未找到已知内置 imagegen 技能，未停用任何内置技能；可显式调用 $gptplus-imagegen。';
+  return '自定义技能已配置；可自动匹配或显式调用 $gptplus-imagegen。';
+}
+
+function imageChoiceGroup(ctx, name, label, options, current, onChange) {
+  let value = options.some(([key]) => key === current) ? current : options[0][0];
+  const radios = [];
+  const choices = options.map(([key, text]) => {
+    const radio = ctx.el('input', { type: 'radio', name: 'imagegen-' + name, value: key, checked: key === value,
+      attrs: { 'aria-label': text }, on: { change: () => {
+        if (!radio.checked) return;
+        value = key;
+        for (const other of radios) other.checked = other === radio;
+        onChange?.();
+      } },
+    });
+    radios.push(radio);
+    return ctx.el('label', { class: 'imagegen-choice' }, [radio, ctx.el('span', { text })]);
+  });
+  const node = ctx.el('fieldset', { class: 'imagegen-option-group' }, [
+    ctx.el('legend', { class: 'label', text: label }),
+    ctx.el('div', { class: 'imagegen-options' + (name === 'aspectRatio' ? ' is-ratios' : '') }, choices),
+  ]);
+  return { node, get value() { return value; } };
+}
+
+function openImageConfig(ctx, plugin) {
+  const current = plugin.config || {};
+  const field = (label, input, hint) => ctx.el('label', { class: 'field' }, [
+    ctx.el('span', { class: 'label', text: label }), input,
+    ctx.el('span', { class: 'hint', text: hint }),
+  ]);
+  const input = (label, value, placeholder, type = 'text') => ctx.el('input', {
+    class: 'input', type, value, placeholder, attrs: { 'aria-label': label, autocomplete: 'off' },
+  });
+  const url = input('API URL', current.baseUrl || '', 'https://your-provider.example/v1');
+  const key = input('API Key', '', current.hasKey ? '已保存，留空保持不变' : '填写你的 API Key', 'password');
+  const model = input('模型名', current.model || '', '提供商支持的生图模型名');
+  const dimensions = ctx.el('p', { class: 'hint imagegen-dimensions' });
+  const updateDimensions = () => {
+    const edge = { '1K': 1024, '2K': 2048, '4K': 4096 }[resolution.value];
+    const [width, height] = aspectRatio.value.split(':').map(Number);
+    const scale = edge / Math.max(width, height);
+    dimensions.textContent = '请求尺寸：' + Math.round(width * scale) + ' × ' + Math.round(height * scale) + ' px';
+  };
+  const resolution = imageChoiceGroup(ctx, 'resolution', '图片尺寸', [['1K', '1K'], ['2K', '2K'], ['4K', '4K']], current.resolution || '1K', updateDimensions);
+  const aspectRatio = imageChoiceGroup(ctx, 'aspectRatio', '画面比例', [['1:1', '1:1'], ['4:3', '4:3'], ['3:4', '3:4'], ['16:9', '16:9'], ['9:16', '9:16']], current.aspectRatio || '1:1', updateDimensions);
+  const quality = imageChoiceGroup(ctx, 'quality', '画质', [['low', '低'], ['medium', '中'], ['high', '高'], ['auto', '自动']], current.quality || 'auto');
+  const background = imageChoiceGroup(ctx, 'background', '背景', [['auto', '自动'], ['opaque', '不透明'], ['transparent', '透明']], current.background || 'auto');
+  updateDimensions();
+  const prefer = ctx.el('input', { type: 'checkbox', checked: current.preferDefault !== false,
+    attrs: { 'aria-label': '设为默认生图（自动优先）' } });
+  const verifyLabel = ctx.el('span', { text: '生成 1 张验证（可能计费）' });
+  const verifyResult = ctx.el('p', { class: 'hint', text: '验证使用已保存的配置，需要先启用插件和本地网关；会实际生成 1 张测试图，可能计费，仅返回结果，不保存测试图片。' });
+  const verify = ctx.el('button', { class: 'btn btn-ghost btn-sm', type: 'button', disabled: plugin.enabled ? null : true,
+    on: { click: async () => {
+      verify.disabled = true; verifyLabel.textContent = '正在验证…';
+      try {
+        const result = await ctx.api.verifyImagePlugin();
+        verifyResult.textContent = `固定路由验证通过：${result.model}，${result.count} 张（${result.formats.join(', ')}）。这不代表新会话自动选择已验证。`;
+        ctx.toast('自定义生图接口验证通过', 'ok');
+      } catch (err) { verifyResult.textContent = '验证失败；请检查服务配置和网关状态。'; ctx.toastError(err, '生图接口验证失败'); }
+      finally { verify.disabled = false; verifyLabel.textContent = '生成 1 张验证（可能计费）'; }
+    } },
+  }, [ctx.icon('activity', 13), verifyLabel]);
+  const modal = ctx.openModal(ctx.el('section', {
+    class: 'modal plugin-config-modal imagegen-config-modal', attrs: { role: 'dialog', 'aria-modal': 'true', 'aria-label': '配置自定义生图' },
+  }, [
+    ctx.el('header', { class: 'modal-head' }, [ctx.el('div', { class: 'modal-title', text: '配置自定义生图' })]),
+    ctx.el('div', { class: 'modal-body plugin-config-body' }, [
+      ctx.el('p', { class: 'setting-desc', text: '使用你自己的 OpenAI 兼容 Images API 生成图片；执行器固定使用这里的地址和模型，失败不自动切换服务。首版仅支持文生图。' }),
+      field('API URL', url, '支持 Base URL（如 https://example.com/v1）或完整 /images/generations 端点。'),
+      field('API Key', key, '使用本机系统安全存储加密保存；不写入技能、命令或日志。已有密钥时留空保持不变。'),
+      field('模型名', model, '填写生图服务实际支持的模型名，不会自动替换模型。'),
+      ctx.el('section', { class: 'imagegen-generation-settings', attrs: { 'aria-label': '默认生成参数' } }, [
+        ctx.el('h3', { text: '默认生成参数' }),
+        ctx.el('p', { class: 'hint', text: '仅在本次生图未明确指定时使用。对话中的临时要求只作用于该次请求，不修改这里的默认值，也不沿用到其他次生图。' }),
+        resolution.node, aspectRatio.node, quality.node, background.node, dimensions,
+        ctx.el('p', { class: 'hint', text: '1K / 2K / 4K 按长边 1024 / 2048 / 4096 px 换算。实际支持的尺寸、画质与透明背景由服务和模型决定；不支持时明确报错，不自动降级。透明背景使用 PNG。' }),
+      ]),
+      ctx.el('label', { class: 'plugin-config-option' }, [prefer, ctx.el('span', { class: 'plugin-config-option-copy' }, [
+        ctx.el('strong', { text: '设为默认生图（自动优先）' }),
+        ctx.el('span', { class: 'hint', text: '启用时备份并修改 Codex 技能设置，停用已知内置 imagegen 技能；不删除内置文件，停用插件时撤回这项设置。' }),
+      ])]),
+      ctx.el('p', { class: 'setting-desc', text: '不能保证模型每次都自动选择该技能，也不代表关闭底层生图工具。启用或修改默认设置后，请重启 ChatGPT 并开启新对话；需要确定选中时可使用 $gptplus-imagegen。' }),
+      ctx.el('p', { class: 'hint', text: '生成时 gpt++ 与本地网关必须保持运行。技能脚本需要 Python 3，可使用客户端自带运行时；不会自动安装依赖。' }),
+      verify, verifyResult,
+    ]),
+    ctx.el('div', { class: 'modal-foot' }, [
+      ctx.el('button', { class: 'btn btn-ghost btn-sm', type: 'button', on: { click: () => ctx.closeModal() } }, [ctx.el('span', { text: '取消' })]),
+      ctx.el('button', { class: 'btn btn-accent btn-sm', type: 'button', on: { click: () => {
+        if (!url.value.trim() || !model.value.trim() || (!key.value.trim() && !current.hasKey)) {
+          ctx.toast('请填写 API URL、API Key 和模型名', 'warn'); return;
+        }
+        void runPluginAction(ctx, plugin.id, () => ctx.api.setPluginConfig({ id: plugin.id, config: {
+          baseUrl: url.value.trim(), apiKey: key.value.trim(), model: model.value.trim(), preferDefault: prefer.checked,
+          resolution: resolution.value, aspectRatio: aspectRatio.value, quality: quality.value, background: background.value,
+        } }), plugin.enabled ? '生图配置已保存，请重启 ChatGPT 并开启新对话' : '生图配置已保存，请启用后使用').then((saved) => {
+          if (saved) { if (plugin.enabled) ctx.markRelaunchNeeded?.(); ctx.closeModal(); }
+        });
+      } } }, [ctx.icon('check', 13), ctx.el('span', { text: '保存配置' })]),
+    ]),
+  ]));
+  modal.classList.add('is-plugin-config');
+}
+
+function openImageEnableConfirmation(ctx, plugin) {
+  if (!plugin.config?.baseUrl || !plugin.config?.model || !plugin.config?.hasKey) {
+    ctx.toast('请先保存生图服务的 URL、API Key 和模型', 'warn'); openImageConfig(ctx, plugin); return;
+  }
+  const modal = ctx.openModal(ctx.el('section', {
+    class: 'modal plugin-config-modal', attrs: { role: 'dialog', 'aria-modal': 'true', 'aria-label': '启用自定义生图' },
+  }, [
+    ctx.el('header', { class: 'modal-head' }, [ctx.el('div', { class: 'modal-title', text: '启用自定义生图' })]),
+    ctx.el('div', { class: 'modal-body plugin-config-body' }, [
+      ctx.el('p', { class: 'setting-desc', text: '将安装 gptplus-imagegen 技能并备份、修改 Codex 技能设置。勾选默认优先时，会停用已知内置 imagegen 技能；不删除内置技能文件。停用本插件时撤回内置技能开关。' }),
+      ctx.el('p', { class: 'setting-desc', text: '这是自动优先，不保证每次自动选中，也不关闭底层工具。启用后需重启 ChatGPT 并开启新对话。此操作本身不会调用生图接口或产生生图费用。' }),
+    ]),
+    ctx.el('div', { class: 'modal-foot' }, [
+      ctx.el('button', { class: 'btn btn-ghost btn-sm', type: 'button', on: { click: () => ctx.closeModal() } }, [ctx.el('span', { text: '取消' })]),
+      ctx.el('button', { class: 'btn btn-accent btn-sm', type: 'button', on: { click: () => {
+        void runPluginAction(ctx, plugin.id, () => ctx.api.setPluginEnabled({ id: plugin.id, enabled: true }),
+          '自定义生图已启用，请重启 ChatGPT 并开启新对话').then((saved) => {
+          if (saved) { ctx.markRelaunchNeeded?.(); ctx.closeModal(); }
+        });
+      } } }, [ctx.icon('check', 13), ctx.el('span', { text: '备份并启用' })]),
+    ]),
+  ]));
+  modal.classList.add('is-plugin-config');
+}
+
 const VOICE_LANGUAGES = [
   ['', '自动检测'],
   ['zh', '中文'],
@@ -317,6 +454,10 @@ function catalogStatusText(plugin) {
 
 function configureButton(ctx, plugin) {
   if (!plugin.installed) return null;
+  if (plugin.id === 'custom-imagegen') {
+    return ctx.el('button', { class: 'btn btn-ghost btn-sm', type: 'button', on: { click: () => openImageConfig(ctx, plugin) } },
+      [ctx.icon('plug', 13), ctx.el('span', { text: '配置' })]);
+  }
   if (plugin.id === 'weixin') {
     return ctx.el('button', {
       class: 'btn btn-ghost btn-sm',
@@ -356,6 +497,7 @@ function renderPluginCard(ctx, plugin) {
         },
         on: {
           click: () => {
+            if (plugin.id === 'custom-imagegen' && !plugin.enabled) { openImageEnableConfirmation(ctx, plugin); return; }
             if (plugin.id === 'chatgpt-plugin-catalog' && !plugin.enabled) {
               openCatalogEnableConfirmation(ctx, plugin);
               return;
@@ -363,10 +505,12 @@ function renderPluginCard(ctx, plugin) {
             void runPluginAction(
               ctx, plugin.id,
               () => ctx.api.setPluginEnabled({ id: plugin.id, enabled: !plugin.enabled }),
-              plugin.id === 'chatgpt-plugin-catalog'
+              plugin.id === 'custom-imagegen'
+                ? '自定义生图已停用，请重启 ChatGPT 并开启新对话'
+                : plugin.id === 'chatgpt-plugin-catalog'
                 ? '已移除 gpt++ 插件目录配置，请重启 ChatGPT'
                 : plugin.enabled ? `${plugin.name}已停用` : `${plugin.name}已启用`,
-            ).then((saved) => { if (saved && plugin.id === 'chatgpt-plugin-catalog') ctx.markRelaunchNeeded?.(); });
+            ).then((saved) => { if (saved && ['chatgpt-plugin-catalog', 'custom-imagegen'].includes(plugin.id)) ctx.markRelaunchNeeded?.(); });
           },
         },
       }, [ctx.el('span', { class: 'switch-thumb' })])
@@ -382,8 +526,8 @@ function renderPluginCard(ctx, plugin) {
             ctx,
             plugin.id,
             () => ctx.api.uninstallPlugin(plugin.id),
-            plugin.id === 'chatgpt-plugin-catalog' ? '已卸载并移除 gpt++ 插件目录配置，请重启 ChatGPT' : `${plugin.name}已卸载，配置已保留`,
-          ),
+            plugin.id === 'custom-imagegen' ? '已停用生图技能并保留服务配置，请重启 ChatGPT' : plugin.id === 'chatgpt-plugin-catalog' ? '已卸载并移除 gpt++ 插件目录配置，请重启 ChatGPT' : `${plugin.name}已卸载，配置已保留`,
+          ).then((saved) => { if (saved && plugin.id === 'custom-imagegen') ctx.markRelaunchNeeded?.(); }),
         },
       }, [ctx.icon('trash', 13), ctx.el('span', { text: '卸载' })])
     : ctx.el('button', {
@@ -429,11 +573,13 @@ function renderPluginCard(ctx, plugin) {
     ctx.el('div', { class: 'plugin-card-body' }, [
       ctx.el('p', { class: 'plugin-card-description', text: plugin.description }),
       ctx.el('p', { class: 'plugin-card-detail', text: plugin.detail }),
+      plugin.id === 'custom-imagegen' && plugin.installed
+        ? ctx.el('p', { class: 'plugin-card-detail', text: imageStatusText(plugin) }) : null,
       plugin.id === 'chatgpt-plugin-catalog'
         ? ctx.el('p', { class: 'plugin-card-detail', text: catalogStatusText(plugin) }) : null,
     ].filter(Boolean)),
     ctx.el('footer', { class: 'plugin-card-foot' }, [
-      ctx.el('span', { class: 'hint', text: plugin.id === 'weixin' ? '扫码登录与运行状态在配置页管理' : plugin.id === 'voice-input' ? '麦克风按钮会注入到 ChatGPT 输入框' : plugin.id === 'chatgpt-plugin-catalog' ? '本地市场；不更改登录授权' : '数据仅在本机处理' }),
+      ctx.el('span', { class: 'hint', text: plugin.id === 'custom-imagegen' ? '固定路由；gpt++ 与网关需保持运行' : plugin.id === 'weixin' ? '扫码登录与运行状态在配置页管理' : plugin.id === 'voice-input' ? '麦克风按钮会注入到 ChatGPT 输入框' : plugin.id === 'chatgpt-plugin-catalog' ? '本地市场；不更改登录授权' : '数据仅在本机处理' }),
       ctx.el('div', { class: 'plugin-card-actions' }, actions),
     ]),
   ]);

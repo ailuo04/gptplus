@@ -462,11 +462,19 @@ function createStore({ configPath, secretStorage = null } = {}) {
   function serializeForDisk() {
     const disk = deepCopy(cfg);
     const hasPeerCredentials = disk.remoteSync.connections.some((connection) => connection.baseUrl || connection.authToken);
+    const imageConfig = disk.plugins['custom-imagegen']?.config;
+    const hasImageCredentials = !!(imageConfig?.apiKey || imageConfig?.baseUrl);
     if (!secretStorage) {
+      if (hasImageCredentials) throw secureStorageError('系统安全存储不可用，无法保存生图凭据');
       if (hasPeerCredentials) throw secureStorageError('系统安全存储不可用，无法保存远端连接');
       return disk;
     }
     requireSecretStorage();
+    if (hasImageCredentials) {
+      imageConfig.secret = encryptProviderSecrets({ ...imageConfig, headers: {} });
+      delete imageConfig.baseUrl;
+      delete imageConfig.apiKey;
+    }
     for (const provider of disk.providers) {
       provider.secret = encryptProviderSecrets(provider);
       delete provider.baseUrl;
@@ -531,11 +539,20 @@ function createStore({ configPath, secretStorage = null } = {}) {
       const connections = raw.remoteSync && Array.isArray(raw.remoteSync.connections) ? raw.remoteSync.connections : [];
       const hasPeerCredentials = connections.some((connection) => isPlainObject(connection)
         && (Object.prototype.hasOwnProperty.call(connection, 'secret') || connection.baseUrl || connection.authToken));
+      const image = raw.plugins?.['custom-imagegen']?.config;
+      if (image?.secret || image?.apiKey || image?.baseUrl) throw secureStorageError('需要系统安全存储才能读取生图凭据');
       if (hasEncryptedProvider || hasPeerCredentials) throw secureStorageError('需要系统安全存储才能读取加密凭据');
       return { config: raw, migrated: false };
     }
     const config = deepCopy(raw);
     let migrated = false;
+    const image = config.plugins?.['custom-imagegen']?.config;
+    if (isPlainObject(image) && (image.secret || image.apiKey || image.baseUrl)) {
+      const decoded = decodeProviderSecrets(image);
+      config.plugins['custom-imagegen'].config = decoded.provider;
+      delete config.plugins['custom-imagegen'].config.headers;
+      migrated = migrated || decoded.migrated;
+    }
     if (Array.isArray(config.providers)) {
       config.providers = config.providers.map((provider) => {
         const decoded = decodeProviderSecrets(provider);

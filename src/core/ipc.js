@@ -5,6 +5,8 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { normalizeModelLimits, normalizeTheme, normalizeUpdateSettings } = require('./store.js');
 const { normalizeBaseUrl } = require('./base-url.js');
+const { normalizeImageConfig } = require('./plugin-manager.js');
+const { validateImageConfig, IMAGE_ROUTE } = require('./image-generation.js');
 const { slugForProvider } = require('./model-utils.js');
 const { resolveChatGptExe } = require('./chatgpt-install.js');
 const { relaunchChatGpt } = require('./chatgpt-launch.js');
@@ -148,7 +150,9 @@ function registerIpc(deps) {
         const transfer = channel === 'gptplus:provider:export' || channel.startsWith('gptplus:provider:import:');
         const message = transfer
           ? err instanceof ProviderTransferError ? err.message : '配置文件操作失败，现有提供商配置未修改'
-          : redactDiagnostic(err && err.message ? err.message : String(err), store.providers());
+          : redactDiagnostic(err && err.message ? err.message : String(err), [
+            ...store.providers(), { ...(store.get()?.plugins?.['custom-imagegen']?.config || {}), headers: {} },
+          ]);
         ctx.log({ level: 'error', msg: `${channel}: ${message}` });
         throw new Error(message);
       }
@@ -186,8 +190,25 @@ function registerIpc(deps) {
   };
 
   // ---- 状态 ----
-  const pluginWithRuntime = (plugin) => plugin && plugin.id === 'chatgpt-plugin-catalog'
-    ? { ...plugin, catalogStatus: ctx.chatgptPluginRecovery?.status?.() || null } : plugin;
+  const pluginWithRuntime = (plugin) => plugin?.id === 'custom-imagegen'
+    ? { ...plugin, imageStatus: ctx.imagegenSkill?.status?.() || null }
+    : plugin?.id === 'chatgpt-plugin-catalog'
+      ? { ...plugin, catalogStatus: ctx.chatgptPluginRecovery?.status?.() || null } : plugin;
+
+  function changeImagePlugin(enabled, config, persist) {
+    const runtime = ctx.imagegenSkill;
+    if (!runtime) throw new Error('自定义生图技能管理器不可用');
+    const previous = plugins.get('custom-imagegen');
+    if (enabled && !previous.installed) throw new Error('请先安装插件');
+    if (enabled) validateImageConfig(config);
+    const result = runtime.sync({ enabled, preferDefault: config.preferDefault });
+    try { return pluginWithRuntime(persist()); }
+    catch (err) {
+      try { result.rollback(); }
+      catch (rollbackError) { throw new Error('插件状态保存失败，生图配置回退也失败：' + rollbackError.message); }
+      throw err;
+    }
+  }
 
   async function changeCatalogPlugin(enabled, persist) {
     const recovery = ctx.chatgptPluginRecovery;
@@ -212,12 +233,14 @@ function registerIpc(deps) {
   handle('gptplus:plugin:list', () => plugins ? plugins.list().map(pluginWithRuntime) : []);
   handle('gptplus:plugin:install', (id) => {
     if (!plugins) throw new Error('插件管理器不可用');
+    if (id === 'custom-imagegen' && plugins.get(id).installed) return pluginWithRuntime(plugins.get(id));
     if (id === 'chatgpt-plugin-catalog' && plugins.get(id).installed) return pluginWithRuntime(plugins.get(id));
     return pluginWithRuntime(plugins.install(id));
   });
   handle('gptplus:plugin:uninstall', async (id) => {
     if (!plugins) throw new Error('插件管理器不可用');
     const plugin = plugins.get(id);
+    if (plugin.id === 'custom-imagegen') return changeImagePlugin(false, plugins.config(plugin.id), () => plugins.uninstall(id));
     if (plugin.id === 'weixin') await ctx.weixinConnect?.stop?.({ persist: false });
     if (plugin.id === 'chatgpt-plugin-catalog') {
       return changeCatalogPlugin(false, () => plugins.uninstall(id));
@@ -228,6 +251,7 @@ function registerIpc(deps) {
     if (!plugins) throw new Error('插件管理器不可用');
     const id = String(patch.id || '').trim();
     const enabled = patch.enabled === true;
+    if (id === 'custom-imagegen') return changeImagePlugin(enabled, plugins.config(id), () => plugins.setEnabled(id, enabled));
     if (!enabled && id === 'weixin') await ctx.weixinConnect?.stop?.({ persist: false });
     if (id === 'chatgpt-plugin-catalog') {
       return changeCatalogPlugin(enabled, () => plugins.setEnabled(id, enabled));
@@ -236,7 +260,32 @@ function registerIpc(deps) {
   });
   handle('gptplus:plugin:config:set', (patch = {}) => {
     if (!plugins) throw new Error('插件管理器不可用');
-    return plugins.setConfig(String(patch.id || '').trim(), patch.config);
+    const id = String(patch.id || '').trim();
+    if (id === 'custom-imagegen') {
+      const config = normalizeImageConfig({ ...patch.config, apiKey: String(patch.config?.apiKey || '').trim() || plugins.config(id).apiKey });
+      validateImageConfig(config);
+      return changeImagePlugin(plugins.isActive(id), config, () => plugins.setConfig(id, config));
+    }
+    return plugins.setConfig(id, patch.config);
+  });
+  handle('gptplus:plugin:image:verify', async () => {
+    if (!plugins?.isActive('custom-imagegen')) throw new Error('请先启用自定义生图插件');
+    const gateway = ctx.gateway?.getState?.();
+    if (!gateway?.running) throw new Error('请先启动本地网关');
+    const endpoint = new URL(IMAGE_ROUTE, gateway.url).href;
+    // Exercise the same local authenticated route as the skill, not an alternate provider path.
+    let response;
+    try {
+      response = await globalThis.fetch(endpoint, {
+        method: 'POST', redirect: 'error', signal: AbortSignal.timeout(200000),
+        headers: { Authorization: 'Bearer ' + store.get().gateway.token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: 'A small white cloud on a plain blue background.', n: 1 }),
+      });
+    } catch { throw new Error('无法连接本地生图执行器或请求超时，未切换提供商'); }
+    if (!response.ok) { await response.body?.cancel(); throw new Error('生图接口验证失败（HTTP ' + response.status + '），请检查 URL、API Key 和模型'); }
+    const result = await response.json();
+    return { ok: true, model: result.model, count: result.data.length,
+      formats: result.data.map((image) => image.format), at: Date.now() };
   });
   handle('gptplus:update:state', () => updater?.getState?.() || { enabled: false, status: 'disabled' });
   handle('gptplus:update:check', () => updater?.checkForUpdates?.() || { enabled: false, status: 'disabled' });

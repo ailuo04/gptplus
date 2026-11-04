@@ -621,3 +621,15 @@ onWeixinStatus(cb): () => void;   // 事件 gptplus:weixin:status
   目录，不读取系统目录或用户主目录中的无关图片。
 - 微信凭据、状态文件与 Codex 配置都只保存在当前用户的 `~/.gptplus` /
   `~/.codex`，不写入安装包或日志（日志只记状态与错误原因）。
+
+
+## 10. 自定义生图插件（2026-11-04）
+
+- 插件 id 为 `custom-imagegen`，默认未安装、未启用。配置：`{baseUrl, apiKey, model, preferDefault, resolution, aspectRatio, quality, background}`；公开插件状态使用 `hasKey` 代替 `apiKey`，包括插件事件中的 before。空白 Key 更新保留已有密钥。
+- `plugins["custom-imagegen"].config` 的 URL/Key 通过现有 `safeStorage` 加密到 `secret`，禁止无安全存储时回退明文。仅技能定位文件记录 gpt++ 配置的绝对路径，不包含凭据。
+- 认证且仅本机的 `POST /gptplus/images/generations` 接受 `{prompt, n?:1..4, size?, resolution?, aspectRatio?, quality?, background?}`，拒绝调用者传入 URL、Key 或模型；返回 `{model,data:[{b64_json,format}]}`。不接受浏览器 Origin 或对等端令牌。执行超时 180 秒、上游 JSON 响应上限 64 MiB、单图上限 24 MiB；执行脚本允许最多四张图编码后的 129 MiB 网关响应，不跟随重定向或隐式回退。PNG/JPEG/WebP 图片 URL 下载不携带 API Key。
+- 生成参数默认 `resolution="1K"`、`aspectRatio="1:1"`、`quality="auto"`、`background="auto"`；resolution 支持 1K/2K/4K，分别以长边 1024/2048/4096 px 按选定比例计算 `size`。比例支持 1:1、4:3、3:4、16:9、9:16；quality 为 low/medium/high/auto，background 为 auto/opaque/transparent；透明背景固定 `output_format="png"`。调用者可以单次覆盖生成参数，不可覆盖路由参数；未传入的字段沿用插件保存值。generate 不持久化参数、不维护任何会话级参数状态；下一次请求及并发请求重新从保存值合并其独立的本次参数。技能不得从前次生成继承临时参数，除非当前请求明确要求复用。参数与实际模型不兼容时由服务返回错误，不降低分辨率或更换参数。
+- `image-generation.js` 暴露 `createImageGeneration({plugins,fetchImpl?,timeoutMs?}) => {generate}`。`imagegen-skill.js` 暴露 `createImagegenSkill({codexHome,configPath,appConfigPath,backup}) => {sync({enabled,preferDefault}),status()}`；sync 的返回值含 changed、backupPath（有变更时）和 rollback。
+- 启用、停用、卸载及启用期间修改配置，经 IPC 同步技能与配置后持久化插件状态；状态保存失败回退本次技能和 Codex 配置写入。专用目录中已有外部修改时拒绝覆盖，配置块有内容校验。停用保留禁用的专用技能条目与插件服务配置。
+- preload 新增 `verifyImagePlugin()`，对应 `gptplus:plugin:image:verify`；仅用户明确点击付费验证入口时经同一认证本地路由生成一张图，返回 `{ok,model,count,formats,at}`，不向渲染层返回图片数据或密钥。
+- 默认优先只通过受支持的 `[[skills.config]]` 条目停用已知内置 `imagegen/SKILL.md`。状态字段 `automaticSelectionGuaranteed` 恒为 false，不能将配置成功等同于模型自动选择、底层工具关闭或真实提供商调用已验证。启用/停用和默认优先设置变更需要客户端重启、新对话生效。

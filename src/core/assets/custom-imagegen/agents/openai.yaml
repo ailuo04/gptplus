@@ -1,0 +1,6 @@
+interface:
+  display_name: "自定义生图"
+  short_description: "通过 gpt++ 中配置的自定义 Images API 生成图片；固定路由、不隐式回退"
+  default_prompt: "使用 $gptplus-imagegen 按我的描述生成图片，并保存到当前工作目录。"
+policy:
+  allow_implicit_invocation: true

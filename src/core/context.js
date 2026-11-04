@@ -18,6 +18,8 @@ const { slugForProvider, orderModels, modelKey } = require('./model-utils.js');
 const { redactDiagnostic } = require('./redact.js');
 const { createRemoteProviders, createRemoteSync, remoteProviderId } = require('./peer-sharing.js');
 const { createPluginManager } = require('./plugin-manager.js');
+const { createImageGeneration } = require('./image-generation.js');
+const { createImagegenSkill } = require('./imagegen-skill.js');
 const { createChatGptPluginRecovery } = require('./chatgpt-plugin-recovery.js');
 
 /**
@@ -50,8 +52,13 @@ async function createContext(opts = {}) {
   usageStore.load();
   const usageLive = createUsageLiveReader({ codexHome: paths.CODEX_HOME });
   const plugins = createPluginManager({ store });
+  const imageGeneration = createImageGeneration({ plugins, fetchImpl: network });
   const chatgptPluginRecovery = createChatGptPluginRecovery({
     codexHome: paths.CODEX_HOME, configPath: paths.CODEX_CONFIG_PATH, appDir: paths.APP_DIR, backup: codex.backup,
+  });
+  const imagegenSkill = createImagegenSkill({
+    codexHome: paths.CODEX_HOME, configPath: paths.CODEX_CONFIG_PATH,
+    appConfigPath: paths.CONFIG_PATH, backup: codex.backup,
   });
   // 兼容升级前的混合日志：把旧日志里的终结请求迁移到独立统计文件。
   usageStore.importLogs(logStore.all());
@@ -67,6 +74,7 @@ async function createContext(opts = {}) {
       : [];
     const full = redactDiagnostic({ at: Date.now(), level: 'info', ...entry }, [
       ...store.providers(), ...peerSecrets, ...weixinSecrets,
+      { ...plugins.config('custom-imagegen'), headers: {} },
     ]);
     logStore.append(full);
     if (full.final === true) usageStore.append(full);
@@ -107,6 +115,7 @@ async function createContext(opts = {}) {
     fetch: network,
     log: (e) => log(e),
     usageLive,
+    imageGeneration,
     taskObserver: taskMonitor,
   });
   taskMonitor.start();
@@ -179,7 +188,8 @@ async function createContext(opts = {}) {
       sharing: { enabled: cfg.sharing.enabled, clients: cfg.sharing.clients.length, models: cfg.sharing.models.length },
       remoteSync: { enabled: cfg.remoteSync.enabled, intervalMinutes: cfg.remoteSync.intervalMinutes,
         connections: cfg.remoteSync.connections.length, sources: cfg.remoteSync.sources.length },
-      plugins: plugins.list(),
+      plugins: plugins.list().map((plugin) => plugin.id === 'custom-imagegen'
+        ? { ...plugin, imageStatus: imagegenSkill.status() } : plugin),
     };
   }
 
@@ -272,6 +282,10 @@ async function createContext(opts = {}) {
       try { onStatus({ ...status(), peer: peerState(), models: models() }); } catch { /* ignore notification failures */ }
     },
   });
+  if (plugins.isActive('custom-imagegen')) {
+    try { imagegenSkill.sync({ enabled: true, preferDefault: plugins.config('custom-imagegen').preferDefault }); }
+    catch (err) { log({ level: 'warn', msg: '自定义生图技能检查失败：' + err.message }); }
+  }
   remoteSyncManager.start();
 
   return {
@@ -290,6 +304,8 @@ async function createContext(opts = {}) {
     usageTrend: () => usageStore.trend(),
     usageLive,
     plugins,
+    imageGeneration,
+    imagegenSkill,
     chatgptPluginRecovery,
     clearUsage: (mode = 'all') => {
       const preserveTrend = mode === 'details';

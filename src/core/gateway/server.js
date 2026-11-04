@@ -24,6 +24,7 @@
  *   `paths` 为签名兼容而接收，网关不直接落盘（日志走 log 回调与内存环形缓冲）。
  */
 const http = require('node:http');
+const { IMAGE_ROUTE } = require('../image-generation.js');
 const crypto = require('node:crypto');
 const { performance } = require('node:perf_hooks');
 const fs = require('node:fs');
@@ -606,6 +607,23 @@ function createGateway(deps = {}) {
     if (!authorized(req)) {
       logEntry({ level: 'warn', msg: `未授权访问: ${method} ${path}`, status: 401 });
       sendError(res, 401, '无效的网关令牌（Authorization: Bearer <token>）', 'authentication_error');
+      return;
+    }
+
+    if (path === IMAGE_ROUTE) {
+      const localAddress = String(req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+      if (!['127.0.0.1', '::1'].includes(localAddress) || req.headers.origin || !effectiveToken()) {
+        sendError(res, 403, '生图接口仅供本机执行器通过网关令牌访问', 'permission_error');
+        return;
+      }
+      if (method !== 'POST') { sendError(res, 405, '生图接口仅支持 POST', 'invalid_request_error'); return; }
+      if (!deps.imageGeneration) { sendError(res, 503, '生图执行器尚未就绪', 'api_error'); return; }
+      try {
+        const body = await readJsonBody(req, 128 * 1024);
+        sendJson(res, 200, await deps.imageGeneration.generate(body));
+      } catch (err) {
+        sendError(res, err.statusCode || 502, err.message, 'image_generation_error');
+      }
       return;
     }
 
