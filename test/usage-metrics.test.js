@@ -3,7 +3,13 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { buildUsageStatuslineStyle, computeUsageSnapshot, mergeUsageCacheEntry } = require('../src/core/usage-metrics.js');
+const { buildUsageStatuslineStyle, computeUsageSnapshot, formatTokenRate, mergeUsageCacheEntry } = require('../src/core/usage-metrics.js');
+
+test('token rate is displayed with one decimal place without rounding the measured value early', () => {
+  assert.equal(formatTokenRate(null), '--');
+  assert.equal(formatTokenRate(42.36), '42.4');
+  assert.equal(formatTokenRate(0.04), '0.0');
+});
 
 test('usage snapshot uses the latest request instead of mixing a whole turn', () => {
   const t = '2026-10-29T02:00:00.000Z';
@@ -48,6 +54,23 @@ test('usage snapshot keeps unavailable cache data unavailable instead of reporti
   assert.equal(value.context, 32);
 });
 
+test('usage snapshot includes cache writes in total input and rejects inconsistent counts', () => {
+  const t = '2026-10-29T02:00:00.000Z';
+  const valid = computeUsageSnapshot([], {
+    at: Date.parse(t), speed: 12.34, speedAvailable: true,
+    inputTokens: 100, cachedInputTokens: 30, cacheWriteTokens: 10,
+    cacheUsageAvailable: true,
+  }, Date.parse(t));
+  assert.equal(valid.cache, 30);
+  assert.equal(valid.speed, 12.34);
+
+  const invalid = computeUsageSnapshot([], {
+    at: Date.parse(t), inputTokens: 100, cachedInputTokens: 95,
+    cacheWriteTokens: 10, cacheUsageAvailable: true,
+  }, Date.parse(t));
+  assert.equal(invalid.cache, null, '缓存读取与写入之和超过输入时不能伪造命中率');
+});
+
 test('usage snapshot derives context total when rollout omits total_tokens', () => {
   const t = '2026-10-29T02:00:00.000Z';
   const value = computeUsageSnapshot([{
@@ -60,17 +83,17 @@ test('usage snapshot derives context total when rollout omits total_tokens', () 
   assert.equal(value.cacheEstimated, true);
 });
 
-test('estimated gateway usage is marked without hiding otherwise usable values', () => {
+test('estimated gateway usage retains context but cannot supply a precise token rate', () => {
   const t = '2026-10-29T02:00:00.000Z';
   const value = computeUsageSnapshot([{ t, turn_id: 'turn_1', context_window: 1000 }], {
     at: Date.parse(t), speed: 30, inputTokens: 200, cachedInputTokens: 0,
     outputTokens: 30, totalTokens: 230, cacheUsageAvailable: false, estimatedUsage: true,
   }, Date.parse(t) + 1000);
 
-  assert.equal(value.speed, 30);
+  assert.equal(value.speed, null);
   assert.equal(value.cache, null);
   assert.equal(value.context, 23);
-  assert.equal(value.speedEstimated, true);
+  assert.equal(value.speedEstimated, false);
   assert.equal(value.contextEstimated, true);
 });
 
@@ -137,4 +160,41 @@ test('request-only bridge updates preserve the last rollout events', () => {
   const first = mergeUsageCacheEntry(undefined, null, nextRequest);
   assert.deepEqual(first.events, []);
   assert.equal(first.request, nextRequest);
+});
+
+
+test('a newer rollout request cannot borrow speed or cache from a nearby older request', () => {
+  const at = Date.parse('2026-11-04T02:00:00Z');
+  const events = [{ t: new Date(at + 1000).toISOString(), input_tokens: 200,
+    cached_input_tokens: 50, cache_usage_available: true, output_tokens: 40,
+    total_tokens: 240, context_window: 1000 }];
+  const result = computeUsageSnapshot(events, {
+    at, speed: 72.35, inputTokens: 100, cachedInputTokens: 90,
+    outputTokens: 20, totalTokens: 120, cacheUsageAvailable: true,
+  }, at + 2000);
+  assert.equal(result.speed, null);
+  assert.equal(result.cache, 25);
+  assert.equal(result.context, 24);
+});
+
+test('request-completion intervals are not token generation intervals', () => {
+  const events = [
+    { t: '2026-11-04T02:00:00Z', turn_id: 'turn_1', turn_output_tokens: 10, output_tokens: 10 },
+    { t: '2026-11-04T02:00:01Z', turn_id: 'turn_1', turn_output_tokens: 110, output_tokens: 100 },
+  ];
+  assert.equal(computeUsageSnapshot(events, null).speed, null,
+    'rollout only contains completed requests and includes tool/queue/prefill time');
+});
+
+test('a contradictory unavailable speed flag wins over a populated speed value', () => {
+  assert.equal(computeUsageSnapshot([], { speed: 42.35, speedAvailable: false }).speed, null);
+});
+
+test('rollout explicit zero cache hits are valid but unavailable data stays unknown', () => {
+  const event = { t: '2026-11-04T02:00:00Z', input_tokens: 100,
+    cached_input_tokens: 0, output_tokens: 10, cache_usage_available: true };
+  const zero = computeUsageSnapshot([event], null);
+  assert.equal(zero.cache, 0);
+  assert.equal(zero.cacheEstimated, false);
+  assert.equal(computeUsageSnapshot([{ ...event, cached_input_tokens: 10, cache_usage_available: false }], null).cache, null);
 });

@@ -78,6 +78,12 @@ test('生成速度按首包后的耗时计算，并与中转面板正常样本�
   }
   assert.equal(generationSpeed({ output_tokens: 60 }, 10000), null, '缺少首包时间时不伪造速度');
   assert.equal(generationSpeed({ output_tokens: 60 }, 1050, 1000), null, '尾窗不足 50ms 时丢弃');
+  assert.equal(generationSpeed({ output_tokens: 60 }, 1000, 0), 60, '首包恰好在计时起点时仍按有效时长计算');
+  for (const invalid of [null, undefined, '', false, NaN, Infinity, -1]) {
+    assert.equal(generationSpeed({ output_tokens: 60 }, 1000, invalid), null, 'invalid first-output timestamp: ' + String(invalid));
+  }
+  assert.equal(generationSpeed({ output_tokens: 60 }, Infinity, 0), null);
+  assert.ok(Math.abs(generationSpeed({ output_tokens: 60 }, 1500.375, 500.125) - 60000 / 1000.25) < 1e-10);
   assert.equal(generationSpeed({ output_tokens: 972 }, 32159, 31099), null, '上千 tok/s 的缓冲异常样本应丢弃');
   assert.equal(generationSpeed({ output_tokens: 0 }, 10000, 1000), null);
 });
@@ -433,7 +439,8 @@ test('三协议 3x3 转换矩阵：JSON/SSE 均保留文本、两路工具、缓
           if (protocol === 'responses') Object.assign(body, { input: 'matrix input', tools: [{ type: 'function', name: 'alpha', parameters: { type: 'object' } }] });
           else if (protocol === 'chat') Object.assign(body, { messages: [{ role: 'user', content: 'matrix input' }], stream_options: { include_usage: true }, tools: [{ type: 'function', function: { name: 'alpha', parameters: { type: 'object' } } }] });
           else Object.assign(body, { max_tokens: 100, messages: [{ role: 'user', content: 'matrix input' }], tools: [{ name: 'alpha', input_schema: { type: 'object' } }] });
-          const response = await postJson(`http://127.0.0.1:${ctx.port}/v1/${route}`, body);
+          const response = await postJson(`http://127.0.0.1:${ctx.port}/v1/${route}`, body, { 'User-Agent': 'codex_cli_rs/test-matrix' });
+          assert.equal(upstream.requests.at(-1).headers['user-agent'], 'codex_cli_rs/test-matrix');
           assert.equal(response.status, 200, `${protocol}->${providers[index].api}, stream=${stream}: ${response.text}`);
           if (!stream) {
             const json = JSON.parse(response.text);
@@ -737,8 +744,8 @@ test('对等网关：A↔B 双向清单授权、独立上游凭据、Responses J
 
   const slugFor = (sourceId, providerId, modelId) => remoteProviderId(sourceId) + '__' + providerId + '::' + modelId;
   const [responseAtoB, responseBtoA] = await Promise.all([
-    postJson(startedA.url + '/responses', { model: slugFor('source-B', providerB.id, 'model-b'), input: 'A to B', stream: false }),
-    postJson(startedB.url + '/responses', { model: slugFor('source-A', providerA.id, 'model-a'), input: 'B to A', stream: false }),
+    postJson(startedA.url + '/responses', { model: slugFor('source-B', providerB.id, 'model-b'), input: 'A to B', stream: false }, { 'User-Agent': 'codex_cli_rs/peer-A' }),
+    postJson(startedB.url + '/responses', { model: slugFor('source-A', providerA.id, 'model-a'), input: 'B to A', stream: false }, { 'User-Agent': 'codex_cli_rs/peer-B' }),
   ]);
   assert.equal(responseAtoB.status, 200);
   assert.equal(JSON.parse(responseAtoB.text).output[0].content[0].text, 'B');
@@ -746,6 +753,8 @@ test('对等网关：A↔B 双向清单授权、独立上游凭据、Responses J
   assert.equal(JSON.parse(responseBtoA.text).output[0].content[0].text, 'A');
   assert.equal(upstreamA.requests.length, 1);
   assert.equal(upstreamB.requests.length, 1);
+  assert.equal(upstreamA.requests[0].headers['user-agent'], 'codex_cli_rs/peer-B');
+  assert.equal(upstreamB.requests[0].headers['user-agent'], 'codex_cli_rs/peer-A');
 
   const streamed = await fetch(startedB.url + '/responses', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ model: slugFor('source-A', providerA.id, 'model-a'), input: 'stream', stream: true }) });
@@ -1945,9 +1954,10 @@ test('上游 400 报可选参数错误时去掉可选参数重试一次（compat
       input: 'hi',
       max_output_tokens: 128,
       reasoning: { effort: 'medium' },
-    });
+    }, { 'User-Agent': 'codex_cli_rs/compat-retry' });
     assert.equal(res.status, 200);
     assert.equal(calls, 2, '应重试一次');
+    assert.deepEqual(upstream.requests.map(request => request.headers['user-agent']), ['codex_cli_rs/compat-retry', 'codex_cli_rs/compat-retry']);
     const frames = parseFrames(res.text);
     assert.equal(frames.find((f) => f.json && f.json.type === 'response.output_text.done').json.text, 'ok after retry');
     assert.equal(upstream.requests[0].body.prompt_cache_key, 'session-cache-key');
@@ -2961,10 +2971,11 @@ test('gateway: Responses 上游瞬时 502 -> 只重试一次并成功', async ()
       model: 'p_resp01__gpt-6.1-sol',
       input: '你好',
       stream: false,
-    });
+    }, { 'User-Agent': 'codex_cli_rs/transient-retry' });
     assert.equal(res.status, 200);
     assert.equal(JSON.parse(res.text).id, 'resp_retry');
     assert.equal(hits, 2);
+    assert.deepEqual(upstream.requests.map(request => request.headers['user-agent']), ['codex_cli_rs/transient-retry', 'codex_cli_rs/transient-retry']);
     assert.ok(logs.some((entry) => entry.msg.includes('短暂重试一次')));
   } finally {
     await ctx.gw.stop();
@@ -3409,4 +3420,176 @@ test('gateway: 微信请求中的本地图片在转发前内联，普通请求�
   } finally {
     await ctx.gw.stop();
   }
+});
+
+
+test('gateway: Chat 与 Responses 流式计时不受系统时钟跳变影响', async (t) => {
+  const originalNow = Date.now;
+  let clockJump = 0;
+  t.mock.method(Date, 'now', () => originalNow() + clockJump);
+  const upstream = await startMockUpstream((req, res) => {
+    clockJump = 0;
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    const send = value => res.write('data: ' + JSON.stringify(value) + '\n\n');
+    if (req.url.endsWith('/responses')) {
+      send({ type: 'response.output_text.delta', delta: 'hello' });
+      setTimeout(() => {
+        clockJump = 60000;
+        send({ type: 'response.completed', response: { id: 'resp_clock', output: [], usage: { input_tokens: 100, output_tokens: 20, input_tokens_details: { cached_tokens: 30, cache_write_tokens: 10 } } } });
+        res.end();
+      }, 100);
+    } else {
+      send({ choices: [{ delta: { content: 'hello' } }] });
+      setTimeout(() => {
+        clockJump = 60000;
+        send({ choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 100, completion_tokens: 20, prompt_tokens_details: { cached_tokens: 30 } } });
+        res.end('data: [DONE]\n\n');
+      }, 100);
+    }
+  });
+  t.after(() => upstream.close());
+  for (const api of ['openai', 'responses']) {
+    clockJump = 0;
+    const provider = { ...SAMPLE_PROVIDER, api, baseUrl: upstream.url + '/v1' };
+    const { gw, base, logs } = await withGateway({ providers: [provider] });
+    try {
+      const result = await postJson(base + '/responses', {
+        model: 'p_ab12cd__gpt-6.1-sol', input: 'hi', stream: true,
+        prompt_cache_key: 'thread_clock_1234',
+      });
+      assert.equal(result.status, 200);
+      const entry = logs.find(item => item.final === true);
+      assert.ok(entry.ms < 1000, 'wall-clock jump must not add 60 seconds: ' + entry.ms);
+      assert.ok(entry.speed > 50 && entry.speed < 600, 'measured tok/s: ' + entry.speed);
+      assert.ok(Math.abs(entry.speed - 20000 / (entry.ms - entry.firstOutputMs)) < 1e-8);
+      assert.equal(gw.getRequestSpeed('thread_clock_1234').cachedInputTokens, 30);
+    } finally { await gw.stop(); }
+  }
+});
+
+
+test('cache availability requires valid read usage, not cache writes or malformed numbers', () => {
+  const { hasCacheUsage } = require('../src/core/gateway/responses.js');
+  for (const usage of [
+    { cache_creation_input_tokens: 10 },
+    { input_tokens_details: { cache_write_tokens: 10 } },
+    { input_tokens_details: { cached_tokens: 'unknown' } },
+    { cache_read_input_tokens: -1 },
+    { input_tokens: 100, input_tokens_details: { cached_tokens: 110 } },
+    { input_tokens: 100, input_tokens_details: { cached_tokens: 95, cache_write_tokens: 10 } },
+  ]) assert.equal(hasCacheUsage(usage), false);
+  assert.equal(hasCacheUsage({ cache_read_input_tokens: 0 }), true);
+});
+
+test('Anthropic JSON/SSE preserve unknown vs explicit zero cache-read usage', async () => {
+  const { hasCacheUsage } = require('../src/core/gateway/responses.js');
+  for (const cached of [undefined, 0, 30]) {
+    const usage = { input_tokens: 100, cache_creation_input_tokens: 10, output_tokens: 5,
+      ...(cached === undefined ? {} : { cache_read_input_tokens: cached }) };
+    const parsed = anthropicAdapter.parseJson({ content: [{ type: 'text', text: 'ok' }], usage });
+    assert.equal(hasCacheUsage(parsed.usage), cached !== undefined);
+    assert.equal(parsed.usage.input_tokens, 110 + (cached || 0));
+    const records = [
+      { type: 'message_start', message: { usage } },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 5 } },
+      { type: 'message_stop' },
+    ];
+    const upstream = new Response(records.map(record => 'data: ' + JSON.stringify(record) + '\n\n').join(''));
+    const usages = [];
+    for await (const event of anthropicAdapter.translate(upstream)) if (event.type === 'usage') usages.push(event.usage);
+    assert.equal(usages.length, 2);
+    for (const value of usages) assert.equal(hasCacheUsage(value), cached !== undefined);
+  }
+});
+
+
+test('gateway: missing upstream usage does not turn character estimates into measured tok/s', async (t) => {
+  const upstream = await startMockUpstream((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.write('data: ' + JSON.stringify({ choices: [{ delta: { content: 'hello world' } }] }) + '\n\n');
+    setTimeout(() => res.end('data: ' + JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }) + '\n\ndata: [DONE]\n\n'), 100);
+  });
+  t.after(() => upstream.close());
+  const { gw, base, logs } = await withGateway({ providers: [{ ...SAMPLE_PROVIDER, baseUrl: upstream.url + '/v1' }] });
+  t.after(() => gw.stop());
+  assert.equal((await postJson(base + '/responses', {
+    model: 'p_ab12cd__gpt-6.1-sol', input: 'hi', stream: true, prompt_cache_key: 'thread_estimate_1234',
+  })).status, 200);
+  const entry = logs.find(value => value.final === true);
+  assert.equal(entry.estimatedUsage, true);
+  assert.equal(entry.speed, undefined);
+  assert.equal(gw.getRequestSpeed('thread_estimate_1234').speedAvailable, false);
+});
+
+
+test('gateway: User-Agent 转发且提供商自定义优先，不污染后续请求', async (t) => {
+  const upstream = await startMockUpstream((req, res, body) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    const usage = { input_tokens: 1, output_tokens: 1 };
+    if (req.url.endsWith('/chat/completions')) {
+      res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1 } }));
+    } else if (req.url.endsWith('/messages')) {
+      res.end(JSON.stringify({ type: 'message', role: 'assistant', content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', usage }));
+    } else {
+      res.end(JSON.stringify({ id: 'resp_ua', object: 'response', status: 'completed', model: body.model, output: [], usage }));
+    }
+  });
+  t.after(() => upstream.close());
+  for (const api of ['openai', 'responses', 'anthropic']) {
+    await t.test(api, async () => {
+      const provider = { ...SAMPLE_PROVIDER, api, baseUrl: upstream.url + '/v1', headers: {} };
+      const { gw, base, store } = await withGateway({ providers: [provider] });
+      try {
+        const payload = { model: 'p_ab12cd__gpt-6.1-sol', input: 'hi', stream: false };
+        for (const userAgent of ['codex_cli_rs/0.159.0 (Windows; x86_64)', 'codex_exec/other-session', 'another-client/1.0']) {
+          const result = await postJson(base + '/responses', payload, { 'User-Agent': userAgent, Authorization: 'Bearer client-only', 'X-Private-Client': 'do-not-forward' });
+          assert.equal(result.status, 200, result.text);
+          assert.equal(upstream.requests.at(-1).headers['user-agent'], userAgent);
+          assert.equal(upstream.requests.at(-1).headers['x-private-client'], undefined);
+          assert.equal(upstream.requests.at(-1).headers.authorization, api === 'anthropic' ? undefined : 'Bearer sk-upstream-key');
+          assert.deepEqual(provider.headers, {});
+        }
+        for (const name of ['User-Agent', 'user-agent', 'uSeR-aGeNt']) {
+          store.update(cfg => { cfg.providers[0].headers = { [name]: 'custom-provider/1.0' }; });
+          const result = await postJson(base + '/responses', payload, { 'User-Agent': 'codex_cli_rs/client' });
+          assert.equal(result.status, 200, result.text);
+          assert.equal(upstream.requests.at(-1).headers['user-agent'], 'custom-provider/1.0');
+        }
+        store.update(cfg => { cfg.providers[0].headers = {}; });
+        // node:http 不自动加 UA：缺少入站 UA 时不冒充 Codex，也不复用上一请求的 UA。
+        await new Promise((resolve, reject) => {
+          const request = http.request(base + '/responses', { method: 'POST', headers: { 'Content-Type': 'application/json' } }, response => {
+            response.resume();
+            response.on('error', reject);
+            response.on('end', () => { try { assert.equal(response.statusCode, 200); resolve(); } catch (error) { reject(error); } });
+          });
+          request.on('error', reject);
+          request.end(JSON.stringify(payload));
+        });
+        assert.doesNotMatch(upstream.requests.at(-1).headers['user-agent'] || '', /codex|custom-provider/);
+      } finally { await gw.stop(); }
+    });
+  }
+});
+
+
+test('gateway: 实际 Undici 网络层使用 Codex User-Agent 而不是 undici 默认值', async (t) => {
+  const { createSystemProxyFetch } = require('../src/core/system-proxy.js');
+  const upstream = await startMockUpstream((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ id: 'resp_undici_ua', object: 'response', status: 'completed', output: [], usage: { input_tokens: 1, output_tokens: 1 } }));
+  });
+  t.after(() => upstream.close());
+  const network = createSystemProxyFetch({ mode: 'direct' });
+  t.after(() => network.close());
+  const store = makeStore([{ ...SAMPLE_PROVIDER, api: 'responses', baseUrl: upstream.url + '/v1' }]);
+  const gw = createGateway({ store, fetch: network });
+  const started = await gw.start({ port: 0, host: '127.0.0.1', token: '' });
+  t.after(() => gw.stop());
+  const userAgent = 'codex_cli_rs/0.159.0 (Windows 11; x86_64)';
+  const result = await postJson(started.url + '/responses', {
+    model: 'p_ab12cd__gpt-6.1-sol', input: 'hi', stream: false,
+  }, { 'User-Agent': userAgent });
+  assert.equal(result.status, 200, result.text);
+  assert.equal(upstream.requests[0].headers['user-agent'], userAgent);
 });

@@ -3,6 +3,10 @@
 const REQUEST_MATCH_MS = 15000;
 const STALE_MS = 120000;
 
+function formatTokenRate(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value.toFixed(1) : '--';
+}
+
 /**
  * 状态栏只展示最近一次完整请求的数据。该函数同时被打包进 ChatGPT 页面脚本，
  * 因此必须保持自包含，不能引用模块级变量或 Node API。
@@ -26,7 +30,9 @@ function computeUsageSnapshot(events, request, now = Date.now()) {
   if (request) {
     if (!latest) matched = true;
     else if (Number.isFinite(latestTime) && Number.isFinite(requestTime)) {
-      matched = requestTime >= latestTime - 15000;
+      const sameUsage = value(request.inputTokens) === value(latest.input_tokens)
+        && value(request.outputTokens) === value(latest.output_tokens);
+      matched = requestTime >= latestTime || (requestTime >= latestTime - 15000 && sameUsage);
     } else {
       const requestOutput = value(request.outputTokens);
       const latestOutput = value(latest.output_tokens);
@@ -34,34 +40,12 @@ function computeUsageSnapshot(events, request, now = Date.now()) {
     }
   }
 
-  function eventSpeed() {
-    if (!list.length) return null;
-    let start = list.length - 1;
-    const turnId = list[start].turn_id;
-    if (typeof turnId === 'string' && turnId) {
-      while (start > 0 && list[start - 1].turn_id === turnId) start -= 1;
-    }
-    const intervals = [];
-    for (let index = start + 1; index < list.length; index += 1) {
-      const before = list[index - 1];
-      const current = list[index];
-      const delta = (value(current.turn_output_tokens) || 0) - (value(before.turn_output_tokens) || 0);
-      const seconds = (Date.parse(current.t) - Date.parse(before.t)) / 1000;
-      if (delta <= 0 || seconds < 0.5 || seconds > 120) continue;
-      intervals.push({ delta, seconds });
-    }
-    const recent = intervals.slice(-3);
-    const totalSeconds = recent.reduce((sum, item) => sum + item.seconds, 0);
-    return totalSeconds > 0 ? recent.reduce((sum, item) => sum + item.delta, 0) / totalSeconds : null;
-  }
-
-  const requestSpeedUnavailable = matched && request?.speedAvailable === false;
-  const requestSpeed = matched ? value(request && request.speed) : null;
-  const fallbackSpeed = requestSpeed === null && !requestSpeedUnavailable ? eventSpeed() : null;
-  const speed = requestSpeed !== null && requestSpeed > 0 ? requestSpeed : fallbackSpeed;
-  const speedEstimated = requestSpeed !== null
-    ? matched && request?.estimatedUsage === true
-    : fallbackSpeed !== null;
+  // token_count is a request-completion snapshot, not per-token telemetry.
+  // Inter-request time includes tools/queue/prefill and cannot measure decoding speed.
+  const requestSpeed = matched && request?.speedAvailable !== false && request?.estimatedUsage !== true
+    ? value(request && request.speed) : null;
+  const speed = requestSpeed !== null && requestSpeed > 0 ? requestSpeed : null;
+  const speedEstimated = false;
 
   const latestInput = latest ? value(latest.input_tokens) : null;
   const latestCached = latest ? value(latest.cached_input_tokens) : null;
@@ -69,15 +53,17 @@ function computeUsageSnapshot(events, request, now = Date.now()) {
   const requestCached = matched ? value(request && request.cachedInputTokens) : null;
   let cache = null;
   let cacheEstimated = false;
-  if (matched && request && request.cacheUsageAvailable === true) {
-    if (requestInput > 0 && requestCached !== null) cache = percent(Math.min(requestCached, requestInput), requestInput);
-  } else if (!(matched && request && request.cacheUsageAvailable === false)) {
-    const input = requestInput > 0 ? requestInput : latestInput;
-    const cached = requestInput > 0 ? requestCached : latestCached;
-    const explicitlyAvailable = requestInput > 0 || latest?.cache_usage_available === true || (cached || 0) > 0;
-    if (input > 0 && cached !== null && explicitlyAvailable) {
-      cache = percent(Math.min(cached, input), input);
-      cacheEstimated = true;
+  if (matched && request && request.cacheUsageAvailable !== false) {
+    const cacheWrite = request.cacheWriteTokens === undefined ? 0 : value(request.cacheWriteTokens);
+    if (requestInput > 0 && requestCached !== null && cacheWrite !== null && requestCached + cacheWrite <= requestInput) {
+      cache = percent(requestCached, requestInput);
+      cacheEstimated = request.cacheUsageAvailable !== true || request.estimatedUsage === true;
+    }
+  } else if (!matched && latest?.cache_usage_available !== false) {
+    const available = latest?.cache_usage_available === true || (latestCached || 0) > 0;
+    if (latestInput > 0 && latestCached !== null && latestCached <= latestInput && available) {
+      cache = percent(latestCached, latestInput);
+      cacheEstimated = latest?.cache_usage_available !== true;
     }
   }
 
@@ -130,5 +116,6 @@ module.exports = {
   STALE_MS,
   buildUsageStatuslineStyle,
   computeUsageSnapshot,
+  formatTokenRate,
   mergeUsageCacheEntry,
 };

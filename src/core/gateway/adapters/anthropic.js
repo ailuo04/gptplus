@@ -66,10 +66,11 @@ function firstUsageNumber(...values) {
 }
 
 function normalizeUsageCounts(usage, previous = {}) {
-  const cachedInputTokens = firstUsageNumber(
+  const reportedCacheRead = firstUsageNumber(
     usage?.prompt_cache_hit_tokens,
     usage?.cache_read_input_tokens,
-  ) ?? previous.cachedInputTokens ?? 0;
+  );
+  const cachedInputTokens = reportedCacheRead ?? previous.cachedInputTokens ?? 0;
   const uncachedInputTokens = firstUsageNumber(
     usage?.prompt_cache_miss_tokens,
     usage?.input_tokens,
@@ -83,6 +84,7 @@ function normalizeUsageCounts(usage, previous = {}) {
     uncachedInputTokens,
     outputTokens,
     cachedInputTokens,
+    cacheReadAvailable: reportedCacheRead !== null || previous.cacheReadAvailable === true,
     cacheCreationInputTokens,
   };
 }
@@ -98,7 +100,7 @@ function usageEvent(usage, previous) {
         input_tokens: counts.inputTokens,
         output_tokens: counts.outputTokens,
         total_tokens: counts.inputTokens + counts.outputTokens,
-        cache_read_input_tokens: counts.cachedInputTokens,
+        ...(counts.cacheReadAvailable ? { cache_read_input_tokens: counts.cachedInputTokens } : {}),
         cache_creation_input_tokens: counts.cacheCreationInputTokens,
       },
     },

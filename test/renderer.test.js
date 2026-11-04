@@ -1640,7 +1640,7 @@ test('三个页面与提供商表单能在 DOM 替身上真实渲染', async () 
     const uRoot = new FakeNode('main');
     usageMod.renderUsage(uRoot, usageCtx, new FakeNode('div'));
     assert.match(uRoot.allText(), /缓存命中率/, '使用量页应显示缓存命中率');
-    assert.match(uRoot.allText(), /60%/, '缓存命中率应按缓存输入 Token / 总输入 Token 计算');
+    assert.match(uRoot.allText(), /60\.0%/, '缓存命中率应按缓存输入 Token / 总输入 Token 计算');
   } finally {
     delete globalThis.document;
     delete globalThis.window;
@@ -3622,6 +3622,41 @@ test('插件市场：目录修复需明确确认，显示本地缓存状态与�
     const missing = new FakeNode('main');
     pluginsMod.renderPlugins(missing, ctx, new FakeNode('div'));
     assert.match(missing.allText(), /未找到 ChatGPT 的本机插件目录/);
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+
+test('使用量页：缓存统计纳入真实零命中、排除未知并按输入 Token 加权', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const usageMod = await import(pathToFileURL(path.join(tmp, 'views/usage.js')).href);
+    installFakeDom();
+    const now = Date.now();
+    const base = { at: now, providerId: 'p_demo0001', status: 200, ms: 100, final: true };
+    const logs = [
+      { ...base, model: 'hit', tokens: { input_tokens: 100, input_tokens_details: { cached_tokens: 60, cache_write_tokens: 10 } } },
+      { ...base, model: 'zero', tokens: { input_tokens: 200, input_tokens_details: { cached_tokens: 0 } } },
+      { ...base, model: 'unknown', cacheUsageAvailable: false, tokens: { input_tokens: 900, input_tokens_details: { cached_tokens: 0 } } },
+    ];
+    const root = new FakeNode('main');
+    usageMod.renderUsage(root, makeCtx(appMod, fixtureState({ logs })), new FakeNode('div'));
+    const card = findNodes(root, n => String(n.className).split(/\s+/).includes('usage-stat')).find(n => n.allText().includes('缓存命中率'));
+    assert.ok(card);
+    assert.match(card.allText(), /20(?:\.0)?%/);
+    assert.match(card.allText(), /缓存 60 \/ 输入 300/);
+    assert.match(card.allText(), /2 \/ 3/);
+    const zeroRow = findNodes(root,n=>String(n.className).split(/\s+/).includes('usage-table-row')).find(n=>n.allText().includes('zero'));
+    assert.equal(zeroRow.childNodes[5].textContent, '0.0%');
+    usageMod.renderUsage(root, makeCtx(appMod, fixtureState({ logs: [logs[2]] })), new FakeNode('div'));
+    const unknownCard = findNodes(root, n => String(n.className).split(/\s+/).includes('usage-stat')).find(n => n.allText().includes('缓存命中率'));
+    assert.match(unknownCard.allText(), /—/);
+    assert.doesNotMatch(unknownCard.allText(), /0%/);
   } finally {
     delete globalThis.document;
     delete globalThis.window;

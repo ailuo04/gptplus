@@ -48,6 +48,7 @@
  *        codex_rollout_budget_units(故意不写)
  */
 const crypto = require('node:crypto');
+const { performance } = require('node:perf_hooks');
 const { ensureApiVersion } = require('../base-url.js');
 
 const DONE_FRAME = 'data: [DONE]\n\n';
@@ -76,21 +77,23 @@ function asNumber(value, fallback = 0) {
 }
 
 function hasCacheUsage(raw) {
-  return !!(
-    raw &&
-    typeof raw === 'object' &&
-    (raw.input_tokens_details?.cached_tokens != null ||
-      raw.input_tokens_details?.cached_input_tokens != null ||
-      raw.prompt_tokens_details?.cached_tokens != null ||
-      raw.cached_input_tokens != null ||
-      raw.cached_tokens != null ||
-      raw.cache_read_input_tokens != null ||
-      raw.prompt_cache_hit_tokens != null ||
-      raw.cache_creation_input_tokens != null ||
-      raw.cache_creation_tokens != null ||
-      raw.input_tokens_details?.cache_creation_tokens != null ||
-      raw.input_tokens_details?.cache_write_tokens != null)
-  );
+  if (!raw || typeof raw !== 'object') return false;
+  // Cache writes alone say nothing about how many input tokens were cache hits.
+  const cached = [
+    raw.input_tokens_details?.cached_tokens,
+    raw.input_tokens_details?.cached_input_tokens,
+    raw.prompt_tokens_details?.cached_tokens,
+    raw.cached_input_tokens,
+    raw.cached_tokens,
+    raw.cache_read_input_tokens,
+    raw.prompt_cache_hit_tokens,
+  ].find((value) => (typeof value === 'number' || (typeof value === 'string' && value.trim() !== ''))
+    && asNumber(value, null) !== null);
+  if (cached === undefined) return false;
+  const input = asNumber(raw.input_tokens ?? raw.prompt_tokens, null);
+  const cacheWrite = asNumber(raw.input_tokens_details?.cache_write_tokens ?? raw.input_tokens_details?.cache_creation_tokens
+    ?? raw.cache_creation_input_tokens ?? raw.cache_creation_tokens);
+  return input === null || asNumber(cached) + cacheWrite <= input;
 }
 
 /**
@@ -149,9 +152,10 @@ function generationSpeed(rawUsage, elapsedMs, firstOutputMs) {
   const usage = normalizeUsage(rawUsage);
   const output = usage ? usage.output_tokens : 0;
   const totalMs = Number(elapsedMs);
-  if (!(output > 0) || !(totalMs > 0)) return null;
+  if (!(output > 0) || !Number.isFinite(totalMs) || !(totalMs > 0)) return null;
+  if (firstOutputMs === null || firstOutputMs === undefined || firstOutputMs === '' || typeof firstOutputMs === 'boolean') return null;
   const firstOutput = Number(firstOutputMs);
-  if (!(firstOutput > 0 && firstOutput < totalMs)) return null;
+  if (!Number.isFinite(firstOutput) || firstOutput < 0 || !(firstOutput < totalMs)) return null;
   const activeMs = totalMs - firstOutput;
   if (!(activeMs >= 50)) return null;
   const speed = output / (activeMs / 1000);
@@ -915,11 +919,11 @@ async function pipeResponsesSse(upstream, res, out) {
     if (outputDelta) out.estimateText = (out.estimateText || '') + outputDelta;
     // 首个输出片段：思考、正文、工具参数都要算。思考 Token 已经计入 usage.output_tokens，
     // 分母必须从思考开始时起算，否则 tok/s 会虚高。
-    if (!out.firstOutputAt && (textDelta || reasoningDelta || toolDelta || toolAdded)) {
-      out.firstOutputAt = Date.now();
+    if (out.firstOutputAt == null && (textDelta || reasoningDelta || toolDelta || toolAdded)) {
+      out.firstOutputAt = performance.now();
     }
-    if (!out.firstTextAt && (textDelta || textDone || toolDelta || toolAdded)) {
-      out.firstTextAt = Date.now();
+    if (out.firstTextAt == null && (textDelta || textDone || toolDelta || toolAdded)) {
+      out.firstTextAt = performance.now();
     }
     if (type === 'response.created' || type === 'response.in_progress') {
       if (!out.responseId && json?.response?.id) out.responseId = json.response.id;

@@ -144,7 +144,7 @@ test('usage statusline script retains the composer placement, icons, and valid s
   assert.match(script, /M2 12\.5a6 6 0 0 1 12 0/);
   assert.match(script, /cached_input_tokens/);
   assert.match(script, /context_window/);
-  assert.match(script, /turn_output_tokens/);
+  assert.match(script, /formatTokenRate/);
   assert.match(script, /document\.hidden/);
   assert.match(script, /if \(!card\)/);
   assert.match(script, /__gptplusUsageStatuslineDispose\?\.\(\)/);
@@ -152,7 +152,7 @@ test('usage statusline script retains the composer placement, icons, and valid s
   assert.match(script, /__gptplusUsageStatusline/);
   assert.match(script, /READY_WAIT_MS = 2000/);
   assert.match(script, /SYNC_INTERVAL_MS = 1000/);
-  assert.match(script, /gptplus-usage-statusline-v7/);
+  assert.match(script, /gptplus-usage-statusline-v8/);
   assert.match(script, /request\.speed/);
   assert.match(script, /function apply\(id, events, request\)/);
   assert.match(script, /requestTime >= latestTime - 15000/);
@@ -385,4 +385,69 @@ test('resumeUsageStatusline reattaches to a running ChatGPT and skips when absen
     findPort: async () => 9229,
     listTargetsImpl: async () => [{ id: 'x', type: 'page', title: 'Other', url: 'http://example.com' }],
   }), { ok: false, skipped: true });
+});
+
+
+test('statusline delivers fresh request usage before reading the rollout tail', async () => {
+  const order = [];
+  const bridge = startUsageStatuslineBridge({
+    cdpPort: 9337,
+    requestSpeed: () => ({ at: 1000, speed: 42.36, speedAvailable: true }),
+    read: () => { order.push('rollout'); return { status: 'ok', events: [] }; },
+    listTargetsImpl: async () => [{ id: 'fast-page', type: 'page', title: 'Codex', url: 'app://-/index.html' }],
+    evaluateImpl: async (_page, expression) => {
+      if (expression.includes('context?.()')) return { id: 'thread_fast_1234', hidden: false };
+      order.push('apply');
+      return true;
+    },
+    visibleIntervalMs: 5000,
+  });
+  try {
+    const deadline = Date.now() + 1000;
+    while (!order.includes('rollout') && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(order.includes('rollout'), true);
+    assert.equal(order[0], 'apply', 'fresh speed must not wait for rollout scanning/parsing');
+  } finally { bridge.stop(); }
+});
+
+test('injected statusline renders one decimal immediately when usage is applied', async () => {
+  const vm = require('node:vm');
+  const nodes = [];
+  class Node {
+    constructor() { this.dataset = {}; this.children = []; this.attributes = {}; this.isConnected = true; nodes.push(this); }
+    setAttribute(key, value) { this.attributes[key] = value; }
+    appendChild(node) { this.children.push(node); }
+    remove() { this.isConnected = false; }
+  }
+  const anchor = { insertAdjacentElement(_position, node) { node.isConnected = true; node.previousElementSibling = anchor; } };
+  const composerRoot = { querySelector: () => ({ getAttribute: () => 'thread_render_1234' }), getAttribute: () => 'thread' };
+  const card = {
+    isConnected: true, parentElement: anchor, getBoundingClientRect: () => ({ width: 600 }),
+    closest: selector => selector.includes('data-codex-composer-root') ? composerRoot : null,
+    querySelector: () => ({}),
+  };
+  const sandbox = {
+    document: { body: {}, head: new Node(), documentElement: { lang: 'zh-CN' },
+      querySelectorAll: () => [card], querySelector: () => null,
+      createElement: () => new Node(), createElementNS: () => new Node(),
+      getElementById: id => nodes.find(node => node.id === id && node.isConnected),
+    },
+    navigator: { language: 'zh-CN' },
+    getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
+    MutationObserver: class { observe() {} disconnect() {} },
+    setTimeout: () => 1, clearTimeout: () => {},
+  };
+  const script = buildUsageStatuslineScript();
+  assert.equal((await vm.runInNewContext(script, sandbox)).installed, true);
+  const api = sandbox.__gptplusUsageStatusline;
+  api.apply('thread_render_1234', [], { at: Date.now(), speed: 42.36, speedAvailable: true });
+  const status = nodes.find(node => node.id === 'gptplus-codex-usage-statusline');
+  const speedValue = status.children[0].children[1];
+  assert.equal(speedValue.textContent, '42.4 tok/s');
+  api.apply('thread_render_1234', [], { at: Date.now(), speed: 42, speedAvailable: true });
+  assert.equal(speedValue.textContent, '42.0 tok/s');
+  api.apply('thread_render_1234', [], { at: Date.now(), speed: null, speedAvailable: false });
+  assert.equal(speedValue.textContent, '-- tok/s');
+  assert.equal((await vm.runInNewContext(script, sandbox)).reused, true);
+  sandbox.__gptplusUsageStatuslineDispose();
 });

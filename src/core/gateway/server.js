@@ -25,6 +25,7 @@
  */
 const http = require('node:http');
 const crypto = require('node:crypto');
+const { performance } = require('node:perf_hooks');
 const fs = require('node:fs');
 const path = require('node:path');
 const { fileURLToPath } = require('node:url');
@@ -276,7 +277,7 @@ function createGateway(deps = {}) {
   function requestSnapshot(entry) {
     if (!entry || entry.final !== true || Number(entry.status) !== 200 || !entry.sessionId) return null;
     const speed = Number(entry.speed);
-    const speedAvailable = speed > 0;
+    const speedAvailable = Number.isFinite(speed) && speed > 0 && entry.estimatedUsage !== true;
     const tokens = normalizeUsage(entry.tokens);
     return {
       speed: speedAvailable ? speed : null,
@@ -662,7 +663,7 @@ function createGateway(deps = {}) {
     sendError(res, 404, `not found: ${method} ${path}`, 'invalid_request_error');
   }
 
-  async function callUpstream(adapter, { provider, modelId, body, stream, compat }, signal) {
+  async function callUpstream(adapter, { provider, modelId, body, stream, compat, userAgent }, signal) {
     if (provider.remote) {
       const connection = provider.remoteConnection;
       if (!connection || !connection.baseUrl || !connection.authToken) {
@@ -671,13 +672,18 @@ function createGateway(deps = {}) {
       const upstream = await doFetch(peerEndpoint(connection.baseUrl, 'responses'), {
         method: 'POST',
         headers: { Authorization: 'Bearer ' + connection.authToken, 'Content-Type': 'application/json',
-          Accept: stream ? 'text/event-stream' : 'application/json' },
+          Accept: stream ? 'text/event-stream' : 'application/json',
+          ...(userAgent ? { 'User-Agent': userAgent } : {}) },
         body: JSON.stringify({ ...body, model: modelId }),
         signal,
       });
       return { built: { passthrough: true }, upstream };
     }
     const built = adapter.buildRequest({ provider, modelId, body, stream, compat });
+    // 仅透传客户端 UA；凭据仍由提供商配置生成，自定义 UA（大小写无关）优先。
+    if (userAgent && !Object.keys(built.headers).some(name => name.toLowerCase() === 'user-agent')) {
+      built.headers['User-Agent'] = userAgent;
+    }
     const upstream = await doFetch(built.url, {
       method: 'POST',
       headers: built.headers,
@@ -693,7 +699,8 @@ function createGateway(deps = {}) {
   }
 
   async function handleResponses(req, res, { peerRequest = false, protocol = 'responses' } = {}) {
-    const started = Date.now();
+    const startedMono = performance.now();
+    const userAgent = req.headers['user-agent'];
     state.requests += 1;
 
     let body;
@@ -799,8 +806,8 @@ function createGateway(deps = {}) {
     const logFinal = (entry = {}) => {
       if (finalLogged) return null;
       finalLogged = true;
-      const ms = entry.ms ?? Date.now() - started;
-      const speed = entry.speed ?? generationSpeed(entry.tokens, ms, entry.firstOutputMs);
+      const ms = entry.ms ?? performance.now() - startedMono;
+      const speed = entry.estimatedUsage === true ? null : entry.speed ?? generationSpeed(entry.tokens, ms, entry.firstOutputMs);
       const sentEffort = effectiveReasoningEffort(built, body);
       const final = logEntry({
         level: 'info',
@@ -831,15 +838,15 @@ function createGateway(deps = {}) {
 
     // 客户端提前断开时，尽量保留上游已经返回的 usage 和缓存字段。
     const partialUsage = () => {
-      const firstOutputMs = firstOutputAt
-        ? firstOutputAt - started
-        : (pipe?.firstOutputAt ? pipe.firstOutputAt - started : undefined);
-      const firstTextMs = firstTextAt
-        ? firstTextAt - started
-        : (pipe?.firstTextAt ? pipe.firstTextAt - started : undefined);
+      const firstOutputMs = firstOutputAt != null
+        ? firstOutputAt - startedMono
+        : (pipe?.firstOutputAt != null ? pipe.firstOutputAt - startedMono : undefined);
+      const firstTextMs = firstTextAt != null
+        ? firstTextAt - startedMono
+        : (pipe?.firstTextAt != null ? pipe.firstTextAt - startedMono : undefined);
       const timings = {
-        ...(firstOutputMs ? { firstOutputMs } : {}),
-        ...(firstTextMs ? { firstTextMs } : {}),
+        ...(firstOutputMs != null ? { firstOutputMs } : {}),
+        ...(firstTextMs != null ? { firstTextMs } : {}),
       };
       if (stream) {
         const tokens = stream.usage || estimateUsage(body, stream.text);
@@ -872,7 +879,7 @@ function createGateway(deps = {}) {
         observed.text = pipe.outputText || observed.text;
         return logFinal({
           level: 'info',
-          msg: `完成 ${slug} -> ${route.modelId} (${Date.now() - started}ms)`,
+          msg: `完成 ${slug} -> ${route.modelId} (${Math.round(performance.now() - startedMono)}ms)`,
           status: 200,
           ...usage,
         });
@@ -896,7 +903,7 @@ function createGateway(deps = {}) {
     try {
       const firstAttempt = await callUpstream(
         adapter,
-        { provider, modelId: route.modelId, body, stream: wantStream, compat: false },
+        { provider, modelId: route.modelId, body, stream: wantStream, compat: false, userAgent },
         controller.signal,
       );
       let upstream = firstAttempt.upstream;
@@ -927,7 +934,7 @@ function createGateway(deps = {}) {
           });
           const compatAttempt = await callUpstream(
             adapter,
-            { provider, modelId: route.modelId, body, stream: wantStream, compat: extractErrorMessage(firstText, '') },
+            { provider, modelId: route.modelId, body, stream: wantStream, compat: extractErrorMessage(firstText, ''), userAgent },
             controller.signal,
           );
           upstream = compatAttempt.upstream;
@@ -949,7 +956,7 @@ function createGateway(deps = {}) {
           await sleep(UPSTREAM_TRANSIENT_RETRY_DELAY_MS);
           const retryAttempt = await callUpstream(
             adapter,
-            { provider, modelId: route.modelId, body, stream: wantStream, compat: false },
+            { provider, modelId: route.modelId, body, stream: wantStream, compat: false, userAgent },
             controller.signal,
           );
           upstream = retryAttempt.upstream;
@@ -983,7 +990,7 @@ function createGateway(deps = {}) {
           observed.text = extractResponseText(json.output);
           const entry = logFinal({
             level: 'info',
-            msg: `完成 ${slug} -> ${route.modelId} (${Date.now() - started}ms)`,
+            msg: `完成 ${slug} -> ${route.modelId} (${Math.round(performance.now() - startedMono)}ms)`,
             status: 200,
             tokens: normalizeUsage(json.usage) || estimateUsage(body, extractResponseEstimateText(json.output)),
             estimatedUsage: !json.usage || undefined,
@@ -1009,7 +1016,7 @@ function createGateway(deps = {}) {
         });
         const entry = logFinal({
           level: 'info',
-          msg: `完成 ${slug} -> ${route.modelId} (${Date.now() - started}ms)`,
+          msg: `完成 ${slug} -> ${route.modelId} (${Math.round(performance.now() - startedMono)}ms)`,
           status: 200,
           tokens: normalizeUsage(parsed.usage) || estimateUsage(body, estimateParsedOutput(parsed)),
           estimatedUsage: !parsed.usage || undefined,
@@ -1035,12 +1042,12 @@ function createGateway(deps = {}) {
           for await (const event of adapter.translate(upstream)) {
             switch (event.type) {
               case 'text':
-                if (!firstOutputAt) firstOutputAt = Date.now();
-                if (!firstTextAt) firstTextAt = Date.now();
+                if (firstOutputAt == null) firstOutputAt = performance.now();
+                if (firstTextAt == null) firstTextAt = performance.now();
                 stream.textDelta(event.delta);
                 break;
               case 'reasoning':
-                if (!firstOutputAt) firstOutputAt = Date.now();
+                if (firstOutputAt == null) firstOutputAt = performance.now();
                 stream.reasoningDelta(event.delta);
                 break;
               case 'reasoning_signature':
@@ -1054,13 +1061,13 @@ function createGateway(deps = {}) {
                 break;
               case 'tool_start':
                 sawToolCall = true;
-                if (!firstOutputAt) firstOutputAt = Date.now();
-                if (!firstTextAt) firstTextAt = Date.now();
+                if (firstOutputAt == null) firstOutputAt = performance.now();
+                if (firstTextAt == null) firstTextAt = performance.now();
                 stream.toolStart({ key: event.key ?? 0, id: event.id, name: event.name });
                 break;
               case 'tool_args':
-                if (!firstOutputAt) firstOutputAt = Date.now();
-                if (!firstTextAt) firstTextAt = Date.now();
+                if (firstOutputAt == null) firstOutputAt = performance.now();
+                if (firstTextAt == null) firstTextAt = performance.now();
                 stream.toolArgsDelta({ key: event.key ?? 0, delta: event.delta });
                 break;
               case 'usage':
@@ -1105,14 +1112,14 @@ function createGateway(deps = {}) {
           observed.text = pipe.outputText;
           const entry = logFinal({
             level: 'info',
-            msg: `完成 ${slug} -> ${route.modelId} (${Date.now() - started}ms)`,
+            msg: `完成 ${slug} -> ${route.modelId} (${Math.round(performance.now() - startedMono)}ms)`,
             status: 200,
             tokens: normalizeUsage(pipe.usage) || estimateUsage(body, pipe.estimateText || pipe.outputText),
             cacheUsageAvailable: hasCacheUsage(pipe.usage),
             estimatedUsage: !pipe.usage || undefined,
             events: pipe.events,
-            firstOutputMs: pipe.firstOutputAt ? pipe.firstOutputAt - started : undefined,
-            firstTextMs: pipe.firstTextAt ? pipe.firstTextAt - started : undefined,
+            firstOutputMs: pipe.firstOutputAt != null ? pipe.firstOutputAt - startedMono : undefined,
+            firstTextMs: pipe.firstTextAt != null ? pipe.firstTextAt - startedMono : undefined,
           });
           if (!res.writableEnded) res.end();
           return entry;
@@ -1122,14 +1129,14 @@ function createGateway(deps = {}) {
         stream.complete({ requestBody: body, finishReason });
         logFinal({
           level: 'info',
-          msg: `完成 ${slug} -> ${route.modelId} (${Date.now() - started}ms)`,
+          msg: `完成 ${slug} -> ${route.modelId} (${Math.round(performance.now() - startedMono)}ms)`,
           status: 200,
           tokens: stream.usage,
           cacheUsageAvailable: stream.cacheUsageAvailable,
           estimatedUsage: stream.usageEstimated || undefined,
           events: stream.emittedTypes.length,
-          firstOutputMs: firstOutputAt ? firstOutputAt - started : undefined,
-          firstTextMs: firstTextAt ? firstTextAt - started : undefined,
+          firstOutputMs: firstOutputAt != null ? firstOutputAt - startedMono : undefined,
+          firstTextMs: firstTextAt != null ? firstTextAt - startedMono : undefined,
         });
       } catch (err) {
         err.message = redactDiagnostic(err.message, [provider]);
@@ -1137,7 +1144,7 @@ function createGateway(deps = {}) {
           finalizeClientGone();
           return;
         }
-        logEntry({ level: 'error', msg: `请求异常: ${err && err.message ? err.message : err}`, ...baseLog, status: 502, ms: Date.now() - started });
+        logEntry({ level: 'error', msg: `请求异常: ${err && err.message ? err.message : err}`, ...baseLog, status: 502, ms: performance.now() - startedMono });
         logFinal({
           level: 'error',
           msg: `流式转发失败: ${err.message}`,

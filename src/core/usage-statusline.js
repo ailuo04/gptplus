@@ -1,6 +1,6 @@
 'use strict';
 
-const { buildUsageStatuslineStyle, computeUsageSnapshot, mergeUsageCacheEntry } = require('./usage-metrics.js');
+const { buildUsageStatuslineStyle, computeUsageSnapshot, formatTokenRate, mergeUsageCacheEntry } = require('./usage-metrics.js');
 
 function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
   const readyWait = Math.max(500, Number(readyWaitMs) || 12000);
@@ -18,9 +18,10 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
   const EXT_ATTR = "data-gptplus-usage-statusline";
   const CIRCUMFERENCE = 37.7;
   const SYNC_INTERVAL_MS = 1000;
-  const runtimeKey = "gptplus-usage-statusline-v7";
+  const runtimeKey = "gptplus-usage-statusline-v8";
   const STYLE_TEXT = ${JSON.stringify(buildUsageStatuslineStyle())};
   const computeUsageSnapshot = ${computeUsageSnapshot.toString()};
+  const formatTokenRate = ${formatTokenRate.toString()};
   const mergeUsageCacheEntry = ${mergeUsageCacheEntry.toString()};
   if (globalThis.__gptplusUsageStatuslineRuntime === runtimeKey && globalThis.__gptplusUsageStatusline) {
     return { ok: true, installed: true, reused: true };
@@ -152,7 +153,7 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
     if (!node?.isConnected) return;
     const parts = state.parts || build(node);
     const labels = textLabels();
-    const speed = value?.speed == null ? "--" : String(Math.max(0, Math.round(value.speed)));
+    const speed = formatTokenRate(value?.speed);
     const cache = value?.cache == null ? "--" : value.cache.toFixed(1) + "%";
     const context = value?.context == null ? "--" : Math.round(value.context) + "%";
     const fingerprint = [

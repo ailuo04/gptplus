@@ -172,6 +172,7 @@ function startUsageStatuslineBridge({
   let stopped = false;
   let target = null;
   let lastErrorAt = 0;
+  let lastRequestKey = null;
   let wakeResolver = null;
   let wakeRequested = false;
 
@@ -228,6 +229,12 @@ function startUsageStatuslineBridge({
           }
           if (value?.id) {
             const request = typeof requestSpeed === 'function' ? requestSpeed(value.id) : null;
+            // Push fresh request metrics before synchronous rollout scanning/parsing.
+            const requestKey = JSON.stringify([target.id, value.id, request]);
+            if (request && requestKey !== lastRequestKey) {
+              await evaluateImpl(target, applyExpression(value.id, null, request), { timeoutMs: COMMAND_TIMEOUT_MS });
+              lastRequestKey = requestKey;
+            }
             let snapshot = null;
             try {
               snapshot = read(value.id);
@@ -247,6 +254,7 @@ function startUsageStatuslineBridge({
         }
       } catch (error) {
         target = null;
+        lastRequestKey = null;
         prepared.clear();
         delay = BRIDGE_RETRY_MS;
         reportError('输入框用量栏数据推送暂停', error);

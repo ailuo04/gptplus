@@ -24,13 +24,18 @@ function tokenMetrics(entry) {
   const output = firstToken(usage.output_tokens, usage.completion_tokens);
   const cached = firstToken(
     usage.input_tokens_details?.cached_tokens,
+    usage.input_tokens_details?.cached_input_tokens,
     usage.prompt_tokens_details?.cached_tokens,
     usage.cache_read_input_tokens,
+    usage.cached_input_tokens,
+    usage.prompt_cache_hit_tokens,
     usage.cached_tokens,
   );
   const cacheWrite = firstToken(
     usage.input_tokens_details?.cache_write_tokens,
+    usage.input_tokens_details?.cache_creation_tokens,
     usage.cache_creation_input_tokens,
+    usage.cache_creation_tokens,
     usage.cache_write_tokens,
   );
   const reasoning = firstToken(
@@ -86,14 +91,15 @@ function hasCacheUsage(entry) {
   const usage = entry?.tokens && typeof entry.tokens === 'object' ? entry.tokens : {};
   if (entry?.cacheUsageAvailable === false) return false;
   if (entry?.cacheUsageAvailable === true) return true;
-  const explicit = Object.prototype.hasOwnProperty.call(usage, 'cached_tokens') ||
-    Object.prototype.hasOwnProperty.call(usage, 'cache_read_input_tokens') ||
-    Object.prototype.hasOwnProperty.call(usage, 'cache_creation_input_tokens') ||
-    Object.prototype.hasOwnProperty.call(usage, 'cache_write_tokens') ||
-    Object.prototype.hasOwnProperty.call(usage.prompt_tokens_details || {}, 'cached_tokens') ||
-    cachedTokenCount(entry) > 0 ||
-    cacheWriteTokenCount(entry) > 0;
-  return explicit;
+  return [
+    usage.input_tokens_details?.cached_tokens,
+    usage.input_tokens_details?.cached_input_tokens,
+    usage.prompt_tokens_details?.cached_tokens,
+    usage.cached_input_tokens,
+    usage.cached_tokens,
+    usage.cache_read_input_tokens,
+    usage.prompt_cache_hit_tokens,
+  ].some((value) => tokenValue(value) !== null);
 }
 
 function cacheHitRate(entry) {
@@ -101,7 +107,8 @@ function cacheHitRate(entry) {
   const input = inputTokenCount(entry);
   if (input <= 0) return null;
   const cached = Math.max(0, cachedTokenCount(entry));
-  return Math.min(100, (cached / input) * 100);
+  if (cached + cacheWriteTokenCount(entry) > input) return null;
+  return (cached / input) * 100;
 }
 
 function cacheHitRateText(entry) {
@@ -451,13 +458,11 @@ export function renderUsage(root, ctx, actions) {
   const totalTokens = rows.reduce((sum, row) => sum + tokenCount(row), 0);
   const inputTokens = rows.reduce((sum, row) => sum + inputTokenCount(row), 0);
   const outputTokens = rows.reduce((sum, row) => sum + tokenMetrics(row).output, 0);
-  const cacheRows = rows.filter(hasCacheUsage);
-  // 分母用全部有输入 token 的请求，而不是「带回读 usage 的那些」：
-  // 只拿命中缓存的样本算比例会把命中率算得虚高。
-  const cacheInputRows = rows.filter((row) => inputTokenCount(row) > 0);
-  const cachedTokens = rows.reduce((sum, row) => sum + cachedTokenCount(row), 0);
-  const cacheInputTokens = cacheInputRows.reduce((sum, row) => sum + inputTokenCount(row), 0);
-  const cacheRate = cacheInputTokens > 0 ? Math.min(100, Math.round((cachedTokens / cacheInputTokens) * 100)) : null;
+  // Include explicit zero hits, exclude unknown usage; weight by total input tokens.
+  const cacheRows = rows.filter((row) => cacheHitRate(row) !== null);
+  const cachedTokens = cacheRows.reduce((sum, row) => sum + cachedTokenCount(row), 0);
+  const cacheInputTokens = cacheRows.reduce((sum, row) => sum + inputTokenCount(row), 0);
+  const cacheRate = cacheInputTokens > 0 ? cachedTokens / cacheInputTokens * 100 : null;
   const averageMs = rows.length ? rows.reduce((sum, row) => sum + (Number(row.ms) || 0), 0) / rows.length : 0;
   const settled = settledRows(state).filter((entry) => Number(entry.at) >= start);
   const successCount = settled.filter((entry) => isSuccessStatus(entry.status)).length;
@@ -517,8 +522,8 @@ export function renderUsage(root, ctx, actions) {
       el,
       icon('box', 16),
       '缓存命中率',
-      cacheRate === null ? '—' : `${cacheRate}%`,
-      cacheRows.length ? `缓存 ${compactNumber(cachedTokens)} / 输入 ${compactNumber(cacheInputTokens)}` : '上游未返回缓存 usage',
+      cacheRate === null ? '—' : `${cacheRate.toFixed(1)}%`,
+      cacheRows.length ? `缓存 ${compactNumber(cachedTokens)} / 输入 ${compactNumber(cacheInputTokens)} · 有效 ${cacheRows.length} / ${rows.length} 次` : '上游未返回有效缓存 usage',
       'cache',
     ),
   ]);
