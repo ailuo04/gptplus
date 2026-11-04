@@ -1,6 +1,7 @@
 'use strict';
 // Fixed-route Images API executor. Neither callers nor upstream errors can change
 // provider/model/credentials, and diagnostic messages never include response bodies.
+const { normalizeImageBaseUrl } = require('./base-url.js');
 const MAX_IMAGE_BYTES = 24 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
 const IMAGE_ROUTE = '/gptplus/images/generations';
@@ -11,13 +12,13 @@ function failure(message, statusCode = 400) {
 
 function imageEndpoint(value) {
   let url;
-  try { url = new URL(String(value || '').trim()); }
+  try { url = new URL(normalizeImageBaseUrl(value)); }
   catch { throw failure('请填写有效的生图 API URL'); }
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
     throw failure('生图 API URL 只支持不含凭据、查询参数或片段的 HTTP(S) 地址');
   }
   const basePath = url.pathname.replace(/\/+$/, '');
-  url.pathname = basePath.endsWith('/images/generations') ? basePath : basePath + '/images/generations';
+  url.pathname = /\/images\/generations$/i.test(basePath) ? basePath : basePath + '/images/generations';
   return url.href;
 }
 
@@ -71,9 +72,7 @@ function imageFormat(bytes) {
 }
 
 function createImageGeneration({ plugins, fetchImpl = globalThis.fetch, timeoutMs = 180000 } = {}) {
-  async function generate(input = {}) {
-    if (!plugins?.isActive('custom-imagegen')) throw failure('自定义生图插件未启用', 403);
-    const config = plugins.config('custom-imagegen');
+  async function generateWithConfig(config, input) {
     const endpoint = validateImageConfig(config);
     if (!input || typeof input !== 'object' || Array.isArray(input)
       || Object.keys(input).some((key) => !['prompt', 'size', 'n', 'quality', 'resolution', 'aspectRatio', 'background'].includes(key))) {
@@ -137,7 +136,19 @@ function createImageGeneration({ plugins, fetchImpl = globalThis.fetch, timeoutM
       throw failure(signal.aborted ? '生图请求超时，未切换提供商' : '生图请求或图片下载失败，未切换提供商', 502);
     }
   }
-  return { generate };
+  async function generate(input = {}) {
+    if (!plugins?.isActive('custom-imagegen')) throw failure('自定义生图插件未启用', 403);
+    return generateWithConfig(plugins.config('custom-imagegen'), input);
+  }
+
+  // Only the settings IPC calls this with a draft. Skill/gateway callers still use
+  // generate(), which requires an active plugin and always uses saved routing.
+  async function verify(config) {
+    const result = await generateWithConfig(config, { prompt: 'A small white cloud on a plain blue background.', n: 1 });
+    return { ok: true, model: result.model, count: result.data.length,
+      formats: result.data.map((image) => image.format), at: Date.now() };
+  }
+  return { generate, verify };
 }
 
 module.exports = { createImageGeneration, validateImageConfig, imageEndpoint, selectImageSize, IMAGE_ROUTE };

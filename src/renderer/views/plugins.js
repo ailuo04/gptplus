@@ -170,16 +170,39 @@ function openImageConfig(ctx, plugin) {
   updateDimensions();
   const prefer = ctx.el('input', { type: 'checkbox', checked: current.preferDefault !== false,
     attrs: { 'aria-label': '设为默认生图（自动优先）' } });
+  const readConfig = () => ({
+    baseUrl: url.value.trim(), apiKey: key.value.trim(), model: model.value.trim(), preferDefault: prefer.checked,
+    resolution: resolution.value, aspectRatio: aspectRatio.value, quality: quality.value, background: background.value,
+  });
+  const requiredHint = '请填写 API URL、API Key 和模型名';
+  const validateConfig = (config) => {
+    if (!config.baseUrl || !config.model || (!config.apiKey && !current.hasKey)) {
+      ctx.toast(requiredHint, 'warn'); return false;
+    }
+    return true;
+  };
   const verifyLabel = ctx.el('span', { text: '生成 1 张验证（可能计费）' });
-  const verifyResult = ctx.el('p', { class: 'hint', text: '验证使用已保存的配置，需要先启用插件和本地网关；会实际生成 1 张测试图，可能计费，仅返回结果，不保存测试图片。' });
-  const verify = ctx.el('button', { class: 'btn btn-ghost btn-sm', type: 'button', disabled: plugin.enabled ? null : true,
+  const verifyResult = ctx.el('p', { class: 'hint', attrs: { role: 'status', 'aria-live': 'polite' }, text:
+    '验证使用当前填写配置，无需先保存、启用插件或启动网关；Key 留空时复用已保存值。会实际生成 1 张测试图，可能计费，仅返回结果，不保存测试图片。' });
+  const verify = ctx.el('button', { class: 'btn btn-ghost btn-sm', type: 'button',
     on: { click: async () => {
+      if (verify.disabled) return;
+      const config = readConfig();
+      if (!validateConfig(config)) { verifyResult.textContent = requiredHint; return; }
       verify.disabled = true; verifyLabel.textContent = '正在验证…';
+      verifyResult.textContent = '正在使用当前填写配置生成 1 张测试图，请稍候；可能计费，仅返回结果，不保存测试图片。';
       try {
-        const result = await ctx.api.verifyImagePlugin();
-        verifyResult.textContent = `固定路由验证通过：${result.model}，${result.count} 张（${result.formats.join(', ')}）。这不代表新会话自动选择已验证。`;
+        const result = await ctx.api.verifyImagePlugin(config);
+        const changed = JSON.stringify(readConfig()) !== JSON.stringify(config);
+        if (!changed && result.baseUrl) url.value = result.baseUrl;
+        verifyResult.textContent = `${changed ? '本次请求配置' : '当前填写配置'}验证通过：${result.model}，${result.count} 张（${result.formats.join(', ')}）。未自动保存配置或更改启用状态。`
+          + (changed ? '表单已修改，请重新验证当前配置。' : plugin.enabled ? '' : '插件仍未启用，可保存后再启用。')
+          + '这不代表新会话自动选择已验证。';
         ctx.toast('自定义生图接口验证通过', 'ok');
-      } catch (err) { verifyResult.textContent = '验证失败；请检查服务配置和网关状态。'; ctx.toastError(err, '生图接口验证失败'); }
+      } catch (err) {
+        verifyResult.textContent = '验证失败：' + ctx.describeError(err, '请检查当前填写的服务配置。');
+        ctx.toastError(err, '生图接口验证失败');
+      }
       finally { verify.disabled = false; verifyLabel.textContent = '生成 1 张验证（可能计费）'; }
     } },
   }, [ctx.icon('activity', 13), verifyLabel]);
@@ -189,7 +212,7 @@ function openImageConfig(ctx, plugin) {
     ctx.el('header', { class: 'modal-head' }, [ctx.el('div', { class: 'modal-title', text: '配置自定义生图' })]),
     ctx.el('div', { class: 'modal-body plugin-config-body' }, [
       ctx.el('p', { class: 'setting-desc', text: '使用你自己的 OpenAI 兼容 Images API 生成图片；执行器固定使用这里的地址和模型，失败不自动切换服务。首版仅支持文生图。' }),
-      field('API URL', url, '支持 Base URL（如 https://example.com/v1）或完整 /images/generations 端点。'),
+      field('API URL', url, '支持 Base URL 或完整 /images/generations 端点；缺少协议头或 /v1 时，验证和保存会自动补齐；完整生图端点原样使用。'),
       field('API Key', key, '使用本机系统安全存储加密保存；不写入技能、命令或日志。已有密钥时留空保持不变。'),
       field('模型名', model, '填写生图服务实际支持的模型名，不会自动替换模型。'),
       ctx.el('section', { class: 'imagegen-generation-settings', attrs: { 'aria-label': '默认生成参数' } }, [
@@ -203,19 +226,15 @@ function openImageConfig(ctx, plugin) {
         ctx.el('span', { class: 'hint', text: '启用时备份并修改 Codex 技能设置，停用已知内置 imagegen 技能；不删除内置文件，停用插件时撤回这项设置。' }),
       ])]),
       ctx.el('p', { class: 'setting-desc', text: '不能保证模型每次都自动选择该技能，也不代表关闭底层生图工具。启用或修改默认设置后，请重启 ChatGPT 并开启新对话；需要确定选中时可使用 $gptplus-imagegen。' }),
-      ctx.el('p', { class: 'hint', text: '生成时 gpt++ 与本地网关必须保持运行。技能脚本需要 Python 3，可使用客户端自带运行时；不会自动安装依赖。' }),
+      ctx.el('p', { class: 'hint', text: '通过技能生成时 gpt++ 与本地网关必须保持运行；下方配置验证无需网关。技能脚本需要 Python 3，可使用客户端自带运行时；不会自动安装依赖。' }),
       verify, verifyResult,
     ]),
     ctx.el('div', { class: 'modal-foot' }, [
       ctx.el('button', { class: 'btn btn-ghost btn-sm', type: 'button', on: { click: () => ctx.closeModal() } }, [ctx.el('span', { text: '取消' })]),
       ctx.el('button', { class: 'btn btn-accent btn-sm', type: 'button', on: { click: () => {
-        if (!url.value.trim() || !model.value.trim() || (!key.value.trim() && !current.hasKey)) {
-          ctx.toast('请填写 API URL、API Key 和模型名', 'warn'); return;
-        }
-        void runPluginAction(ctx, plugin.id, () => ctx.api.setPluginConfig({ id: plugin.id, config: {
-          baseUrl: url.value.trim(), apiKey: key.value.trim(), model: model.value.trim(), preferDefault: prefer.checked,
-          resolution: resolution.value, aspectRatio: aspectRatio.value, quality: quality.value, background: background.value,
-        } }), plugin.enabled ? '生图配置已保存，请重启 ChatGPT 并开启新对话' : '生图配置已保存，请启用后使用').then((saved) => {
+        const config = readConfig();
+        if (!validateConfig(config)) return;
+        void runPluginAction(ctx, plugin.id, () => ctx.api.setPluginConfig({ id: plugin.id, config }), plugin.enabled ? '生图配置已保存，请重启 ChatGPT 并开启新对话' : '生图配置已保存，请启用后使用').then((saved) => {
           if (saved) { if (plugin.enabled) ctx.markRelaunchNeeded?.(); ctx.closeModal(); }
         });
       } } }, [ctx.icon('check', 13), ctx.el('span', { text: '保存配置' })]),

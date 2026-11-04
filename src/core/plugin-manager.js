@@ -1,4 +1,5 @@
 'use strict';
+const { normalizeImageBaseUrl } = require('./base-url.js');
 
 // The catalog describes capabilities and configuration boundaries. Plugin code stays
 // bundled with the app so the renderer never executes downloaded code.
@@ -140,7 +141,7 @@ function normalizeVoiceConfig(raw) {
 function normalizeImageConfig(raw) {
   const source = isPlainObject(raw) ? raw : {};
   return {
-    baseUrl: String(source.baseUrl || '').trim().slice(0, 2048),
+    baseUrl: normalizeImageBaseUrl(String(source.baseUrl || '').trim().slice(0, 2048)),
     apiKey: String(source.apiKey || '').trim().slice(0, 8192),
     model: String(source.model || '').trim().slice(0, 256),
     preferDefault: source.preferDefault !== false,

@@ -313,7 +313,7 @@ function ipcFixture(t) {
   const f = skillFixture(t);
   const { registerIpc } = require('../src/core/ipc.js');
   const channels = new Map();
-  const ctx = { store: f.store, plugins: f.plugins, imagegenSkill: f.runtime, log() {}, onLogEvent: () => () => {},
+  const ctx = { store: f.store, plugins: f.plugins, imageGeneration: imageService(f), imagegenSkill: f.runtime, log() {}, onLogEvent: () => () => {},
     status: () => ({}), gateway: { getState: () => ({ running: false }) } };
   registerIpc({ ipcMain: { handle: (name, fn) => channels.set(name, fn) }, shell: {}, dialog: {}, ctx });
   return { ...f, ctx, call: (name, ...args) => channels.get('gptplus:plugin:' + name)(null, ...args) };
@@ -371,30 +371,112 @@ test('skill status is read-only and reports missing installed assets', (t) => {
   assert.equal(fs.existsSync(untouched), false);
 });
 
-test('paid verification uses the skill gateway route and returns no image bytes or credentials', async (t) => {
-  const f = ipcFixture(t); let calls = 0;
-  const base = await listen(t, (req, res) => { calls++; res.end(JSON.stringify({ data: [{ b64_json: PNG }] })); });
-  configure(f, { baseUrl: base + '/v1' });
-  const gateway = require('../src/core/gateway/server.js').createGateway({ store: f.store, imageGeneration: imageService(f) });
-  f.ctx.gateway = gateway; t.after(() => gateway.stop());
-  await assert.rejects(f.call('image:verify'), /启用/);
-  assert.equal(calls, 0);
-  await f.call('enabled:set', { id: 'custom-imagegen', enabled: true });
-  await assert.rejects(f.call('image:verify'), /网关/);
-  assert.equal(calls, 0);
-  await gateway.start({ port: 0, host: '127.0.0.1' });
-  const result = await f.call('image:verify');
-  assert.equal(result.ok, true); assert.equal(result.count, 1); assert.deepEqual(result.formats, ['png']);
+test('paid verification uses unsaved draft config before enable with no gateway or persistent changes', async (t) => {
+  const f = ipcFixture(t), calls = [];
+  const base = await listen(t, async (req, res) => {
+    let body = ''; for await (const chunk of req) body += chunk;
+    calls.push({ url: req.url, key: req.headers.authorization, body: JSON.parse(body) });
+    res.end(JSON.stringify({ data: [{ b64_json: PNG }] }));
+  });
+  f.plugins.install('custom-imagegen');
+  const before = fs.readFileSync(f.configPath, 'utf8');
+  const codexBefore = fs.readFileSync(f.codexConfigPath, 'utf8');
+  const draft = { baseUrl: base, apiKey: 'sk-draft-image-key', model: 'draft-model',
+    resolution: '2K', aspectRatio: '16:9', quality: 'high', background: 'transparent', preferDefault: false };
+  const result = await f.call('image:verify', draft);
+  assert.equal(result.ok, true); assert.equal(result.model, 'draft-model');
+  assert.equal(result.count, 1); assert.deepEqual(result.formats, ['png']);
+  assert.equal(result.baseUrl, base + '/v1');
+  assert.equal(typeof result.at, 'number');
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], { url: '/v1/images/generations', key: 'Bearer sk-draft-image-key', body: {
+    model: 'draft-model', prompt: 'A small white cloud on a plain blue background.', n: 1,
+    size: '2048x1152', quality: 'high', background: 'transparent', output_format: 'png',
+  } });
   assert.ok(!JSON.stringify(result).includes(PNG));
-  assert.ok(!JSON.stringify(result).includes('sk-private-image-key'));
-  assert.equal(calls, 1);
+  assert.ok(!JSON.stringify(result).includes('sk-draft-image-key'));
+  assert.equal(f.plugins.isActive('custom-imagegen'), false);
+  assert.equal(f.ctx.gateway.getState().running, false);
+  assert.equal(fs.readFileSync(f.configPath, 'utf8'), before);
+  assert.equal(fs.readFileSync(f.codexConfigPath, 'utf8'), codexBefore);
+  assert.equal(f.backups.length, 0);
+  assert.equal(fs.existsSync(path.join(f.codexHome, 'skills', 'gptplus-imagegen')), false);
+  await assert.rejects(f.ctx.imageGeneration.generate({ prompt: 'cloud' }), /未启用/);
+  assert.equal(calls.length, 1, 'draft verification must not enable ordinary skill/gateway generation');
 });
 
-test('image endpoint normalizes origin-only URLs without a double slash', () => {
+test('draft verification reuses only a blank saved key, never old routing or output defaults', async (t) => {
+  const f = ipcFixture(t), calls = [];
+  const base = await listen(t, async (req, res) => {
+    let body = ''; for await (const chunk of req) body += chunk;
+    calls.push({ url: req.url, key: req.headers.authorization, body: JSON.parse(body) });
+    res.end(JSON.stringify({ data: [{ b64_json: PNG }] }));
+  });
+  configure(f, { baseUrl: 'https://saved.example/v2', model: 'saved-model', resolution: '4K',
+    aspectRatio: '9:16', quality: 'low', background: 'opaque' });
+  const before = fs.readFileSync(f.configPath, 'utf8');
+  const draft = { baseUrl: base + '/custom/images/generations', apiKey: '  ', model: 'new-model' };
+  await f.call('image:verify', draft);
+  assert.deepEqual(calls[0], { url: '/custom/images/generations', key: 'Bearer sk-private-image-key', body: {
+    model: 'new-model', prompt: 'A small white cloud on a plain blue background.', n: 1,
+    size: '1024x1024', quality: 'auto', background: 'auto',
+  } });
+  await f.call('image:verify', { ...draft, apiKey: 'sk-new-draft-key', model: 'another-model' });
+  assert.equal(calls[1].key, 'Bearer sk-new-draft-key');
+  assert.equal(calls[1].body.model, 'another-model');
+  assert.equal(fs.readFileSync(f.configPath, 'utf8'), before);
+  assert.equal(f.plugins.config('custom-imagegen').model, 'saved-model');
+  assert.equal(f.plugins.config('custom-imagegen').apiKey, 'sk-private-image-key');
+  const saved = await f.call('config:set', { id: 'custom-imagegen', config: { ...draft, baseUrl: base } });
+  assert.equal(saved.config.baseUrl, base + '/v1', 'saving and verifying use identical URL normalization');
+  assert.equal(f.plugins.isActive('custom-imagegen'), false);
+  assert.equal(calls.length, 2, 'saving never issues a paid generation');
+});
+
+test('draft verification validates required fields before sending and leaves failed drafts unsaved', async (t) => {
+  const f = ipcFixture(t); let calls = 0;
+  const base = await listen(t, (req, res) => {
+    calls++; res.writeHead(401); res.end('sk-draft-secret private upstream response');
+  });
+  f.plugins.install('custom-imagegen');
+  const before = fs.readFileSync(f.configPath, 'utf8');
+  const draft = { baseUrl: base, model: 'draft-model', apiKey: 'sk-draft-secret' };
+  for (const [patch, message] of [[{ baseUrl: '' }, /URL/], [{ apiKey: '' }, /Key/], [{ model: '' }, /模型/]]) {
+    await assert.rejects(f.call('image:verify', { ...draft, ...patch }), message);
+  }
+  assert.equal(calls, 0);
+  await assert.rejects(f.call('image:verify', draft), (err) => /HTTP 401/.test(err.message)
+    && !err.message.includes('sk-draft-secret') && !err.message.includes('private upstream response'));
+  assert.equal(calls, 1);
+  assert.equal(fs.readFileSync(f.configPath, 'utf8'), before);
+  assert.equal(f.plugins.isActive('custom-imagegen'), false);
+});
+
+test('image URLs add protocol and version like providers while preserving full endpoints', () => {
   const { imageEndpoint } = require('../src/core/image-generation.js');
-  assert.equal(imageEndpoint('https://images.example'), 'https://images.example/images/generations');
-  assert.equal(imageEndpoint('https://images.example/'), 'https://images.example/images/generations');
-  assert.equal(imageEndpoint('https://images.example/v1/'), 'https://images.example/v1/images/generations');
+  const cases = [
+    ['https://images.example', 'https://images.example/v1', 'https://images.example/v1/images/generations'],
+    ['images.example/', 'https://images.example/v1', 'https://images.example/v1/images/generations'],
+    ['http://localhost:8080/', 'http://localhost:8080/v1', 'http://localhost:8080/v1/images/generations'],
+    ['localhost:8080', 'https://localhost:8080/v1', 'https://localhost:8080/v1/images/generations'],
+    ['https://images.example/v1/', 'https://images.example/v1', 'https://images.example/v1/images/generations'],
+    ['https://images.example/v2', 'https://images.example/v2', 'https://images.example/v2/images/generations'],
+    ['https://images.example/api/v1beta/', 'https://images.example/api/v1beta', 'https://images.example/api/v1beta/images/generations'],
+    ['https://images.example/api', 'https://images.example/api/v1', 'https://images.example/api/v1/images/generations'],
+    ['https://images.example/v1/chat/completions', 'https://images.example/v1', 'https://images.example/v1/images/generations'],
+    ['https://images.example/images/generations/', 'https://images.example/images/generations', 'https://images.example/images/generations'],
+    ['images.example/custom/images/generations', 'https://images.example/custom/images/generations', 'https://images.example/custom/images/generations'],
+  ];
+  for (const [raw, normalized, endpoint] of cases) {
+    assert.equal(normalizeImageConfig({ baseUrl: raw }).baseUrl, normalized, raw);
+    assert.equal(imageEndpoint(raw), endpoint, raw);
+    assert.equal(imageEndpoint(normalized), endpoint, 'URL completion must be idempotent');
+  }
+  for (const baseUrl of ['file:///private', 'data:text/plain,hello', 'ftp://images.example',
+    'https://user:password@images.example', 'https://images.example?key=private', 'https://images.example/#fragment']) {
+    assert.throws(() => imageEndpoint(normalizeImageConfig({ baseUrl }).baseUrl), /URL/, baseUrl);
+  }
+  assert.equal(normalizeImageConfig({}).baseUrl, '');
 });
 
 test('helper response budget accepts every supported four-image gateway output', async (t) => {

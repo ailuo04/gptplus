@@ -6,7 +6,7 @@ const crypto = require('node:crypto');
 const { normalizeModelLimits, normalizeTheme, normalizeUpdateSettings } = require('./store.js');
 const { normalizeBaseUrl } = require('./base-url.js');
 const { normalizeImageConfig } = require('./plugin-manager.js');
-const { validateImageConfig, IMAGE_ROUTE } = require('./image-generation.js');
+const { validateImageConfig } = require('./image-generation.js');
 const { slugForProvider } = require('./model-utils.js');
 const { resolveChatGptExe } = require('./chatgpt-install.js');
 const { relaunchChatGpt } = require('./chatgpt-launch.js');
@@ -268,24 +268,15 @@ function registerIpc(deps) {
     }
     return plugins.setConfig(id, patch.config);
   });
-  handle('gptplus:plugin:image:verify', async () => {
-    if (!plugins?.isActive('custom-imagegen')) throw new Error('请先启用自定义生图插件');
-    const gateway = ctx.gateway?.getState?.();
-    if (!gateway?.running) throw new Error('请先启动本地网关');
-    const endpoint = new URL(IMAGE_ROUTE, gateway.url).href;
-    // Exercise the same local authenticated route as the skill, not an alternate provider path.
-    let response;
-    try {
-      response = await globalThis.fetch(endpoint, {
-        method: 'POST', redirect: 'error', signal: AbortSignal.timeout(200000),
-        headers: { Authorization: 'Bearer ' + store.get().gateway.token, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: 'A small white cloud on a plain blue background.', n: 1 }),
-      });
-    } catch { throw new Error('无法连接本地生图执行器或请求超时，未切换提供商'); }
-    if (!response.ok) { await response.body?.cancel(); throw new Error('生图接口验证失败（HTTP ' + response.status + '），请检查 URL、API Key 和模型'); }
-    const result = await response.json();
-    return { ok: true, model: result.model, count: result.data.length,
-      formats: result.data.map((image) => image.format), at: Date.now() };
+  handle('gptplus:plugin:image:verify', async (draft = {}) => {
+    if (!plugins) throw new Error('插件管理器不可用');
+    if (!ctx.imageGeneration?.verify) throw new Error('生图执行器尚未就绪');
+    // Test the form snapshot without saving/enabling it or changing skill settings.
+    // Only a blank key may reuse stored data; URL/model/output options come from the draft.
+    const config = normalizeImageConfig({ ...draft,
+      apiKey: String(draft?.apiKey || '').trim() || plugins.config('custom-imagegen').apiKey });
+    validateImageConfig(config);
+    return { ...await ctx.imageGeneration.verify(config), baseUrl: config.baseUrl };
   });
   handle('gptplus:update:state', () => updater?.getState?.() || { enabled: false, status: 'disabled' });
   handle('gptplus:update:check', () => updater?.checkForUpdates?.() || { enabled: false, status: 'disabled' });

@@ -31,4 +31,19 @@ function normalizeBaseUrl(raw) {
   return ensureApiVersion(base);
 }
 
-module.exports = { normalizeBaseUrl, ensureApiVersion, stripEndpoint };
+/** Images 配置沿用提供商补全规则，但完整生图端点必须原样保留。 */
+function normalizeImageBaseUrl(raw) {
+  let base = String(raw == null ? '' : raw).trim();
+  if (!base) return '';
+  // 保留显式协议供生图 URL 校验拒绝；host:port 不视为协议。
+  const hasScheme = /^[a-z][a-z0-9+.-]*:/i.test(base) && !/^[^/:]+:\d+(?:\/|$)/.test(base);
+  if (!hasScheme) base = 'https://' + base;
+  let url;
+  try { url = new URL(base); } catch { return base; }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) return base;
+  base = base.replace(/\/+$/, '');
+  if (/\/images\/generations$/i.test(url.pathname.replace(/\/+$/, ''))) return base;
+  return normalizeBaseUrl(base);
+}
+
+module.exports = { normalizeBaseUrl, normalizeImageBaseUrl, ensureApiVersion, stripEndpoint };

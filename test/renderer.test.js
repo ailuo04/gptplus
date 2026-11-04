@@ -339,6 +339,21 @@ test('preload 暴露的每个 API 键都在渲染层被调用过', () => {
   }
 });
 
+test('preload 将生图验证的表单草稿完整传给主进程', async () => {
+  let api; const calls = [];
+  const electron = {
+    contextBridge: { exposeInMainWorld: (name, value) => { if (name === 'gptplus') api = value; } },
+    ipcRenderer: { invoke: async (...args) => { calls.push(args); return { ok: true }; } },
+  };
+  require('node:vm').runInNewContext(read(PRELOAD), {
+    require: (name) => { assert.equal(name, 'electron'); return electron; },
+    process: { argv: [] },
+  });
+  const draft = { baseUrl: 'https://draft.example', apiKey: 'sk-test-key', model: 'draft-model', resolution: '2K' };
+  await api.verifyImagePlugin(draft);
+  assert.deepEqual(calls, [['gptplus:plugin:image:verify', draft]]);
+});
+
 test('渲染层调用的 gptplus 方法都存在于 preload', () => {
   const keys = new Set(preloadKeys());
   for (const { rel, src } of allRendererJs()) {
@@ -3705,6 +3720,169 @@ test('自定义生图：安全配置、默认优先边界、付费验证入口�
     assert.equal(saved.config.preferDefault, false);
     assert.ok(calls.some((c) => c[0] === 'restart'));
     assert.equal(calls.filter((c) => c[0] === 'verifyImagePlugin').length, 0, 'saving settings must never trigger paid generation');
+  } finally {
+    delete globalThis.document; delete globalThis.window; delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('自定义生图验证：未启用时使用当前表单草稿，不保存、不启用，并回填补全后的 URL', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const pluginsMod = await import(pathToFileURL(path.join(tmp, 'views', 'plugins.js')).href);
+    installFakeDom();
+    const plugin = { id: 'custom-imagegen', name: '自定义生图', icon: 'image', installed: true, enabled: false,
+      config: { baseUrl: 'https://saved.example/v1', hasKey: true, model: 'saved-model' } };
+    const calls = [], ctx = makeCtx(appMod, fixtureState({ view: 'plugins', plugins: [plugin],
+      gateway: { running: false } }), calls);
+    ctx.api.verifyImagePlugin = async (config) => {
+      calls.push(['verifyImagePlugin', config]);
+      return { ok: true, baseUrl: 'https://draft.example/v1', model: config.model, count: 1, formats: ['png'] };
+    };
+    const root = new FakeNode('main'); pluginsMod.renderPlugins(root, ctx, new FakeNode('div'));
+    root.findTag('button').find((n) => n.textContent.includes('配置')).listeners.click[0]();
+    const modal = calls.find((c) => c[0] === 'openModal')[1];
+    const verify = modal.findTag('button').find((n) => n.textContent.includes('生成 1 张验证'));
+    const input = (label) => findNodes(modal, (n) => n.tagName === 'INPUT' && n.attributes['aria-label'] === label)[0];
+    input('API URL').value = ' draft.example ';
+    input('API Key').value = ' sk-draft-key ';
+    input('模型名').value = ' draft-model ';
+    input('设为默认生图（自动优先）').checked = false;
+    const groups = modal.findTag('fieldset');
+    for (const [index, value] of ['2K', '16:9', 'high', 'transparent'].entries()) {
+      const radio = groups[index].findTag('input').find((n) => n.value === value);
+      radio.checked = true; radio.listeners.change[0]();
+    }
+    assert.equal(verify.disabled, false);
+    assert.match(modal.allText(), /无需.*保存.*启用.*网关/);
+    assert.match(modal.allText(), /自动补齐/);
+    assert.equal(calls.filter((c) => c[0] === 'verifyImagePlugin').length, 0);
+    await verify.listeners.click[0]();
+    assert.deepEqual(calls.find((c) => c[0] === 'verifyImagePlugin')[1], {
+      baseUrl: 'draft.example', apiKey: 'sk-draft-key', model: 'draft-model', preferDefault: false,
+      resolution: '2K', aspectRatio: '16:9', quality: 'high', background: 'transparent',
+    });
+    assert.match(modal.allText(), /当前填写配置验证通过：draft-model/);
+    assert.match(modal.allText(), /未自动保存.*未启用/);
+    assert.equal(input('API URL').value, 'https://draft.example/v1');
+    assert.equal(verify.disabled, false);
+    assert.equal(plugin.enabled, false);
+    assert.equal(plugin.config.model, 'saved-model');
+    assert.equal(calls.filter((c) => ['setPluginConfig', 'setPluginEnabled', 'restart'].includes(c[0])).length, 0);
+  } finally {
+    delete globalThis.document; delete globalThis.window; delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('自定义生图验证：首次填写无需已保存 Key，但必填信息缺失时不发送请求', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const pluginsMod = await import(pathToFileURL(path.join(tmp, 'views', 'plugins.js')).href);
+    installFakeDom();
+    const plugin = { id: 'custom-imagegen', name: '自定义生图', icon: 'image', installed: true, enabled: false, config: {} };
+    const calls = [], ctx = makeCtx(appMod, fixtureState({ view: 'plugins', plugins: [plugin] }), calls);
+    ctx.api.verifyImagePlugin = async (config) => {
+      calls.push(['verifyImagePlugin', config]);
+      return { ok: true, model: config.model, count: 1, formats: ['png'] };
+    };
+    const root = new FakeNode('main'); pluginsMod.renderPlugins(root, ctx, new FakeNode('div'));
+    root.findTag('button').find((n) => n.textContent.includes('配置')).listeners.click[0]();
+    const modal = calls.find((c) => c[0] === 'openModal')[1];
+    const input = (label) => findNodes(modal, (n) => n.tagName === 'INPUT' && n.attributes['aria-label'] === label)[0];
+    const verify = modal.findTag('button').find((n) => n.textContent.includes('生成 1 张验证'));
+    await verify.listeners.click[0]();
+    input('API URL').value = 'https://draft.example';
+    input('模型名').value = 'draft-model';
+    await verify.listeners.click[0]();
+    assert.equal(calls.filter((c) => c[0] === 'verifyImagePlugin').length, 0);
+    assert.match(modal.allText(), /请填写 API URL、API Key 和模型名/);
+    input('API Key').value = 'sk-first-key';
+    await verify.listeners.click[0]();
+    assert.equal(calls.filter((c) => c[0] === 'verifyImagePlugin').length, 1);
+    assert.equal(calls.find((c) => c[0] === 'verifyImagePlugin')[1].apiKey, 'sk-first-key');
+  } finally {
+    delete globalThis.document; delete globalThis.window; delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('自定义生图验证：窗口显示等待状态和具体错误，失败后可重试成功', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const pluginsMod = await import(pathToFileURL(path.join(tmp, 'views', 'plugins.js')).href);
+    installFakeDom();
+    const plugin = { id: 'custom-imagegen', name: '自定义生图', icon: 'image', installed: true, enabled: true,
+      config: { baseUrl: 'https://images.example/v1', hasKey: true, model: 'image-model' } };
+    const calls = [], ctx = makeCtx(appMod, fixtureState({ view: 'plugins', plugins: [plugin] }), calls);
+    let rejectRequest;
+    ctx.api.verifyImagePlugin = (config) => {
+      calls.push(['verifyImagePlugin', config]);
+      return new Promise((_resolve, reject) => { rejectRequest = reject; });
+    };
+    const root = new FakeNode('main'); pluginsMod.renderPlugins(root, ctx, new FakeNode('div'));
+    root.findTag('button').find((n) => n.textContent.includes('配置')).listeners.click[0]();
+    const modal = calls.find((c) => c[0] === 'openModal')[1];
+    const verify = modal.findTag('button').find((n) => n.textContent.includes('生成 1 张验证'));
+    const pending = verify.listeners.click[0]();
+    assert.equal(verify.disabled, true);
+    assert.match(modal.allText(), /正在使用当前填写配置生成 1 张测试图/);
+    await verify.listeners.click[0]();
+    assert.equal(calls.filter((c) => c[0] === 'verifyImagePlugin').length, 1, '等待期间不能重复发起付费请求');
+    assert.equal(calls.find((c) => c[0] === 'verifyImagePlugin')[1].apiKey, '', '空 Key 由主进程复用已保存值');
+    rejectRequest(new Error('生图服务返回 HTTP 401，未切换提供商'));
+    await pending;
+    assert.match(modal.allText(), /验证失败：生图服务返回 HTTP 401/);
+    assert.equal(verify.disabled, false);
+    assert.match(verify.textContent, /生成 1 张验证/);
+    ctx.api.verifyImagePlugin = async () => {
+      calls.push(['verifyImagePlugin']);
+      return { ok: true, model: 'image-model', count: 1, formats: ['png'] };
+    };
+    await verify.listeners.click[0]();
+    assert.match(modal.allText(), /当前填写配置验证通过：image-model，1 张（png）/);
+    assert.equal(verify.disabled, false);
+    assert.equal(calls.filter((c) => c[0] === 'verifyImagePlugin').length, 2);
+  } finally {
+    delete globalThis.document; delete globalThis.window; delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('自定义生图验证：等待期间修改表单时不覆盖新 URL，也不把旧请求当成当前配置通过', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const pluginsMod = await import(pathToFileURL(path.join(tmp, 'views', 'plugins.js')).href);
+    installFakeDom();
+    const plugin = { id: 'custom-imagegen', name: '自定义生图', icon: 'image', installed: true, enabled: false,
+      config: { baseUrl: 'https://first.example', model: 'first-model', hasKey: true } };
+    const calls = [], ctx = makeCtx(appMod, fixtureState({ view: 'plugins', plugins: [plugin] }), calls);
+    let finishRequest;
+    ctx.api.verifyImagePlugin = (config) => {
+      calls.push(['verifyImagePlugin', config]);
+      return new Promise((resolve) => { finishRequest = resolve; });
+    };
+    const root = new FakeNode('main'); pluginsMod.renderPlugins(root, ctx, new FakeNode('div'));
+    root.findTag('button').find((n) => n.textContent.includes('配置')).listeners.click[0]();
+    const modal = calls.find((c) => c[0] === 'openModal')[1];
+    const input = (label) => findNodes(modal, (n) => n.tagName === 'INPUT' && n.attributes['aria-label'] === label)[0];
+    const verify = modal.findTag('button').find((n) => n.textContent.includes('生成 1 张验证'));
+    const pending = verify.listeners.click[0]();
+    input('API URL').value = 'https://second.example';
+    input('模型名').value = 'second-model';
+    finishRequest({ ok: true, baseUrl: 'https://first.example/v1', model: 'first-model', count: 1, formats: ['png'] });
+    await pending;
+    assert.equal(input('API URL').value, 'https://second.example');
+    assert.equal(input('模型名').value, 'second-model');
+    assert.match(modal.allText(), /本次请求配置验证通过：first-model/);
+    assert.match(modal.allText(), /表单已修改，请重新验证当前配置/);
+    assert.doesNotMatch(modal.allText(), /当前填写配置验证通过/);
+    assert.equal(calls.find((c) => c[0] === 'verifyImagePlugin')[1].model, 'first-model');
+    assert.equal(verify.disabled, false);
   } finally {
     delete globalThis.document; delete globalThis.window; delete globalThis.navigator;
     fs.rmSync(tmp, { recursive: true, force: true });

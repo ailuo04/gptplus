@@ -105,7 +105,7 @@ contextBridge.exposeInMainWorld('gptplus', {
   uninstallPlugin: (id) => invoke('gptplus:plugin:uninstall', id),
   setPluginEnabled: (patch) => invoke('gptplus:plugin:enabled:set', patch),
   setPluginConfig: (patch) => invoke('gptplus:plugin:config:set', patch),
-  verifyImagePlugin: () => invoke('gptplus:plugin:image:verify'),
+  verifyImagePlugin: (config) => invoke('gptplus:plugin:image:verify', config),
   onPluginChange: (cb) => subscribe('gptplus:plugin:change', cb),
 
   // 模型与网关
