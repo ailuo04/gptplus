@@ -60,6 +60,18 @@ test('NSIS 覆盖安装会递归结束 gpt++ 的 Electron 进程树', () => {
   assert.match(script, /customCheckAppRunning/);
 });
 
+test('NSIS 在删除旧版本前先校验安装目录可重建、可写入', () => {
+  const script = fs.readFileSync(path.join(ROOT, 'build', 'installer.nsh'), 'utf8');
+  assert.match(script, /!macro GPTPLUS_ENSURE_INSTALL_WRITABLE _RETURN/);
+  assert.match(script, /FileOpen \$R7 "\$INSTDIR\\\.\.\\gptplus-install-probe\.tmp" "w"/);
+  assert.match(script, /CreateDirectory "\$INSTDIR"/);
+  // customCheckAppRunning 是 uninstallOldVersion 之前最后一个钩子，探测必须挂在它里面。
+  const checkHook = script.slice(script.indexOf('!macro customCheckAppRunning'));
+  assert.match(checkHook, /!insertmacro GPTPLUS_ENSURE_INSTALL_WRITABLE/);
+  assert.match(checkHook, /Setup was aborted/);
+  assert.match(checkHook, /Quit/);
+});
+
 test('NSIS 安装会用程序本体图标重写桌面和开始菜单快捷方式', () => {
   const script = fs.readFileSync(path.join(ROOT, 'build', 'installer.nsh'), 'utf8');
   assert.match(script, /!macro customInstall/);

@@ -29,6 +29,40 @@ Var pid
   ${endIf}
 !macroend
 
+; Uninstalling the old version removes $INSTDIR, so the installer must be able to
+; recreate it inside the parent directory afterwards. When the parent is read-only
+; for the current user the old app is deleted and nothing can be written back, which
+; leaves the product uninstalled but still registered. Probe both paths first.
+; Non-ASCII text is avoided here: NSIS reads includes in the system codepage.
+!macro GPTPLUS_ENSURE_INSTALL_WRITABLE _RETURN
+  Push $R7
+  Push $R8
+  StrCpy ${_RETURN} 0
+  ${if} ${FileExists} "$INSTDIR\*.*"
+    ClearErrors
+    FileOpen $R7 "$INSTDIR\gptplus-install-probe.tmp" "w"
+    ${ifNot} ${Errors}
+      FileClose $R7
+      Delete "$INSTDIR\gptplus-install-probe.tmp"
+      ClearErrors
+      FileOpen $R7 "$INSTDIR\..\gptplus-install-probe.tmp" "w"
+      ${ifNot} ${Errors}
+        FileClose $R7
+        Delete "$INSTDIR\..\gptplus-install-probe.tmp"
+        StrCpy ${_RETURN} 1
+      ${endIf}
+    ${endIf}
+  ${else}
+    ClearErrors
+    CreateDirectory "$INSTDIR"
+    ${if} ${FileExists} "$INSTDIR\*.*"
+      StrCpy ${_RETURN} 1
+    ${endIf}
+  ${endIf}
+  Pop $R8
+  Pop $R7
+!macroend
+
 ; NSIS upgrades keep an existing shortcut when its target still exists. Rewrite
 ; both shortcuts so an older external .ico path cannot survive an upgrade.
 !macro customInstall
@@ -72,5 +106,11 @@ Var pid
           ${endIf}
         ${endIf}
     ${endIf}
+  ${endIf}
+
+  !insertmacro GPTPLUS_ENSURE_INSTALL_WRITABLE $R6
+  ${if} $R6 != 1
+    MessageBox MB_OK|MB_ICONSTOP "gpt++ cannot be installed into:$\r$\n$INSTDIR$\r$\n$\r$\nThis folder, or the folder above it, is read-only for the current user, so the installer cannot recreate it after removing the old version. Setup was aborted and the existing installation was left untouched. Run the installer as administrator, or choose a folder you can write to." /SD IDOK
+    Quit
   ${endIf}
 !macroend

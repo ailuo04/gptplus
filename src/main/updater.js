@@ -141,6 +141,57 @@ function releasePageUrl(version) {
   return parsed ? `${RELEASE_TAG_BASE}/v${parsed.value}` : null;
 }
 
+/**
+ * 安装器会先删除旧安装目录再重建，父目录对当前用户只读时更新会把应用删没却装不回来。
+ * 下载和重启安装前各实测一次，失败就中止，不改动现有文件。
+ * @param {{ exePath?: string, fileSystem?: typeof import('node:fs').promises,
+ *   platform?: string, pid?: number }} options
+ * @returns {Promise<{ok: true} | {ok: false, dir: string, message: string}>} 安装可行性
+ */
+async function checkInstallWriteAccess({
+  exePath,
+  fileSystem = fs.promises,
+  platform = process.platform,
+  pid = process.pid,
+} = {}) {
+  if (platform !== 'win32' || !exePath) return { ok: true };
+  const installDir = path.dirname(exePath);
+  const parentDir = path.dirname(installDir);
+  const probe = `.gptplus-install-probe-${pid}`;
+  const blocked = (dir) => ({
+    ok: false,
+    dir,
+    message: `安装目录不可写，更新已中止：${dir}（当前用户没有写入权限）。现有版本未被改动，`
+      + '请以管理员身份运行安装程序，或把 gpt++ 安装到可写目录后再更新。',
+  });
+
+  const probeDir = path.join(parentDir, probe);
+  try {
+    await fileSystem.mkdir(probeDir);
+    await fileSystem.rm(probeDir, { recursive: true, force: true });
+  } catch {
+    return blocked(parentDir);
+  }
+
+  // 安装目录已存在时还要能写入新版本文件；不存在时上一步已证明可重建。
+  let installDirExists = true;
+  try {
+    await fileSystem.access(installDir);
+  } catch {
+    installDirExists = false;
+  }
+  if (installDirExists) {
+    const probeFile = path.join(installDir, probe);
+    try {
+      await fileSystem.writeFile(probeFile, '');
+      await fileSystem.rm(probeFile, { force: true });
+    } catch {
+      return blocked(installDir);
+    }
+  }
+  return { ok: true };
+}
+
 /** 读取某个已发布版本的摘要；失败时由调用方保留更新能力，不阻塞下载。 */
 async function fetchReleaseDetails(version, options = {}) {
   const parsed = stableVersion(version);
@@ -261,7 +312,8 @@ async function cleanupInstalledUpdateCache(options = {}) {
  * 开发模式、冒烟测试和未打包运行时不执行网络更新检查。
  * @param {{ app: any, autoUpdater: any, isDev?: boolean, isSmoke?: boolean,
  *   onLog?: (entry: object) => void, onState?: (state: object) => void,
- *   checkIntervalMinutes?: number, initialCheckDelayMs?: number, timers?: object }} options
+ *   checkIntervalMinutes?: number, initialCheckDelayMs?: number,
+ *   installAccessCheck?: () => Promise<object>, timers?: object }} options
  * @returns {{ enabled: boolean, getState: () => object, checkForUpdates: () => Promise<any>,
  *   setCheckIntervalMinutes: (value: number) => object, stopAutomaticChecks: () => void,
  *   downloadUpdate: () => Promise<object> }} 更新控制器
@@ -277,6 +329,7 @@ function setupAutoUpdater(options = {}) {
     onState = () => {},
     checkIntervalMinutes = DEFAULT_CHECK_INTERVAL_MINUTES,
     initialCheckDelayMs = INITIAL_CHECK_DELAY_MS,
+    installAccessCheck = null,
     timers = globalThis,
   } = options;
 
@@ -330,6 +383,18 @@ function setupAutoUpdater(options = {}) {
     onLog({ at: Date.now(), level, msg });
   };
 
+  /** 安装前实测目录可写；检查自身出错时不阻塞更新，只记日志。 */
+  const ensureInstallWritable = async () => {
+    try {
+      if (typeof installAccessCheck === 'function') return await installAccessCheck();
+      const exePath = typeof app?.getPath === 'function' ? app.getPath('exe') : '';
+      return await checkInstallWriteAccess({ exePath });
+    } catch (error) {
+      log('warn', `安装目录写入检查失败: ${error.message}`);
+      return { ok: true };
+    }
+  };
+
   autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = false;
   // 保留 electron-updater 的 blockmap 差分下载，减少更新时的网络流量。
@@ -355,6 +420,12 @@ function setupAutoUpdater(options = {}) {
 
   const beginDownload = async () => {
     if (downloading || state.status !== 'available') return { ...state };
+    const access = await ensureInstallWritable();
+    if (!access.ok) {
+      publish({ status: 'error', error: access.message });
+      log('error', `更新下载已取消: ${access.message}`);
+      return { ...state };
+    }
     downloading = true;
     installAfterDownload = true;
     publish({ status: 'downloading', percent: 0, error: null });
@@ -442,11 +513,18 @@ function setupAutoUpdater(options = {}) {
     downloading = false;
     publish({ status: 'downloaded', percent: 100, error: null });
     log('info', '更新已下载完成');
-    if (installAfterDownload) {
-      installAfterDownload = false;
+    if (!installAfterDownload) return;
+    installAfterDownload = false;
+    // 下载完成后再次确认，避免安装器删掉旧目录却写不回新版本。
+    void ensureInstallWritable().then((access) => {
+      if (!access.ok) {
+        publish({ status: 'error', error: access.message });
+        log('error', `重启安装已阻止: ${access.message}`);
+        return;
+      }
       app.isQuitting = true;
       setTimeout(() => autoUpdater.quitAndInstall(false, true), 250);
-    }
+    });
   });
 
   autoUpdater.on('error', (err) => {
@@ -578,6 +656,7 @@ function setupAutoUpdater(options = {}) {
 module.exports = {
   setupAutoUpdater,
   cleanupInstalledUpdateCache,
+  checkInstallWriteAccess,
   listRollbackReleases,
   extractUpdateHighlights,
   fetchReleaseDetails,

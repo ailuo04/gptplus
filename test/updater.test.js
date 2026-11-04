@@ -6,6 +6,7 @@ const { EventEmitter } = require('node:events');
 const {
   setupAutoUpdater,
   cleanupInstalledUpdateCache,
+  checkInstallWriteAccess,
   listRollbackReleases,
   extractUpdateHighlights,
 } = require('../src/main/updater.js');
@@ -325,4 +326,100 @@ test('主进程不再立即检查更新，自动检查由更新控制器调度',
   const mainSource = await readFile(path.join(__dirname, '../src/main/main.js'), 'utf8');
   assert.match(mainSource, /checkIntervalMinutes: ctx\.store\.get\(\)\.updates\.checkIntervalMinutes/);
   assert.doesNotMatch(mainSource, /if \(updater\.enabled\) \{[\s\S]{0,300}updater\.checkForUpdates\(\)/, '主进程不应再直接触发启动检查');
+});
+
+function fakeInstallFs({ parentWritable = true, installWritable = true } = {}) {
+  const deny = () => { throw Object.assign(new Error('EACCES'), { code: 'EACCES' }); };
+  return {
+    async mkdir() { if (!parentWritable) deny(); },
+    async rm() {},
+    async access() {},
+    async writeFile() { if (!installWritable) deny(); },
+  };
+}
+
+test('安装目录上级不可写时判定为无法安全安装', async () => {
+  const result = await checkInstallWriteAccess({
+    exePath: 'D:\\own\\app\\gpt-plus\\gpt-plus.exe',
+    platform: 'win32',
+    fileSystem: fakeInstallFs({ parentWritable: false }),
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.dir, 'D:\\own\\app');
+  assert.match(result.message, /安装目录不可写/);
+  assert.match(result.message, /现有版本未被改动/);
+});
+
+test('安装目录本身不可写时同样阻止安装', async () => {
+  const result = await checkInstallWriteAccess({
+    exePath: 'D:\\own\\app\\gpt-plus\\gpt-plus.exe',
+    platform: 'win32',
+    fileSystem: fakeInstallFs({ installWritable: false }),
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.dir, 'D:\\own\\app\\gpt-plus');
+});
+
+test('安装目录缺失但上级可写时允许安装，非 Windows 直接放行', async () => {
+  const missing = fakeInstallFs();
+  missing.access = async () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); };
+  assert.deepEqual(await checkInstallWriteAccess({
+    exePath: 'D:\\own\\app\\gpt-plus\\gpt-plus.exe',
+    platform: 'win32',
+    fileSystem: missing,
+  }), { ok: true });
+  assert.deepEqual(await checkInstallWriteAccess({
+    exePath: '/Applications/gpt++.app/Contents/MacOS/gpt-plus',
+    platform: 'darwin',
+    fileSystem: fakeInstallFs({ parentWritable: false }),
+  }), { ok: true });
+  assert.deepEqual(await checkInstallWriteAccess({ exePath: '', platform: 'win32' }), { ok: true });
+});
+
+test('安装目录不可写时取消下载，不发起网络传输', async () => {
+  const updater = createUpdater();
+  let downloadCalls = 0;
+  updater.downloadUpdate = async () => { downloadCalls += 1; };
+  const logs = [];
+  const controller = setupAutoUpdater({
+    app: { isPackaged: true, getVersion: () => '0.1.0' },
+    autoUpdater: updater,
+    fetchImpl: releaseFetch('## 软件内更新摘要\n- 修复用量状态栏。\n'),
+    installAccessCheck: async () => ({ ok: false, dir: 'D:\\own\\app', message: '安装目录不可写，更新已中止：D:\\own\\app' }),
+    onLog: (entry) => logs.push(entry),
+  });
+
+  await controller.checkForUpdates();
+  updater.emit('update-available', { version: '0.1.1' });
+  const state = await controller.downloadUpdate();
+  assert.equal(downloadCalls, 0);
+  assert.equal(state.status, 'error');
+  assert.match(state.error, /安装目录不可写/);
+  assert.ok(logs.some((entry) => entry.level === 'error' && entry.msg.includes('更新下载已取消')));
+});
+
+test('下载完成后安装目录不可写时不重启安装', async () => {
+  const updater = createUpdater();
+  let access = { ok: true };
+  let installed = false;
+  updater.quitAndInstall = () => { installed = true; };
+  const logs = [];
+  const controller = setupAutoUpdater({
+    app: { isPackaged: true, getVersion: () => '0.1.0' },
+    autoUpdater: updater,
+    fetchImpl: releaseFetch('## 软件内更新摘要\n- 修复用量状态栏。\n'),
+    installAccessCheck: async () => access,
+    onLog: (entry) => logs.push(entry),
+  });
+
+  await controller.checkForUpdates();
+  updater.emit('update-available', { version: '0.1.1' });
+  await controller.downloadUpdate();
+  access = { ok: false, dir: 'D:\\own\\app', message: '安装目录不可写，更新已中止：D:\\own\\app' };
+  updater.emit('update-downloaded');
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  assert.equal(installed, false);
+  assert.equal(controller.getState().status, 'error');
+  assert.ok(logs.some((entry) => entry.msg.includes('重启安装已阻止')));
 });
