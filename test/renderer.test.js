@@ -3918,6 +3918,59 @@ test('自定义生图：启用前明确确认技能设置修改，停用后提�
   }
 });
 
+test('中转站余额配置：按已有提供商选择适配器并校验刷新间隔', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const pluginsMod = await import(pathToFileURL(path.join(tmp, 'views', 'plugins.js')).href);
+    installFakeDom();
+    const plugin = { id: 'provider-balance', name: '中转站余额', icon: 'activity', installed: true, enabled: false,
+      config: { providers: [{ providerId: 'p_demo0001', adapter: 'sub2api' }], refreshIntervalSeconds: 60 } };
+    const state = fixtureState({ view: 'plugins', plugins: [plugin] });
+    const calls = [];
+    const ctx = makeCtx(appMod, state, calls);
+    state.providers = [
+      { id: 'p_demo0001', name: 'Sub2API Provider', enabled: true, hasKey: true },
+      { id: 'p_demo0002', name: 'New API Provider', enabled: true, hasKey: true },
+      { id: 'p_no_key', name: 'No Key', enabled: true, hasKey: false },
+    ];
+    ctx.api.setPluginConfig = async (patch) => { calls.push(['setPluginConfig', patch]); return { ...plugin, config: patch.config }; };
+    const root = new FakeNode('main');
+    pluginsMod.renderPlugins(root, ctx, new FakeNode('div'));
+    root.findTag('button').find((node) => node.textContent.includes('配置')).listeners.click[0]();
+    const modal = calls.find((call) => call[0] === 'openModal')[1];
+    assert.match(modal.allText(), /只读取固定额度接口/);
+    assert.equal(modal.findTag('select').length, 3);
+    const inputs = modal.findTag('input');
+    const firstProvider = inputs.find((input) => input.attributes['aria-label'] === '关联 Sub2API Provider');
+    const secondProvider = inputs.find((input) => input.attributes['aria-label'] === '关联 New API Provider');
+    const interval = inputs.find((input) => input.attributes['aria-label'] === '自动刷新间隔（秒）');
+    assert.ok(firstProvider.checked);
+    assert.equal(inputs.find((input) => input.attributes['aria-label'] === '关联 No Key').disabled, true, '无 Key 的提供商不能关联');
+    interval.value = '9';
+    modal.findTag('button').find((button) => button.textContent.includes('保存配置')).listeners.click[0]();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(calls.some((call) => call[0] === 'setPluginConfig'), false);
+    assert.ok(calls.some((call) => call[0] === 'toast' && /10–86400/.test(call[2])));
+    interval.value = '120';
+    secondProvider.checked = true;
+    modal.findTag('select')[1].value = 'newapi';
+    modal.findTag('button').find((button) => button.textContent.includes('保存配置')).listeners.click[0]();
+    await new Promise((resolve) => setImmediate(resolve));
+    const saved = calls.find((call) => call[0] === 'setPluginConfig')[1].config;
+    assert.deepEqual(saved, {
+      providers: [
+        { providerId: 'p_demo0001', adapter: 'sub2api' },
+        { providerId: 'p_demo0002', adapter: 'newapi' },
+      ],
+      refreshIntervalSeconds: 120,
+    });
+  } finally {
+    delete globalThis.document; delete globalThis.window; delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test('自定义生图配置：可设置截图中的尺寸、比例、画质和背景，并保存到插件配置', async () => {
   const tmp = copyRendererToTemp();
   try {

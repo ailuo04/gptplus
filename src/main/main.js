@@ -61,6 +61,7 @@ const {
   resumeUsageStatusline,
   stopUsageStatuslineBridge,
 } = require('../core/chatgpt-statusline.js');
+const { disposeChatGptBalance, resumeChatGptBalance, stopChatGptBalanceBridge, launchChatGptWithBalance, installChatGptBalanceOnPort } = require('../core/chatgpt-balance.js');
 
 const isDev = process.argv.includes('--dev');
 const isQuitRequest = process.argv.includes('--quit');
@@ -241,7 +242,8 @@ async function launchChatGptAtLogin(commandLine = process.argv) {
   try {
     // 日志里必须区分“已请求唤起”和“客户端真的起来了”：登录时没有界面反馈，
     // 只 spawn explorer 成功并不代表 ChatGPT 主窗口出现。
-    const usageStatuslineEnabled = ctx?.plugins?.isActive?.('usage-statusline') !== false;
+    const usageStatuslineEnabled = ctx?.plugins?.isActive ? ctx.plugins.isActive('usage-statusline') === true : true;
+    const balanceEnabled = ctx?.plugins?.isActive?.('provider-balance') === true;
     const voiceInputEnabled = ctx?.plugins?.isActive?.('voice-input') === true;
     let result;
     if (ctx?.gateway && usageStatuslineEnabled) {
@@ -257,6 +259,17 @@ async function launchChatGptAtLogin(commandLine = process.argv) {
         } catch (error) {
           ctx?.log?.({ level: 'warn', msg: '语音输入注入失败: ' + error.message });
         }
+      }
+      if (result?.ok && balanceEnabled && result.cdpPort) {
+        try { await installChatGptBalanceOnPort({ ctx, cdpPort: result.cdpPort }); }
+        catch (error) { ctx?.log?.({ level: 'warn', msg: '中转站余额圆环注入失败: ' + error.message }); }
+      }
+    } else if (balanceEnabled) {
+      result = await launchChatGptWithBalance({ ctx, launchOptions: { preferredPath }, wrapperDir: path.join(ctx.paths.APP_DIR, 'cdp'),
+        launch: (options) => launchChatGptAndVerify({ preferredPath, ...options }) });
+      if (result?.ok && voiceInputEnabled && result.cdpPort) {
+        try { await startVoiceInputOnPort({ ctx, cdpPort: result.cdpPort }); }
+        catch (error) { ctx?.log?.({ level: 'warn', msg: '语音输入注入失败: ' + error.message }); }
       }
     } else if (voiceInputEnabled) {
       result = await launchChatGptWithVoiceInput({
@@ -339,6 +352,21 @@ async function handlePluginChange(event) {
         ctx.log?.({ level: 'warn', msg: '用量信息栏插件恢复失败: ' + (result.error || '未知错误') });
       }
     }
+    return;
+  }
+
+  if (id === 'provider-balance') {
+    let port = null;
+    try { port = await findChatGptDebugPort(); } catch { port = null; }
+    if (port) {
+      try { await disposeChatGptBalance({ cdpPort: port }); }
+      catch (error) { ctx.log?.({ level: 'warn', msg: '清理 ChatGPT 中转站余额失败: ' + error.message }); }
+    } else {
+      stopChatGptBalanceBridge();
+    }
+    if (!ctx.plugins.isActive('provider-balance')) return;
+    const result = await resumeChatGptBalance({ ctx, timeoutMs: 8000 });
+    if (result && result.ok === false && !result.skipped) ctx.log?.({ level: 'warn', msg: '中转站余额圆环恢复失败: ' + (result.error || '未知错误') });
     return;
   }
 
@@ -649,6 +677,8 @@ app.on('before-quit', () => {
     ctx?.taskMonitor?.stop?.();
     ctx?.gateway?.stopSync?.();
     stopUsageStatuslineBridge();
+    ctx?.balanceRuntime?.stop?.();
+    stopChatGptBalanceBridge();
     stopVoiceInputBridge();
     stopLocalSpeech();
   } catch {

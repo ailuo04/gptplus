@@ -633,3 +633,13 @@ onWeixinStatus(cb): () => void;   // 事件 gptplus:weixin:status
 - 启用、停用、卸载及启用期间修改配置，经 IPC 同步技能与配置后持久化插件状态；状态保存失败回退本次技能和 Codex 配置写入。专用目录中已有外部修改时拒绝覆盖，配置块有内容校验。停用保留禁用的专用技能条目与插件服务配置。
 - preload 暴露 `verifyImagePlugin(config)`，对应 `gptplus:plugin:image:verify`；仅用户明确点击付费验证入口时，使用当前表单草稿的 URL、Key、模型、resolution/aspectRatio/quality/background 直接生成一张图；无需先保存或启用，Key 留空时仅复用已保存 Key，不回退到已保存地址、模型或生成参数。返回 `{ok,baseUrl,model,count,formats,at}`，不向渲染层返回图片数据或密钥。验证不落盘、不改技能设置或启用状态；等待期间修改表单时提示重新验证，不覆盖新填写的地址。验证与保存共用 Images URL 归一化：沿用提供商的协议和 `/v1` 补齐规则，保留已有版本段和完整 `/images/generations` 端点。
 - 默认优先只通过受支持的 `[[skills.config]]` 条目停用已知内置 `imagegen/SKILL.md`。状态字段 `automaticSelectionGuaranteed` 恒为 false，不能将配置成功等同于模型自动选择、底层工具关闭或真实提供商调用已验证。启用/停用和默认优先设置变更需要客户端重启、新对话生效。
+## 11. 中转站余额插件（2026-11-06）
+
+- 内置插件 id 为 `provider-balance`，默认未安装、未启用。规范化配置：`{providers:[{providerId,adapter}],refreshIntervalSeconds}`；adapter 只接受 `sub2api` / `newapi`，刷新间隔是 10–86400 秒整数，默认 60 秒。配置仅存 providerId、adapter 与间隔，不复制凭据。显式保存时未知 providerId 会被过滤；重复 providerId 只保留首项。
+- ChatGPT 圆环通过当前可见模型选择器 React 组件的精确 `props.model` slug 与本机 catalog slug 反查 providerId；不以显示名或最后一次请求猜测。客户端 DOM/React 信号变化、slug 不唯一或没有映射时 fail closed，显示红色 `!`。该信号不是 ChatGPT 公开 DOM API，必须由运行时检查和合成 fixture 防止错误上游被显示。
+- Sub2API 固定请求 `GET {base}/v1/usage`。额度受限响应使用 `quota.remaining` / `quota.unit`、累计额度使用 `quota.used`；非额度受限响应使用 `remaining` / `balance` / `unit`，订阅和钱包保持各自账务范围。只有 `usage.total.actual_cost` 或额度 `used` 字段提供累计用量基线；仅有余额时差值属于净余额减少，不称为精确消费。
+- New API 固定请求 `GET {base}/api/usage/token/`，并可请求同一部署下公开 `GET {base}/api/status` 读取 `quota_per_unit`、`quota_display_type`、汇率和自定义币种符号。令牌响应使用 `data.total_available`、`data.total_used`、`data.unlimited_quota`；用户额度（若允许查询）优先显示 `user_quota.total_available`。只有设置返回有效、可精确表示的比例时才换算；否则保留「额度」原始单位，不将 token quota 误标成货币。
+- Base URL 保留自托管前缀，仅移除最后的版本段后拼固定路由；不接受 renderer 提交 URL、HTTP 方法、Key 或 adapter 作为余额请求输入。网络层使用主进程已保存凭据和系统代理、AbortSignal 超时与响应大小限制；错误正文不向页面回传。页面和 IPC 展示快照均不包含 API Key、Authorization、用户自定义密钥、响应体或用于基线身份的凭据摘要。
+- 精确十进制差额采用 BigInt 系数/小数位计算。每个 provider / 凭据 / adapter / 账务范围单独建立运行时基线；首次快照、充值、累计值回退、单位/币种/账户范围变化或 Key / Base URL 变化均不产出消费提示。仅当前模型上游自动轮询；余额详情首次打开时查询其他已关联提供商一次。
+- 成功快照中可信累计消耗显示红色负数，提示位于根级 viewport overlay 中圆环正上方，约 2 秒淡出；余额数值只为实际变化的数位建立约 400ms 滚动过渡。`prefers-reduced-motion` 下直接显示数值。
+- 余额桥接、固定只读 API 客户端与页面 UI 独立于用量信息栏插件；各自启停，不影响语音输入。停止插件会清轮询、挂起请求、页面脚本和观察器；应用重启后不持久化上一次余额快照，重新采样建立新基线。该余额/用量是 API Key 范围，而非单模型或单会话统计。

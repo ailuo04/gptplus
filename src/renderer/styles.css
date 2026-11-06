@@ -3462,3 +3462,9 @@ html.is-theme-switching .logs {
 .is-ratios .imagegen-choice span { min-width: 56px; border-color: var(--line); background: var(--bg-panel); }
 .imagegen-dimensions { margin: 0; font-variant-numeric: tabular-nums; }
 .imagegen-generation-settings > .hint { margin: 0; }
+
+.balance-provider-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(132px, 180px); gap: 8px; align-items: center; }
+.balance-provider-toggle { min-width: 0; }
+.balance-config-modal { width: min(620px, calc(100vw - 48px)); }
+.balance-provider-list { max-height: min(45vh, 360px); overflow: auto; padding-right: 2px; }
+@media (max-width: 520px) { .balance-provider-row { grid-template-columns: 1fr; } }

@@ -7,6 +7,8 @@ const { createStore } = require('./store.js');
 const { createCatalog } = require('./catalog.js');
 const { createCodexConfig } = require('./codex-config.js');
 const { createProviderClient } = require('./provider-client.js');
+const { createProviderBalanceClient } = require('./provider-balance.js');
+const { createBalanceRuntime } = require('./balance-runtime.js');
 const { createLogStore } = require('./log-store.js');
 const { createUsageStore } = require('./usage-store.js');
 const { createUsageLiveReader } = require('./usage-live.js');
@@ -44,6 +46,17 @@ async function createContext(opts = {}) {
   const catalog = createCatalog({ store, paths });
   const codex = createCodexConfig({ store, catalog, paths });
   const providerClient = createProviderClient({ store, fetchImpl: network });
+  const balanceEvents = new Set();
+  const providerBalance = createProviderBalanceClient({ fetchImpl: network });
+  const balanceRuntime = createBalanceRuntime({
+    store,
+    client: providerBalance,
+    onUpdate: (event) => {
+      for (const callback of balanceEvents) {
+        try { callback(event); } catch { /* balance listeners must not affect refresh */ }
+      }
+    },
+  });
 
   // 使用量页的数据源。启动时从磁盘回放，否则每次重进应用统计都会清零。
   const logStore = createLogStore({ logPath: paths.LOG_PATH });
@@ -52,6 +65,12 @@ async function createContext(opts = {}) {
   usageStore.load();
   const usageLive = createUsageLiveReader({ codexHome: paths.CODEX_HOME });
   const plugins = createPluginManager({ store });
+  const syncBalanceRuntime = () => {
+    if (plugins.isActive('provider-balance')) balanceRuntime.configure(plugins.config('provider-balance'));
+    else balanceRuntime.stop();
+  };
+  syncBalanceRuntime();
+  plugins.onChange((event) => { if (event?.plugin?.id === 'provider-balance') syncBalanceRuntime(); });
   const imageGeneration = createImageGeneration({ plugins, fetchImpl: network });
   const chatgptPluginRecovery = createChatGptPluginRecovery({
     codexHome: paths.CODEX_HOME, configPath: paths.CODEX_CONFIG_PATH, appDir: paths.APP_DIR, backup: codex.backup,
@@ -304,6 +323,12 @@ async function createContext(opts = {}) {
     usageTrend: () => usageStore.trend(),
     usageLive,
     plugins,
+    balanceRuntime,
+    onBalanceEvent: (callback) => {
+      if (typeof callback !== 'function') return () => {};
+      balanceEvents.add(callback);
+      return () => balanceEvents.delete(callback);
+    },
     imageGeneration,
     imagegenSkill,
     chatgptPluginRecovery,

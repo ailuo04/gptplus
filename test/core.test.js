@@ -251,8 +251,8 @@ test('plugin manager: 内置插件可安装、启停、配置和卸载，并保�
 
   const manager = createPluginManager({ store });
   const initial = manager.list();
-  assert.deepEqual(initial.map((plugin) => plugin.id), ['custom-imagegen', 'weixin', 'usage-statusline', 'chatgpt-plugin-catalog', 'voice-input']);
-  assert.ok(initial.filter((plugin) => !['chatgpt-plugin-catalog', 'custom-imagegen'].includes(plugin.id)).every((plugin) => plugin.installed && plugin.enabled));
+  assert.deepEqual(initial.map((plugin) => plugin.id), ['custom-imagegen', 'weixin', 'usage-statusline', 'provider-balance', 'chatgpt-plugin-catalog', 'voice-input']);
+  assert.ok(initial.filter((plugin) => !['chatgpt-plugin-catalog', 'custom-imagegen', 'provider-balance'].includes(plugin.id)).every((plugin) => plugin.installed && plugin.enabled));
   assert.equal(manager.get('chatgpt-plugin-catalog').installed, false, '目录修复需要用户明确安装并启用');
   assert.equal(manager.get('chatgpt-plugin-catalog').enabled, false);
   assert.deepEqual(manager.get('usage-statusline').config.metrics, { speed: true, cache: true, context: true });
@@ -274,6 +274,70 @@ test('plugin manager: 内置插件可安装、启停、配置和卸载，并保�
   assert.equal(reloaded.get('weixin').installed, true);
   assert.equal(reloaded.get('weixin').enabled, false);
   assert.deepEqual(reloaded.config('usage-statusline').metrics, { speed: false, cache: true, context: false });
+});
+
+test('provider balance plugin config: 只保存已知 providerId、adapter 和刷新间隔', (t) => {
+  const dir = tmpDir('provider-balance-plugin');
+  cleanup(t, dir);
+  const store = createStore({ configPath: path.join(dir, 'config.json') });
+  store.upsertProvider({ id: 'p_demo0001', name: 'Sub2API', baseUrl: 'https://one.example/v1', apiKey: 'sk-private-one', headers: { 'X-Secret': 'header-secret' }, models: [{ id: 'model-a' }] });
+  store.upsertProvider({ id: 'p_demo0002', name: 'New API', baseUrl: 'https://two.example/v1', apiKey: 'sk-private-two', models: [{ id: 'model-b' }] });
+
+  const manager = createPluginManager({ store });
+  const initial = manager.get('provider-balance');
+  assert.equal(initial.installed, false);
+  assert.equal(initial.enabled, false);
+  assert.deepEqual(initial.config, { providers: [], refreshIntervalSeconds: 60 });
+
+  manager.setConfig('provider-balance', {
+    providers: [
+      { providerId: 'p_demo0001', adapter: 'sub2api' },
+      { providerId: 'p_demo0002', adapter: 'newapi' },
+      { providerId: 'p_unknown', adapter: 'newapi' },
+      { providerId: 'p_demo0001', adapter: 'newapi' },
+    ],
+    refreshIntervalSeconds: 60,
+  });
+  assert.deepEqual(manager.config('provider-balance'), {
+    providers: [
+      { providerId: 'p_demo0001', adapter: 'sub2api' },
+      { providerId: 'p_demo0002', adapter: 'newapi' },
+    ],
+    refreshIntervalSeconds: 60,
+  });
+  assert.throws(() => manager.setConfig('provider-balance', {
+    providers: [{ providerId: 'p_demo0001', adapter: 'guess' }], refreshIntervalSeconds: 60,
+  }), /adapter/);
+  assert.throws(() => manager.setConfig('provider-balance', {
+    providers: [], refreshIntervalSeconds: 9,
+  }), /刷新间隔/);
+
+  for (const seconds of [10, 86400]) {
+    manager.setConfig('provider-balance', { providers: [], refreshIntervalSeconds: seconds });
+    assert.equal(manager.config('provider-balance').refreshIntervalSeconds, seconds);
+  }
+  const exposed = JSON.stringify(manager.get('provider-balance'));
+  assert.equal(exposed.includes('sk-private'), false);
+  assert.equal(exposed.includes('header-secret'), false);
+  assert.equal(exposed.includes('apiKey'), false);
+});
+test('ipc: 中转站余额刷新通道只注册一次', (t) => {
+  const { registerIpc } = require(path.join(CORE, 'ipc.js'));
+  const dir = tmpDir('ipc-balance-handler');
+  cleanup(t, dir);
+  const registrations = [];
+  const ctx = {
+    store: createStore({ configPath: path.join(dir, 'config.json') }),
+    log: () => {},
+    onLogEvent: () => () => {},
+  };
+
+  registerIpc({
+    ipcMain: { handle: (channel, handler) => registrations.push({ channel, handler }) },
+    shell: {}, dialog: {}, ctx,
+  });
+
+  assert.equal(registrations.filter(({ channel }) => channel === 'gptplus:plugin:balance:refresh').length, 1);
 });
 
 test('store: 提供商敏感字段使用系统安全存储落盘，并迁移旧版明文配置', (t) => {
@@ -2869,6 +2933,39 @@ test('usage-store: 清空细数据时保留按天 Token 趋势，全部清空时
   assert.equal(fs.existsSync(trendPath), false, '全部清空不应留下趋势文件');
 });
 
+test('context: 余额运行时接入插件配置、事件桥接和启停生命周期', (t) => {
+  const dir = tmpDir('context-balance-runtime');
+  cleanup(t, dir);
+  const probe = [
+    `const { createContext } = require(${JSON.stringify(path.join(CORE, 'context.js'))});`,
+    `(async () => {`,
+    `  const ctx = await createContext({});`,
+    `  const providerId = 'p_balance01';`,
+    `  ctx.store.upsertProvider({ id: providerId, name: 'Balance Test', baseUrl: 'https://balance.example/v1', apiKey: 'test-key', models: [{ id: 'm1' }] });`,
+    `  ctx.plugins.install('provider-balance');`,
+    `  ctx.plugins.setConfig('provider-balance', { providers: [{ providerId, adapter: 'sub2api' }], refreshIntervalSeconds: 60 });`,
+    `  ctx.plugins.setEnabled('provider-balance', true);`,
+    `  const selectedProvider = ctx.balanceRuntime?.setCurrentProvider(providerId) || '';`,
+    `  ctx.plugins.setEnabled('provider-balance', false);`,
+    `  const stopped = ctx.balanceRuntime ? await ctx.balanceRuntime.refresh(providerId) : null;`,
+    `  process.stdout.write(JSON.stringify({ hasRuntime: !!ctx.balanceRuntime, hasEventBridge: typeof ctx.onBalanceEvent === 'function', selectedProvider, disabledCode: stopped?.code || null }));`,
+    `  ctx.balanceRuntime?.stop();`,
+    `  ctx.remoteSync?.stop();`,
+    `  ctx.taskMonitor?.stop();`,
+    `})().catch((error) => { console.error(error); process.exitCode = 1; });`,
+  ].join('\n');
+  const run = spawnSync(process.execPath, ['-e', probe], {
+    encoding: 'utf8',
+    env: { ...process.env, GPTPLUS_HOME: dir, CODEX_HOME: path.join(dir, 'codex') },
+  });
+  assert.equal(run.status, 0, run.stderr);
+  assert.deepEqual(JSON.parse(run.stdout), {
+    hasRuntime: true,
+    hasEventBridge: true,
+    selectedProvider: 'p_balance01',
+    disabledCode: 'STOPPED',
+  });
+});
 test('context: 重启后从磁盘回放日志环，使用量统计不再清零（真子进程，隔离 GPTPLUS_HOME）', (t) => {
   const dir = tmpDir('context-replay');
   cleanup(t, dir);

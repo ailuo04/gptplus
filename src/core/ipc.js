@@ -10,6 +10,7 @@ const { validateImageConfig } = require('./image-generation.js');
 const { slugForProvider } = require('./model-utils.js');
 const { resolveChatGptExe } = require('./chatgpt-install.js');
 const { relaunchChatGpt } = require('./chatgpt-launch.js');
+const { launchChatGptWithBalance, installChatGptBalanceOnPort } = require('./chatgpt-balance.js');
 const { launchChatGptWithUsageStatusline } = require('./chatgpt-statusline.js');
 const { launchChatGptWithVoiceInput, startVoiceInputOnPort } = require('./voice-input.js');
 const { redactDiagnostic } = require('./redact.js');
@@ -231,6 +232,15 @@ function registerIpc(deps) {
 
   handle('gptplus:status:get', () => ctx.status());
   handle('gptplus:plugin:list', () => plugins ? plugins.list().map(pluginWithRuntime) : []);
+  handle('gptplus:plugin:balance:refresh', async (providerId) => {
+    if (!plugins?.isActive?.('provider-balance')) throw new Error('中转站余额插件未启用');
+    const id = typeof providerId === 'string' ? providerId.trim() : '';
+    if (!id || id.length > 128) throw new Error('提供商 ID 无效');
+    const mapped = plugins.config('provider-balance').providers.some((item) => item.providerId === id);
+    if (!mapped) throw new Error('该提供商未配置余额查询');
+    if (typeof ctx.balanceRuntime?.refresh !== 'function') throw new Error('余额运行时不可用');
+    return ctx.balanceRuntime.refresh(id, { reason: 'manual' });
+  });
   handle('gptplus:plugin:install', (id) => {
     if (!plugins) throw new Error('插件管理器不可用');
     if (id === 'custom-imagegen' && plugins.get(id).installed) return pluginWithRuntime(plugins.get(id));
@@ -1199,6 +1209,7 @@ function registerIpc(deps) {
     let result;
     try {
       const usageStatuslineEnabled = ctx.plugins?.isActive?.('usage-statusline') !== false;
+      const balanceEnabled = ctx.plugins?.isActive?.('provider-balance') === true;
       const voiceInputEnabled = ctx.plugins?.isActive?.('voice-input') === true;
       if (usageStatuslineEnabled) {
         result = await launchChatGptWithUsageStatusline({
@@ -1217,6 +1228,21 @@ function registerIpc(deps) {
           } catch (error) {
             ctx.log?.({ level: 'warn', msg: '语音输入注入失败: ' + error.message });
           }
+        }
+        if (result?.ok && balanceEnabled && result.cdpPort) {
+          try { await installChatGptBalanceOnPort({ ctx, cdpPort: result.cdpPort }); }
+          catch (error) { ctx.log?.({ level: 'warn', msg: '中转站余额圆环注入失败: ' + error.message }); }
+        }
+      } else if (balanceEnabled) {
+        result = await launchChatGptWithBalance({
+          ctx,
+          launchOptions: { executablePath: exe },
+          wrapperDir: path.join(ctx.paths.APP_DIR, 'cdp'),
+          launch: ({ cdpPort, wrapperDir }) => relaunchChatGpt({ executablePath: exe, cdpPort, wrapperDir }),
+        });
+        if (result?.ok && voiceInputEnabled && result.cdpPort) {
+          try { await startVoiceInputOnPort({ ctx, cdpPort: result.cdpPort }); }
+          catch (error) { ctx.log?.({ level: 'warn', msg: '语音输入注入失败: ' + error.message }); }
         }
       } else if (voiceInputEnabled) {
         result = await launchChatGptWithVoiceInput({

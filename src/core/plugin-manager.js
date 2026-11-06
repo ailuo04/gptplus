@@ -23,6 +23,10 @@ const DEFAULT_VOICE_CONFIG = Object.freeze({
 });
 
 const DEFAULT_IMAGE_CONFIG = Object.freeze({ baseUrl: '', apiKey: '', model: '', preferDefault: true, resolution: '1K', aspectRatio: '1:1', quality: 'auto', background: 'auto' });
+const DEFAULT_BALANCE_CONFIG = Object.freeze({ providers: Object.freeze([]), refreshIntervalSeconds: 60 });
+const MIN_BALANCE_REFRESH_SECONDS = 10;
+const MAX_BALANCE_REFRESH_SECONDS = 86400;
+const BALANCE_ADAPTERS = new Set(['sub2api', 'newapi']);
 
 const BUILTIN_PLUGIN_DEFINITIONS = Object.freeze([
   Object.freeze({
@@ -61,6 +65,21 @@ const BUILTIN_PLUGIN_DEFINITIONS = Object.freeze([
     defaultEnabled: true,
     configurable: true,
     defaultConfig: { metrics: DEFAULT_USAGE_METRICS },
+  }),
+  Object.freeze({
+    id: 'provider-balance',
+    name: '中转站余额',
+    version: '1.0.0',
+    author: 'gpt++',
+    category: '效率',
+    icon: 'activity',
+    description: '在 ChatGPT 页面显示当前模型上游的剩余额度。',
+    detail: '仅调用 Sub2API / New API 的只读额度接口，不发送生成请求或消耗模型 Token；启用后复用已保存的提供商凭据。',
+    builtIn: true,
+    defaultInstalled: false,
+    defaultEnabled: false,
+    configurable: true,
+    defaultConfig: DEFAULT_BALANCE_CONFIG,
   }),
   Object.freeze({
     id: 'chatgpt-plugin-catalog',
@@ -152,10 +171,40 @@ function normalizeImageConfig(raw) {
   };
 }
 
-function normalizePluginConfig(definition, raw) {
+function normalizeBalanceConfig(raw, { validProviderIds, strict = false } = {}) {
+  const source = isPlainObject(raw) ? raw : {};
+  const hasProviderAllowlist = validProviderIds instanceof Set || Array.isArray(validProviderIds);
+  const allowedProviderIds = validProviderIds instanceof Set ? validProviderIds : new Set(Array.isArray(validProviderIds) ? validProviderIds : []);
+  const providers = [];
+  const seen = new Set();
+  for (const entry of Array.isArray(source.providers) ? source.providers : []) {
+    if (!isPlainObject(entry)) continue;
+    const providerId = String(entry.providerId || '').trim();
+    const adapter = String(entry.adapter || '').trim();
+    if (!providerId || !BALANCE_ADAPTERS.has(adapter)) {
+      if (strict && providerId && !BALANCE_ADAPTERS.has(adapter)) throw new Error('不支持的 adapter');
+      continue;
+    }
+    if (hasProviderAllowlist && !allowedProviderIds.has(providerId)) continue;
+    if (seen.has(providerId)) continue;
+    seen.add(providerId);
+    providers.push({ providerId, adapter });
+  }
+
+  const rawInterval = source.refreshIntervalSeconds;
+  const interval = rawInterval == null || String(rawInterval).trim() === '' ? 60 : Number(rawInterval);
+  if (!Number.isInteger(interval) || interval < MIN_BALANCE_REFRESH_SECONDS || interval > MAX_BALANCE_REFRESH_SECONDS) {
+    if (strict) throw new Error('刷新间隔必须是 10–86400 秒的整数');
+    return { providers, refreshIntervalSeconds: 60 };
+  }
+  return { providers, refreshIntervalSeconds: interval };
+}
+
+function normalizePluginConfig(definition, raw, options = {}) {
   if (definition.id === 'custom-imagegen') return normalizeImageConfig(raw);
   if (definition.id === 'usage-statusline') return normalizeUsageConfig(raw);
   if (definition.id === 'voice-input') return normalizeVoiceConfig(raw);
+  if (definition.id === 'provider-balance') return normalizeBalanceConfig(raw, options);
   return isPlainObject(raw) ? deepCopy(raw) : {};
 }
 
@@ -319,11 +368,21 @@ function createPluginManager({ store, definitions = BUILTIN_PLUGIN_DEFINITIONS }
   }
 
   function setConfig(id, rawConfig) {
-    return update(id, (current) => ({
-      ...current,
-      config: normalizePluginConfig(definition(id), id === 'custom-imagegen'
-        ? { ...rawConfig, apiKey: String(rawConfig?.apiKey || '').trim() || current.config.apiKey } : rawConfig),
-    }), 'configure');
+    const def = definition(id);
+    if (def.id === 'custom-imagegen') {
+      return update(def.id, (current) => ({
+        ...current,
+        config: normalizePluginConfig(def, {
+          ...rawConfig,
+          apiKey: String(rawConfig?.apiKey || '').trim() || current.config.apiKey,
+        }),
+      }), 'configure');
+    }
+    const config = normalizePluginConfig(def, rawConfig, {
+      strict: def.id === 'provider-balance',
+      validProviderIds: store.providers().map((provider) => provider.id),
+    });
+    return update(def.id, (current) => ({ ...current, config }), 'configure');
   }
 
   function onChange(callback) {
@@ -351,6 +410,7 @@ function createPluginManager({ store, definitions = BUILTIN_PLUGIN_DEFINITIONS }
 module.exports = {
   BUILTIN_PLUGIN_DEFINITIONS,
   DEFAULT_USAGE_METRICS,
+  DEFAULT_BALANCE_CONFIG,
   DEFAULT_VOICE_CONFIG,
   DEFAULT_VOICE_SPACE_HOLD_MS,
   MAX_VOICE_SPACE_HOLD_MS,
@@ -361,5 +421,6 @@ module.exports = {
   DEFAULT_IMAGE_CONFIG,
   normalizeVoiceConfig,
   normalizeVoiceSpaceHoldMs,
+  normalizeBalanceConfig,
 };
 

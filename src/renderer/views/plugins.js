@@ -112,6 +112,60 @@ function openUsageConfig(ctx, plugin) {
   modal.classList.add('is-plugin-config');
 }
 
+function openBalanceConfig(ctx, plugin) {
+  const current = plugin?.config || { providers: [], refreshIntervalSeconds: 60 };
+  const saved = new Map((Array.isArray(current.providers) ? current.providers : []).map((item) => [item.providerId, item.adapter]));
+  const providers = (ctx.state.providers || []).filter((provider) => provider && provider.enabled !== false);
+  const fields = new Map();
+  const rows = providers.map((provider) => {
+    const adapter = saved.get(provider.id) || 'sub2api';
+    const enabled = ctx.el('input', { type: 'checkbox', checked: saved.has(provider.id) && provider.hasKey === true,
+      attrs: { 'aria-label': '关联 ' + (provider.name || provider.id) } });
+    const adapterSelect = ctx.el('select', { class: 'select', attrs: { 'aria-label': (provider.name || provider.id) + ' 余额接口类型' } }, [
+      ctx.el('option', { value: 'sub2api', text: 'Sub2API', selected: adapter === 'sub2api' }),
+      ctx.el('option', { value: 'newapi', text: 'New API', selected: adapter === 'newapi' }),
+    ]);
+    if (!provider.hasKey) { enabled.disabled = true; adapterSelect.disabled = true; }
+    fields.set(provider.id, { enabled, adapterSelect, provider });
+    return ctx.el('div', { class: 'balance-provider-row' }, [
+      ctx.el('label', { class: 'plugin-config-option balance-provider-toggle' }, [enabled, ctx.el('span', { class: 'plugin-config-option-copy' }, [
+        ctx.el('strong', { text: provider.name || provider.id }),
+        ctx.el('span', { class: 'hint', text: provider.hasKey ? '使用此提供商已保存的 API Key 查询' : '此提供商尚未保存 API Key' }),
+      ])]),
+      adapterSelect,
+    ]);
+  });
+  const seconds = ctx.el('input', { class: 'input mono', type: 'number', value: String(current.refreshIntervalSeconds || 60),
+    attrs: { min: '10', max: '86400', step: '1', 'aria-label': '自动刷新间隔（秒）' } });
+  const modal = ctx.openModal(ctx.el('section', {
+    class: 'modal plugin-config-modal balance-config-modal',
+    attrs: { role: 'dialog', 'aria-modal': 'true', 'aria-label': '配置中转站余额' },
+  }, [
+    ctx.el('header', { class: 'modal-head' }, [ctx.el('div', { class: 'modal-title', text: '配置中转站余额' })]),
+    ctx.el('div', { class: 'modal-body plugin-config-body' }, [
+      ctx.el('p', { class: 'setting-desc', text: '为每个已有提供商选择 Sub2API 或 New API。插件只读取固定额度接口，不发起模型请求；API Key 留在本机主进程，不会发送到 ChatGPT 页面。' }),
+      fields.size ? ctx.el('div', { class: 'plugin-config-options balance-provider-list' }, rows)
+        : ctx.el('p', { class: 'hint', text: '没有可用的已保存 API Key 提供商。请先在提供商页面添加服务配置。' }),
+      ctx.el('label', { class: 'field' }, [
+        ctx.el('span', { class: 'label', text: '自动刷新间隔（秒）' }), seconds,
+        ctx.el('span', { class: 'hint', text: '范围 10–86400 秒，默认 60 秒。刷新只调用额度查询接口。' }),
+      ]),
+    ]),
+    ctx.el('div', { class: 'modal-foot' }, [
+      ctx.el('button', { class: 'btn btn-ghost btn-sm', type: 'button', on: { click: () => ctx.closeModal() } }, [ctx.el('span', { text: '取消' })]),
+      ctx.el('button', { class: 'btn btn-accent btn-sm', type: 'button', on: { click: () => {
+        const interval = Number(seconds.value);
+        if (!Number.isInteger(interval) || interval < 10 || interval > 86400) { ctx.toast('刷新间隔必须是 10–86400 秒的整数', 'warn'); seconds.focus?.(); return; }
+        const mappings = [...fields.values()].filter((field) => field.enabled.checked && field.provider.hasKey)
+          .map((field) => ({ providerId: field.provider.id, adapter: field.adapterSelect.value }));
+        void runPluginAction(ctx, plugin.id, () => ctx.api.setPluginConfig({ id: plugin.id, config: { providers: mappings, refreshIntervalSeconds: interval } }), '中转站余额配置已保存')
+          .then((savedConfig) => { if (savedConfig) ctx.closeModal(); });
+      } } }, [ctx.icon('check', 13), ctx.el('span', { text: '保存配置' })]),
+    ]),
+  ]));
+  modal.classList.add('is-plugin-config');
+}
+
 function imageStatusText(plugin) {
   if (!plugin.enabled) return '未启用；保存配置后启用，重启 ChatGPT 并开启新对话。';
   const status = plugin.imageStatus;
@@ -279,7 +333,7 @@ const VOICE_LANGUAGES = [
 
 function openVoiceConfig(ctx, plugin) {
   const current = plugin?.config || {};
-  const providers = (ctx.state.providers || []).filter((provider) => provider && provider.enabled !== false && provider.api !== 'anthropic');
+  const providers = (ctx.state.providers || []).filter((provider) => provider && provider.enabled !== false);
   const selectedProvider = String(current.providerId || '');
   const providerOptions = providers.map((provider) => ctx.el('option', {
     value: provider.id,
@@ -484,6 +538,10 @@ function configureButton(ctx, plugin) {
       on: { click: () => ctx.navigate('weixin') },
     }, [ctx.icon('plug', 13), ctx.el('span', { text: '配置' })]);
   }
+  if (plugin.id === 'provider-balance') {
+    return ctx.el('button', { class: 'btn btn-ghost btn-sm', type: 'button', on: { click: () => openBalanceConfig(ctx, plugin) } },
+      [ctx.icon('plug', 13), ctx.el('span', { text: '配置' })]);
+  }
   if (plugin.id === 'usage-statusline') {
     return ctx.el('button', {
       class: 'btn btn-ghost btn-sm',
@@ -598,7 +656,7 @@ function renderPluginCard(ctx, plugin) {
         ? ctx.el('p', { class: 'plugin-card-detail', text: catalogStatusText(plugin) }) : null,
     ].filter(Boolean)),
     ctx.el('footer', { class: 'plugin-card-foot' }, [
-      ctx.el('span', { class: 'hint', text: plugin.id === 'custom-imagegen' ? '固定路由；gpt++ 与网关需保持运行' : plugin.id === 'weixin' ? '扫码登录与运行状态在配置页管理' : plugin.id === 'voice-input' ? '麦克风按钮会注入到 ChatGPT 输入框' : plugin.id === 'chatgpt-plugin-catalog' ? '本地市场；不更改登录授权' : '数据仅在本机处理' }),
+      ctx.el('span', { class: 'hint', text: plugin.id === 'custom-imagegen' ? '固定路由；gpt++ 与网关需保持运行' : plugin.id === 'weixin' ? '扫码登录与运行状态在配置页管理' : plugin.id === 'voice-input' ? '麦克风按钮会注入到 ChatGPT 输入框' : plugin.id === 'provider-balance' ? '余额圆环会跟随当前模型对应的上游' : plugin.id === 'chatgpt-plugin-catalog' ? '本地市场；不更改登录授权' : '数据仅在本机处理' }),
       ctx.el('div', { class: 'plugin-card-actions' }, actions),
     ]),
   ]);
