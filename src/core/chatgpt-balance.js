@@ -32,8 +32,10 @@ function formatBalanceAmount(value, currency, unit, locale = 'en-US') {
   if (!/^-?(?:0|[1-9]\d*)(?:\.\d+)?$/.test(raw)) return { text: String(unit || '') + raw, prefix: String(unit || ''), integer: '', fraction: '', decimal: '.', suffix: '' };
   const negative = raw.startsWith('-');
   const unsigned = negative ? raw.slice(1) : raw;
-  const [whole, fraction = ''] = unsigned.split('.');
-  const integer = whole.replace(/^0+(?=\d)/, '') || '0';
+  const rounded = roundDecimalString(unsigned, 2);
+  const [roundedWhole, fraction = ''] = rounded.split('.');
+  const integer = roundedWhole.replace(/^0+(?=\d)/, '') || '0';
+  const tiny = unsigned.includes('.') && /^0\.0+[1-9]/.test(unsigned) && rounded === '0';
   const isoCurrency = /^[A-Z]{3}$/.test(String(currency || '')) ? String(currency) : '';
   if (isoCurrency) {
     try {
@@ -47,17 +49,35 @@ function formatBalanceAmount(value, currency, unit, locale = 'en-US') {
       const groupParts = new Intl.NumberFormat(locale, { useGrouping: true, maximumFractionDigits: 0 }).formatToParts(1000n);
       const group = groupParts.find((part) => part.type === 'group')?.value || ',';
       const decimal = new Intl.NumberFormat(locale, { minimumFractionDigits: 1, maximumFractionDigits: 1 }).formatToParts(1.1).find((part) => part.type === 'decimal')?.value || '.';
-      const text = `${negative ? '-' : ''}${prefix}${grouped}${fraction ? decimal + fraction : ''}${suffix}`;
-      return { text, prefix: `${negative ? '-' : ''}${prefix}`, integer: grouped, integerDigits: integer, group, decimal, fraction, suffix };
+      const sign = negative ? '-' : '';
+      const shownFraction = tiny ? '01' : fraction;
+      const shownPrefix = tiny ? '<' + sign + prefix : sign + prefix;
+      const text = `${shownPrefix}${tiny ? '0' : grouped}${shownFraction ? decimal + shownFraction : ''}${suffix}`;
+      return { text, prefix: shownPrefix, integer: tiny ? '0' : grouped, integerDigits: tiny ? '0' : integer, group, decimal, fraction: shownFraction, suffix };
     } catch { /* unsupported currency falls through to the explicit unit */ }
   }
   const label = String(unit || '额度');
   const prefix = label === '额度' ? '' : label;
   const suffix = label === '额度' ? ' 额度' : '';
-  const text = `${negative ? '-' : ''}${prefix}${integer}${fraction ? '.' + fraction : ''}${suffix}`;
-  return { text, prefix: `${negative ? '-' : ''}${prefix}`, integer, integerDigits: integer, group: '', decimal: '.', fraction, suffix };
+  const grouped = new Intl.NumberFormat(locale, { useGrouping: true, maximumFractionDigits: 0 }).format(BigInt(integer));
+  const shownFraction = tiny ? '01' : fraction;
+  const shownPrefix = tiny ? '<' + (negative ? '-' : '') + prefix : (negative ? '-' : '') + prefix;
+  const text = `${shownPrefix}${tiny ? '0' : grouped}${shownFraction ? '.' + shownFraction : ''}${suffix}`;
+  return { text, prefix: shownPrefix, integer: tiny ? '0' : grouped, integerDigits: tiny ? '0' : integer, group: '', decimal: '.', fraction: shownFraction, suffix };
 }
 
+/** 四舍五入到最多两位小数；只处理已校验的非负十进制字符串。 */
+function roundDecimalString(value, maxFractionDigits) {
+  const [whole, fraction = ''] = String(value).split('.');
+  const keep = fraction.slice(0, maxFractionDigits);
+  const next = fraction[maxFractionDigits] || '0';
+  let digits = BigInt((whole || '0') + keep.padEnd(maxFractionDigits, '0'));
+  if (next >= '5') digits += 1n;
+  const scale = 10n ** BigInt(maxFractionDigits);
+  const integer = digits / scale;
+  const decimal = (digits % scale).toString().padStart(maxFractionDigits, '0').replace(/0+$/, '');
+  return decimal ? `${integer}.${decimal}` : String(integer);
+}
 function buildBalanceIndicatorScript({ modelRoutes = [], readyWaitMs = INJECT_TIMEOUT_MS } = {}) {
   const routes = [];
   const seenSlugs = new Map();
@@ -79,6 +99,7 @@ function buildBalanceIndicatorScript({ modelRoutes = [], readyWaitMs = INJECT_TI
   const mappingJson = JSON.stringify(mapping);
   const safeReadyWait = Math.max(500, Math.min(30000, Number(readyWaitMs) || INJECT_TIMEOUT_MS));
   const animationPlanSource = createDigitAnimationPlan.toString();
+  const roundDecimalSource = roundDecimalString.toString();
   const formatSource = formatBalanceAmount.toString();
   return `(() => {
   const ROUTES = ${mappingJson};
@@ -88,9 +109,11 @@ function buildBalanceIndicatorScript({ modelRoutes = [], readyWaitMs = INJECT_TI
   const STYLE_ID = 'gptplus-balance-indicator-style';
   const EXT_ATTR = 'data-gptplus-balance-indicator';
   const RUNTIME_KEY = 'gptplus-balance-indicator-v1';
+  const POSITION_KEY = 'gptplus-balance-indicator-position-v1';
+  const CACHE_KEY = 'gptplus-balance-last-value-v1';
   const STYLE = ${JSON.stringify(`
     #gptplus-balance-indicator-root{position:fixed;inset:0;z-index:2147483000;pointer-events:none;font-family:inherit;color:var(--text-primary,#1f1f1f)}
-    #gptplus-balance-indicator{position:fixed;width:44px;height:44px;border:1px solid color-mix(in srgb,currentColor 30%,transparent);border-radius:50%;background:var(--background-primary,#fff);box-shadow:0 2px 10px #0003;display:flex;align-items:center;justify-content:center;pointer-events:auto;cursor:pointer;padding:2px;box-sizing:border-box}
+    #gptplus-balance-indicator{position:fixed;width:44px;height:44px;border:4px solid currentColor;border-radius:50%;background:transparent;box-shadow:none;display:flex;align-items:center;justify-content:center;pointer-events:auto;cursor:pointer;padding:2px;box-sizing:border-box}
     #gptplus-balance-indicator[data-state="error"]{border-color:#d92d20;color:#d92d20} #gptplus-balance-indicator[data-state="loading"]{opacity:.65}
     #gptplus-balance-indicator-value{font-size:9px;line-height:1.05;text-align:center;max-width:38px;max-height:36px;overflow:hidden;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
     #gptplus-balance-indicator-value[data-error="true"]{font-size:23px;font-weight:700;color:#d92d20}
@@ -109,11 +132,13 @@ function buildBalanceIndicatorScript({ modelRoutes = [], readyWaitMs = INJECT_TI
     @media(prefers-reduced-motion:reduce){#gptplus-balance-indicator-toast{transition:none}#gptplus-balance-indicator-amount .gpb-track .gpb-old,#gptplus-balance-indicator-amount .gpb-track .gpb-new{animation:none!important}}
   `)};
   const createDigitAnimationPlan = ${animationPlanSource};
+  const roundDecimalString = ${roundDecimalSource};
   const formatBalanceAmount = ${formatSource};
   if (globalThis.__gptplusBalanceRuntime === RUNTIME_KEY && globalThis.__gptplusBalance) return { ok:true,installed:true,reused:true };
   globalThis.__gptplusBalance?.dispose?.();
   globalThis.__gptplusBalanceRuntime = RUNTIME_KEY;
-  const state = { root:null, ring:null, value:null, toast:null, details:null, snapshot:null, current:null, previousParts:null, providerSnapshots:{}, providerStatuses:{}, providerList:[], disposed:false, timer:0, toastTimer:0, observer:null, resizeObserver:null, manualRefresh:0 };
+  const restoredBalanceCache = restoreBalanceCache();
+  const state = { root:null, ring:null, value:null, toast:null, details:null, snapshot:null, current:null, previousParts:null, providerSnapshots:restoredBalanceCache.providers, lastSnapshot:restoredBalanceCache.last, providerStatuses:{}, providerList:[], disposed:false, timer:0, toastTimer:0, observer:null, resizeObserver:null, manualRefresh:0, position:loadPosition(), drag:null, suppressClick:false };
 
   function visible(node) { if (!node || !node.isConnected || !node.getClientRects?.().length) return false; const style=getComputedStyle(node); const rect=node.getBoundingClientRect(); return style.display!=='none'&&style.visibility!=='hidden'&&rect.width>0&&rect.height>0; }
   function reactModelSlugs(node) {
@@ -143,21 +168,25 @@ function buildBalanceIndicatorScript({ modelRoutes = [], readyWaitMs = INJECT_TI
     return {modelSlug:slug,providerId:matches[0].providerId,providerName:matches[0].providerName,reason:''};
   }
   function anchorNode() {
-    const candidates=[...document.querySelectorAll('button,[role="button"]')].filter(visible);
-    const find=(pattern)=>candidates.find((node)=>pattern.test(String(node.getAttribute('aria-label')||node.getAttribute('title')||'')));
-    return find(/settings|设置/i)||find(/profile menu|个人资料菜单/i)||null;
+    const rail=document.querySelector('[data-app-navigation-rail]');
+    const buttonSelector='button,[role="button"]';
+    const scope=rail?[rail,...rail.querySelectorAll(buttonSelector)]:[...document.querySelectorAll(buttonSelector)];
+    const find=(pattern)=>scope.find((node)=>pattern.test(String(node.getAttribute('aria-label')||node.getAttribute('title')||'')));
+    return find(/profile menu|个人资料菜单/i)||find(/settings|设置/i)||null;
   }
   function setFixed(node,left,top){node.style.position='fixed';node.style.left=Math.round(left)+'px';node.style.top=Math.round(top)+'px';}
   function clamp(value,min,max){return Math.max(min,Math.min(max,value));}
+  function viewportBounds(){const vp=globalThis.visualViewport;return {left:(vp?.offsetLeft||0)+8,right:(vp?.offsetLeft||0)+(vp?.width||innerWidth)-8,top:(vp?.offsetTop||0)+8,bottom:(vp?.offsetTop||0)+(vp?.height||innerHeight)-8};}
+  function loadPosition(){try{const raw=globalThis.localStorage?.getItem(POSITION_KEY);if(!raw)return null;const saved=JSON.parse(raw);const left=Number(saved?.left);const top=Number(saved?.top);return Number.isFinite(left)&&Number.isFinite(top)?{left,top}:null;}catch{return null;}}
+  function savePosition(left,top){try{globalThis.localStorage?.setItem(POSITION_KEY,JSON.stringify({left:Math.round(left),top:Math.round(top)}));}catch{}}
+  function clearPosition(){try{globalThis.localStorage?.removeItem(POSITION_KEY);}catch{}}
+  function defaultPosition(){const anchor=anchorNode();if(!anchor)return null;const rect=anchor.getBoundingClientRect();const bounds=viewportBounds();const width=44;return {left:clamp(rect.left+(rect.width-width)/2,bounds.left,Math.max(bounds.left,bounds.right-width)),top:clamp(rect.top-width-8,bounds.top,Math.max(bounds.top,bounds.bottom-width))};}
+  function positionRing(){const bounds=viewportBounds();const width=44;if(state.drag)return;if(state.position){const left=clamp(state.position.left,bounds.left,Math.max(bounds.left,bounds.right-width));const top=clamp(state.position.top,bounds.top,Math.max(bounds.top,bounds.bottom-width));setFixed(state.ring,left,top);state.position={left,top};return;}const fallback=defaultPosition();if(!fallback){state.ring.style.display='none';return;}setFixed(state.ring,fallback.left,fallback.top);}
   function updatePosition() {
     if(!state.ring||!state.root)return;
-    const anchor=anchorNode(); if(!anchor){state.ring.style.display='none';return;}
+    const anchor=anchorNode(); if(!anchor&&!state.position){state.ring.style.display='none';return;}
     state.ring.style.display='flex';
-    const rect=anchor.getBoundingClientRect(); const vp=globalThis.visualViewport;
-    const leftEdge=(vp?.offsetLeft||0)+8; const rightEdge=(vp?.offsetLeft||0)+(vp?.width||innerWidth)-8;
-    const width=44; const left=clamp(rect.left+(rect.width-width)/2,leftEdge,Math.max(leftEdge,rightEdge-width));
-    const top=clamp(rect.top-width-8,8,Math.max(8,(vp?.offsetTop||0)+(vp?.height||innerHeight)-width-8));
-    setFixed(state.ring,left,top);
+    positionRing();
     state.resizeObserver?.disconnect(); if(anchor&&state.resizeObserver)state.resizeObserver.observe(anchor);
     if(state.toast?.dataset.visible==='true')positionToast();
     if(state.details?.dataset.open==='true')positionDetails();
@@ -203,17 +232,23 @@ function buildBalanceIndicatorScript({ modelRoutes = [], readyWaitMs = INJECT_TI
     state.previousParts=parts;
     if(snapshot.currency&&/^[A-Z]{3}$/.test(snapshot.currency))state.value.setAttribute('aria-label',parts.text);
   }
+  function renderCurrencyAmount(value,currency,unit){return renderAmount({balance:value,currency,unit,ok:true});}
   function renderDetails(){
     if(!state.details)return; state.details.replaceChildren();
-    const snapshot=state.snapshot; const current=state.current||{};
-    const title=document.createElement('strong');title.textContent=current.providerName||'中转站余额';state.details.appendChild(title);
+    const current=state.current||{};
+    const live=state.snapshot&&state.snapshot.providerId===current.providerId?state.snapshot:null;
+    const cached=(!live||live.ok===false)?lastSnapshot(current.providerId):null;
+    const snapshot=cached||live;
+    const title=document.createElement('strong');title.textContent=current.providerName||snapshot?.providerName||'中转站余额';state.details.appendChild(title);
     const line=document.createElement('div');
     if(snapshot?.ok===false)line.textContent=snapshot.error||current.reason||'刷新失败';
     else if(snapshot?.unlimited)line.textContent='不限额';
     else if(snapshot?.balance!=null){line.textContent=makeDisplayParts(snapshot.balance,snapshot.currency,snapshot.unit).text;}
     else line.textContent=current.reason||'等待余额刷新';
     state.details.appendChild(line);
-    if(snapshot?.at){const time=document.createElement('div');time.textContent='更新于 '+new Date(snapshot.at).toLocaleTimeString();state.details.appendChild(time);}
+    if(cached){const stale=document.createElement('div');stale.textContent='显示上一次读取值';stale.style.marginTop='4px';state.details.appendChild(stale);}
+    if(cached&&live?.ok===false){const failure=document.createElement('div');failure.textContent='本次刷新失败：'+(live.error||'未知错误');failure.style.marginTop='4px';failure.style.color='#d92d20';state.details.appendChild(failure);}
+    if(snapshot?.at){const time=document.createElement('div');time.textContent=(cached?'上次读取于 ':'更新于 ')+new Date(snapshot.at).toLocaleTimeString();state.details.appendChild(time);}
     if(state.providerList.length){
       const list=document.createElement('div');list.setAttribute('aria-label','已配置提供商余额');list.style.marginTop='8px';
       for(const provider of state.providerList){
@@ -250,15 +285,57 @@ function buildBalanceIndicatorScript({ modelRoutes = [], readyWaitMs = INJECT_TI
     state.toast.textContent='-'+amount.text.replace(/^-/, '');state.toast.dataset.visible='true';positionToast();
     clearTimeout(state.toastTimer);state.toastTimer=setTimeout(()=>{state.toast.dataset.visible='false';setTimeout(()=>{if(state.toast?.dataset.visible==='false')state.toast.style.display='none';},200);},2000);
   }
+  function balanceCacheValue(value,providerId){
+    if(!value||typeof value!=='object'||value.ok===false)return null;
+    const id=String(providerId||value.providerId||'').trim();
+    const balance=value.balance==null?null:String(value.balance).trim();
+    const unlimited=value.unlimited===true;
+    if((balance==null||balance==='')&&!unlimited)return null;
+    const at=Number(value.at);
+    const providerName=String(value.providerName||'').trim().slice(0,100);
+    return {providerId:id,...(providerName?{providerName}:{}),...(value.adapter?{adapter:String(value.adapter)}:{}),...(balance?{balance}:{}),...(value.currency?{currency:String(value.currency)}:{}),...(value.unit?{unit:String(value.unit)}:{}),...(unlimited?{unlimited:true}:{}),...(Number.isFinite(at)?{at}:{})};
+  }
+  function restoreBalanceCache(){
+    try{
+      const parsed=JSON.parse(globalThis.localStorage?.getItem(CACHE_KEY)||'null');
+      const providers={};
+      const saved=parsed?.providers&&typeof parsed.providers==='object'?parsed.providers:{};
+      for(const [id,value] of Object.entries(saved)){const safe=balanceCacheValue(value,id);if(safe)providers[safe.providerId||id]=safe;}
+      return {providers,last:balanceCacheValue(parsed?.last)};
+    }catch{return {providers:{},last:null};}
+  }
+  function persistBalanceCache(){
+    try{
+      const providers={};
+      for(const [id,value] of Object.entries(state.providerSnapshots||{}).slice(-20)){const safe=balanceCacheValue(value,id);if(safe)providers[safe.providerId||id]=safe;}
+      globalThis.localStorage?.setItem(CACHE_KEY,JSON.stringify({providers,last:state.lastSnapshot||null}));
+    }catch{}
+  }
+  function rememberSnapshot(value){
+    const safe=balanceCacheValue(value,value?.providerId);
+    if(!safe)return null;
+    state.providerSnapshots={...(state.providerSnapshots||{}),[safe.providerId||'']:safe};
+    state.lastSnapshot=safe;
+    persistBalanceCache();
+    return safe;
+  }
+  function lastSnapshot(providerId){
+    const id=String(providerId||'').trim();
+    const cached=id?(state.providerSnapshots||{})[id]:state.lastSnapshot;
+    if(!cached)return null;
+    return {...cached,providerId:cached.providerId||id,ok:true,delta:null,deltaKind:'baseline',stale:true};
+  }
   function render(){
-    if(!state.ring?.isConnected)return;const current=state.current||{};const snapshot=state.snapshot;
-    const error=!current.providerId||snapshot?.ok===false;
-    state.ring.dataset.state=error?'error':snapshot?'ready':'loading';
+    if(!state.ring?.isConnected)return;const current=state.current||{};const live=state.snapshot&&state.snapshot.providerId===current.providerId?state.snapshot:null;
+    const cached=(!live||live.ok===false)?lastSnapshot(current.providerId):null;
+    const shown=cached||live;
+    const error=!shown||shown.ok===false;
+    state.ring.dataset.state=error?'error':shown?'ready':'loading';
+    state.ring.dataset.stale=String(Boolean(cached));
     state.value.setAttribute('aria-hidden','false');
-    state.ring.setAttribute('aria-label',error?(snapshot?.error||current.reason||'未关联余额提供商'):'中转站剩余 '+(snapshot?.balance??(snapshot?.unlimited?'不限额':'')));
-    if(!snapshot||snapshot.providerId!==current.providerId){renderAmount({status:current.providerId?'loading':'unmapped'});}
-    else if(snapshot.ok===false){renderAmount({status:'error'});}
-    else renderAmount(snapshot);
+    state.ring.setAttribute('aria-label',error?(live?.error||current.reason||'未关联余额提供商'):cached?'显示上一次读取的中转站余额 '+(shown?.balance??(shown?.unlimited?'不限额':'')):'中转站剩余 '+(shown?.balance??(shown?.unlimited?'不限额':'')));
+    if(!shown){renderAmount({status:current.providerId&&live?.ok===false?'error':current.providerId?'loading':'unmapped'});}
+    else renderAmount(shown);
     if(state.details?.dataset.open==='true')renderDetails();
     updatePosition();
   }
@@ -274,10 +351,12 @@ function buildBalanceIndicatorScript({ modelRoutes = [], readyWaitMs = INJECT_TI
     if(state.disposed||!snapshot||typeof snapshot!=='object')return false;
     syncContext();
     if(String(snapshot.currentProviderId||snapshot.providerId||'')!==String(state.current?.providerId||''))return false;
-    state.providerSnapshots=snapshot.providerSnapshots&&typeof snapshot.providerSnapshots==='object'?snapshot.providerSnapshots:{};
+    const incoming=snapshot.providerSnapshots&&typeof snapshot.providerSnapshots==='object'?snapshot.providerSnapshots:{};
+    const merged={};for(const [id,value] of Object.entries(incoming)){const safe=balanceCacheValue(value,id);if(safe)merged[safe.providerId||id]=safe;}
+    state.providerSnapshots={...(state.providerSnapshots||{}),...merged};
     state.providerStatuses=snapshot.providerStatuses&&typeof snapshot.providerStatuses==='object'?snapshot.providerStatuses:{};
     state.providerList=Array.isArray(snapshot.providerList)?snapshot.providerList:[];
-    if(String(snapshot.providerId||'')===String(state.current?.providerId||'')){state.snapshot={...snapshot};render();showToast(snapshot);}
+    if(String(snapshot.providerId||'')===String(state.current?.providerId||'')){state.snapshot={...snapshot};if(snapshot.ok!==false)rememberSnapshot({...snapshot,providerName:state.current?.providerName||snapshot.providerName});render();showToast(snapshot);}
     else if(state.details?.dataset.open==='true')renderDetails();
     return true;
   }
@@ -285,11 +364,28 @@ function buildBalanceIndicatorScript({ modelRoutes = [], readyWaitMs = INJECT_TI
     if(!document.getElementById(STYLE_ID)){const style=document.createElement('style');style.id=STYLE_ID;style.setAttribute(EXT_ATTR,'true');style.textContent=STYLE;document.head?.appendChild(style);}
     document.getElementById(ID+'-root')?.remove();
     const root=document.createElement('div');root.id=ID+'-root';root.setAttribute(EXT_ATTR,'true');state.root=root;
-    const ring=document.createElement('button');ring.id=ID;ring.type='button';ring.setAttribute(EXT_ATTR,'true');ring.setAttribute('aria-label','中转站余额');
+    const ring=document.createElement('button');ring.id=ID;ring.type='button';ring.setAttribute(EXT_ATTR,'true');ring.setAttribute('aria-label','中转站余额');ring.setAttribute('title','拖动调整位置，双击恢复默认位置');
     const value=document.createElement('span');value.id=ID+'-value';ring.appendChild(value);state.ring=ring;state.value=value;
     const toast=document.createElement('div');toast.id=ID+'-toast';toast.setAttribute(EXT_ATTR,'true');state.toast=toast;
     const details=document.createElement('section');details.id=ID+'-details';details.setAttribute(EXT_ATTR,'true');details.setAttribute('role','dialog');details.setAttribute('aria-label','中转站余额详情');state.details=details;
-    ring.addEventListener('click',(event)=>{event.stopPropagation();details.dataset.open=details.dataset.open==='true'?'false':'true';renderDetails();});
+    ring.addEventListener('click',(event)=>{event.stopPropagation();if(state.suppressClick){state.suppressClick=false;return;}details.dataset.open=details.dataset.open==='true'?'false':'true';renderDetails();});
+    ring.addEventListener('pointerdown',(event)=>{
+      if(event.button!==0)return;event.preventDefault();event.stopPropagation();
+      const rect=ring.getBoundingClientRect();
+      state.drag={pointerId:event.pointerId,offsetX:event.clientX-rect.left,offsetY:event.clientY-rect.top,moved:false};
+      ring.setPointerCapture?.(event.pointerId);ring.dataset.dragging='true';
+    });
+    const finishDrag=(event,commit)=>{
+      const drag=state.drag;if(!drag||event.pointerId!==drag.pointerId)return;
+      state.drag=null;ring.dataset.dragging='false';
+      if(commit&&drag.moved){const bounds=viewportBounds();const left=clamp(Number(ring.style.left.replace('px',''))||0,bounds.left,Math.max(bounds.left,bounds.right-44));const top=clamp(Number(ring.style.top.replace('px',''))||0,bounds.top,Math.max(bounds.top,bounds.bottom-44));state.position={left,top};savePosition(left,top);setFixed(ring,left,top);state.suppressClick=true;}
+      if(!drag.moved)state.suppressClick=false;
+    };
+    ring.addEventListener('pointermove',(event)=>{const drag=state.drag;if(!drag||event.pointerId!==drag.pointerId)return;const bounds=viewportBounds();const left=clamp(event.clientX-drag.offsetX,bounds.left,Math.max(bounds.left,bounds.right-44));const top=clamp(event.clientY-drag.offsetY,bounds.top,Math.max(bounds.top,bounds.bottom-44));if(Math.abs(left-Number(ring.style.left.replace('px',''))||0)>2||Math.abs(top-Number(ring.style.top.replace('px',''))||0)>2)drag.moved=true;setFixed(ring,left,top);if(state.toast?.dataset.visible==='true')positionToast();});
+    ring.addEventListener('pointerup',(event)=>finishDrag(event,true));
+    ring.addEventListener('pointercancel',(event)=>finishDrag(event,false));
+    ring.addEventListener('dblclick',(event)=>{event.preventDefault();event.stopPropagation();state.position=null;clearPosition();const fallback=defaultPosition();if(fallback)setFixed(ring,fallback.left,fallback.top);});
+    window.addEventListener('pointerdown',(event)=>{if(details.dataset.open!=='true'||state.drag)return;if(event.target===details||details.contains?.(event.target)||event.target===ring)return;details.dataset.open='false';});
     root.appendChild(ring);root.appendChild(toast);root.appendChild(details);document.body.appendChild(root);
     state.current=resolveCurrent();render();
     state.observer=new MutationObserver(()=>{syncContext();updatePosition();});state.observer.observe(document.body,{subtree:true,childList:true,attributes:true,characterData:true,attributeFilter:['aria-label','data-composer-navigation-target','style','class']});
