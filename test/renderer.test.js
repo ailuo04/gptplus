@@ -3361,7 +3361,8 @@ test('插件市场：展示三个内置插件并支持配置、启停与卸载�
     assert.match(voiceModal.allText(), /提供商音频转写/);
     assert.match(voiceModal.allText(), /转写模型/);
     assert.match(voiceModal.allText(), /识别语言/);
-    assert.match(voiceModal.allText(), /空格长按时长/);
+    assert.match(voiceModal.allText(), /长按触发时长/);
+    assert.match(voiceModal.allText(), /未选中文字处按住鼠标左键/);
     assert.match(voiceModal.allText(), /默认 1 秒/);
     const voiceSelects = findNodes(voiceModal, (n) => n.tagName === 'SELECT');
     assert.ok(voiceSelects.length >= 3, '语音配置应包含输入方式、提供商与语言选择');

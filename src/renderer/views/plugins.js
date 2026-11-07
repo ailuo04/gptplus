@@ -395,12 +395,12 @@ function openVoiceConfig(ctx, plugin) {
     ctx.el('span', { class: 'hint', text: '自动检测适合中英混说；指定语言通常更准。' }),
   ]);
   const spaceHoldField = ctx.el('label', { class: 'field' }, [
-    ctx.el('span', { class: 'label', text: '空格长按时长（秒）' }),
+    ctx.el('span', { class: 'label', text: '长按触发时长（秒）' }),
     spaceHoldInput,
-    ctx.el('span', { class: 'hint', text: '范围 0.3-5 秒，默认 1 秒。按住空格达到该时长后开始录音，松开自动转写。' }),
+    ctx.el('span', { class: 'hint', text: '范围 0.3-5 秒，默认 1 秒。输入框内按住空格，或在未选中文字处按住鼠标左键，达到该时长后开始录音；松开按键或鼠标自动转写。' }),
   ]);
   const providerFields = ctx.el('div', { class: 'plugin-config-options' }, [providerField, modelField]);
-  const localHint = ctx.el('span', { class: 'hint', text: '首次使用会自动下载约 231 MB 的 SenseVoice 模型；如果已安装 DeepSeek Harness，会直接复用它的模型缓存。录音和识别都在本机完成。输入框内长按空格即可开始录音，松开自动转写。' });
+  const localHint = ctx.el('span', { class: 'hint', text: '首次使用会自动下载约 231 MB 的 SenseVoice 模型；如果已安装 DeepSeek Harness，会直接复用它的模型缓存。录音和识别都在本机完成。输入框内长按空格，或在未选中文字处按住鼠标左键，达到设定时长后开始录音，松开后自动转写。' });
   const systemHint = ctx.el('span', { class: 'hint', text: '系统听写会调用 Win+H 并弹出 Windows 语音浮层，不建议日常使用。' });
   const syncDisabled = () => {
     const provider = engineSelect.value === 'provider';
@@ -427,7 +427,7 @@ function openVoiceConfig(ctx, plugin) {
         ctx.el('div', { class: 'modal-title', text: '配置语音输入' }),
       ]),
       ctx.el('div', { class: 'modal-body plugin-config-body' }, [
-        ctx.el('p', { class: 'setting-desc', text: '麦克风按钮会注入到 ChatGPT 输入框的模型选择器与发送键之间。默认使用本机 SenseVoice 离线识别；在输入框内长按空格可开始录音，默认 1 秒，松开自动转写。也可以改用提供商音频转写，或保留 Windows 系统听写。' }),
+        ctx.el('p', { class: 'setting-desc', text: '麦克风按钮会注入到 ChatGPT 输入框的模型选择器与发送键之间。默认使用本机 SenseVoice 离线识别；在输入框内长按空格，或在未选中文字处按住鼠标左键，达到设定时长后开始录音，默认 1 秒，松开后自动转写。也可以改用提供商音频转写，或保留 Windows 系统听写。' }),
         ctx.el('label', { class: 'field' }, [
           ctx.el('span', { class: 'label', text: '输入方式' }),
           engineSelect,
@@ -456,7 +456,7 @@ function openVoiceConfig(ctx, plugin) {
               }
               const spaceHoldSeconds = Number(spaceHoldInput.value);
               if (!Number.isFinite(spaceHoldSeconds) || spaceHoldSeconds < 0.3 || spaceHoldSeconds > 5) {
-                ctx.toast('空格长按时长需在 0.3-5 秒之间', 'warn');
+                ctx.toast('长按触发时长需在 0.3-5 秒之间', 'warn');
                 return;
               }
               const config = {

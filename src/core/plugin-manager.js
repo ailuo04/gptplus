@@ -103,7 +103,7 @@ const BUILTIN_PLUGIN_DEFINITIONS = Object.freeze([
     category: '效率',
     icon: 'mic',
     description: '在 ChatGPT 输入框的发送键旁加入麦克风按钮，把语音转成文字。',
-    detail: '默认在本机用 SenseVoice 离线识别，不弹出系统语音浮层；在输入框内长按空格 1 秒即可开始录音，松开自动转写，长按时长可调整。也可以改用支持 /audio/transcriptions 的 OpenAI 兼容提供商。',
+    detail: '默认在本机用 SenseVoice 离线识别，不弹出系统语音浮层；在输入框内长按空格或未选中文字处按住鼠标左键 1 秒即可开始录音，松开自动转写，长按时长可调整。也可以改用支持 /audio/transcriptions 的 OpenAI 兼容提供商。',
     builtIn: true,
     defaultInstalled: true,
     defaultEnabled: true,

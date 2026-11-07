@@ -50,7 +50,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
   var PANEL_ID = 'gptplus-voice-panel';
   var STYLE_ID = 'gptplus-voice-input-style';
   var EXT_ATTR = 'data-gptplus-voice-input';
-  var RUNTIME_KEY = 'gptplus-voice-input-v11';
+  var RUNTIME_KEY = 'gptplus-voice-input-v13';
   var MAX_RECORD_MS = 120000;
   var PTT_HOLD_MS = Math.min(5000, Math.max(300, Math.round((Number(spaceHoldMs) || 1000) / 100) * 100));
   var PTT_HOLD_LABEL = String(PTT_HOLD_MS / 1000).replace(/\.0$/, '');
@@ -92,6 +92,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     savedRange: null,
     savedSelection: null,
     spaceHold: null,
+    mouseHold: null,
     pttActive: false,
     lastSpace: null,
   };
@@ -112,8 +113,8 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     var zh = isZh();
     return {
       idle: zh
-        ? (ENGINE === 'local' ? '语音输入（本地识别，长按空格 ' + PTT_HOLD_LABEL + ' 秒）' : ENGINE === 'provider' ? '语音输入（提供商转写，长按空格 ' + PTT_HOLD_LABEL + ' 秒）' : '语音输入（Windows 系统听写）')
-        : (ENGINE === 'system' ? 'Voice input (Windows dictation)' : 'Voice input (hold Space for ' + PTT_HOLD_LABEL + 's)'),
+        ? (ENGINE === 'local' ? '语音输入（本地识别，长按空格或输入框鼠标左键 ' + PTT_HOLD_LABEL + ' 秒）' : ENGINE === 'provider' ? '语音输入（提供商转写，长按空格或输入框鼠标左键 ' + PTT_HOLD_LABEL + ' 秒）' : '语音输入（Windows 系统听写）')
+        : (ENGINE === 'system' ? 'Voice input (Windows dictation)' : 'Voice input (hold Space or left mouse in composer for ' + PTT_HOLD_LABEL + 's)'),
       requesting: zh ? '请允许使用麦克风…' : 'Allow microphone access…',
       preparing: zh ? '正在准备本地识别' : 'Preparing local speech',
       downloading: zh ? '正在下载识别模型' : 'Downloading speech model',
@@ -769,41 +770,141 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     return !!(selection && selection.rangeCount > 0 && selection.isCollapsed && editor.contains(selection.anchorNode));
   }
 
-  function trailingSpaceCount() {
-    var editor = editorNode();
-    if (!editor) return 0;
-    if (editor.tagName === 'TEXTAREA') {
-      var position = editor.selectionStart == null ? editor.value.length : editor.selectionStart;
-      var total = 0;
-      while (position - total > 0 && /[ \u00a0]/.test(editor.value.charAt(position - total - 1))) total += 1;
-      return total;
-    }
-    var selection = window.getSelection();
-    if (!selection || !selection.rangeCount) return 0;
-    var range = selection.getRangeAt(0);
-    var pre = range.cloneRange();
-    pre.selectNodeContents(editor);
-    pre.setEnd(range.startContainer, range.startOffset);
-    var before = pre.toString();
-    var count = 0;
-    for (var i = before.length - 1; i >= 0 && /[ \u00a0]/.test(before.charAt(i)); i -= 1) count += 1;
-    return count;
+  function pageHasFocus() {
+    return document.hidden !== true && typeof document.hasFocus === 'function' && document.hasFocus() === true;
   }
 
-  function removeTrailingSpaces(count) {
-    if (!count) return;
+  function captureSpaceSelection(hold) {
     var editor = editorNode();
-    if (!editor) return;
+    if (!editor || !hold.inEditor) return;
+    hold.editor = editor;
     if (editor.tagName === 'TEXTAREA') {
-      var position = editor.selectionStart == null ? editor.value.length : editor.selectionStart;
-      var from = Math.max(0, position - count);
-      editor.setRangeText('', from, position, 'end');
-      editor.dispatchEvent(new Event('input', { bubbles: true }));
+      hold.selection = {
+        start: editor.selectionStart == null ? editor.value.length : editor.selectionStart,
+        end: editor.selectionEnd == null ? editor.selectionStart : editor.selectionEnd,
+      };
       return;
     }
-    for (var i = 0; i < count; i += 1) {
-      try { document.execCommand('delete', false, null); } catch (e) { break; }
+    var selection = window.getSelection();
+    if (selection && selection.rangeCount > 0 && editor.contains(selection.anchorNode)) {
+      hold.range = selection.getRangeAt(0).cloneRange();
     }
+  }
+
+  function insertSpaceForHold(hold) {
+    if (!hold || !hold.inEditor || !pageHasFocus()) return false;
+    var editor = editorNode();
+    if (!editor || editor !== hold.editor || !composerFocused()) return false;
+    if (editor.tagName === 'TEXTAREA') {
+      var saved = hold.selection;
+      if (!saved) return false;
+      var start = Math.max(0, Math.min(editor.value.length, Number(saved.start)));
+      var end = Math.max(start, Math.min(editor.value.length, Number(saved.end)));
+      editor.setRangeText(' ', start, end, 'end');
+      editor.dispatchEvent(new Event('input', { bubbles: true }));
+      return true;
+    }
+    var selection = window.getSelection();
+    if (!selection || !hold.range || !editor.contains(hold.range.startContainer)) return false;
+    selection.removeAllRanges();
+    selection.addRange(hold.range);
+    var ok = false;
+    try { ok = document.execCommand('insertText', false, ' '); } catch (e) { ok = false; }
+    if (!ok) {
+      try {
+        var range = selection.getRangeAt(0);
+        range.deleteContents();
+        var node = document.createTextNode(' ');
+        range.insertNode(node);
+        range.setStartAfter(node);
+        range.collapse(true);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: ' ' }));
+      } catch (e) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function editorHasSelection(editor) {
+    if (!editor) return false;
+    if (editor.tagName === 'TEXTAREA') return editor.selectionStart !== editor.selectionEnd;
+    var selection = window.getSelection();
+    return !!(selection && selection.rangeCount > 0 && !selection.isCollapsed && editor.contains(selection.anchorNode));
+  }
+
+  function cancelMouseHold(hold) {
+    hold = hold || state.mouseHold;
+    if (!hold || state.mouseHold !== hold) return;
+    clearTimeout(hold.timer);
+    state.mouseHold = null;
+    if (state.wrap && !state.spaceHold) state.wrap.dataset.holding = 'false';
+  }
+
+  function activateMouseHold(hold) {
+    if (state.disposed || state.mouseHold !== hold || hold.active) return;
+    var editor = editorNode();
+    if (!pageHasFocus() || !editor || editor !== hold.editor || !composerFocused() || !editorSelectionCollapsed()) {
+      cancelMouseHold(hold);
+      return;
+    }
+    hold.active = true;
+    clearTimeout(hold.timer);
+    hold.timer = 0;
+    if (state.wrap) state.wrap.dataset.holding = 'false';
+    beginPushToTalk();
+  }
+
+  function onMouseDown(event) {
+    if (ENGINE === 'system' || event.button !== 0 || event.pointerType !== 'mouse') return;
+    if (event.ctrlKey || event.metaKey || event.altKey || !pageHasFocus()) return;
+    if (state.spaceHold || state.mouseHold || state.pttActive) return;
+    if (state.status !== 'idle' && state.status !== 'error' && state.status !== 'feedback') return;
+    var editor = editorNode();
+    if (!editor || (event.target !== editor && !editor.contains(event.target)) || editorHasSelection(editor)) return;
+    var hold = {
+      active: false,
+      editor: editor,
+      pointerId: event.pointerId,
+      startX: Number(event.clientX) || 0,
+      startY: Number(event.clientY) || 0,
+      timer: 0,
+    };
+    hold.timer = setTimeout(function () {
+      activateMouseHold(hold);
+    }, PTT_HOLD_MS);
+    state.mouseHold = hold;
+    if (state.wrap) state.wrap.dataset.holding = 'true';
+  }
+
+  function onMouseMove(event) {
+    var hold = state.mouseHold;
+    if (!hold || event.pointerId !== hold.pointerId || hold.active) return;
+    var dx = (Number(event.clientX) || 0) - hold.startX;
+    var dy = (Number(event.clientY) || 0) - hold.startY;
+    if (dx * dx + dy * dy > 36) cancelMouseHold(hold);
+  }
+
+  function onMouseUp(event) {
+    var hold = state.mouseHold;
+    if (!hold || event.pointerId !== hold.pointerId) return;
+    clearTimeout(hold.timer);
+    state.mouseHold = null;
+    if (state.wrap && !state.spaceHold) state.wrap.dataset.holding = 'false';
+    if (!hold.active) return;
+    event.preventDefault();
+    if (pageHasFocus()) endPushToTalk();
+    else cancelActive();
+  }
+
+  function onMouseCancel(event) {
+    var hold = state.mouseHold;
+    if (!hold || (event && event.pointerId != null && event.pointerId !== hold.pointerId)) return;
+    var wasActive = hold.active;
+    cancelMouseHold(hold);
+    if (wasActive) cancelActive();
   }
 
   function beginPushToTalk() {
@@ -848,14 +949,16 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
 
   function activateSpaceHold(hold) {
     if (state.disposed || state.spaceHold !== hold || hold.active) return;
+    if (!pageHasFocus()) {
+      state.spaceHold = null;
+      clearTimeout(hold.timer);
+      if (state.wrap) state.wrap.dataset.holding = 'false';
+      return;
+    }
     hold.active = true;
     clearTimeout(hold.timer);
     hold.timer = 0;
     if (state.wrap) state.wrap.dataset.holding = 'false';
-    if (hold.inEditor) {
-      var spaces = Math.min(trailingSpaceCount(), hold.count);
-      if (spaces > 0) removeTrailingSpaces(spaces);
-    }
     beginPushToTalk();
   }
 
@@ -866,7 +969,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
         at: Date.now(),
         repeat: event.repeat === true,
         composing: event.isComposing === true,
-        hasFocus: document.hasFocus() === true,
+        hasFocus: pageHasFocus(),
         activeElement: String(document.activeElement?.className || document.activeElement?.tagName || '').slice(0, 80),
         status: state.status,
       };
@@ -874,23 +977,23 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     if (event.key !== ' ' && event.code !== 'Space') return;
     if (event.isComposing === true) return;
     if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+    if (!pageHasFocus()) return;
+    if (state.mouseHold) return;
     if (state.spaceHold) {
-      if (state.spaceHold.active) {
+      var currentHold = state.spaceHold;
+      if (currentHold.inEditor || currentHold.active || Date.now() - currentHold.startedAt >= PTT_HOLD_MS) {
         event.preventDefault();
-        return;
-      }
-      state.spaceHold.count += 1;
-      if (Date.now() - state.spaceHold.startedAt >= PTT_HOLD_MS) {
-        event.preventDefault();
-        activateSpaceHold(state.spaceHold);
+        if (!currentHold.active && Date.now() - currentHold.startedAt >= PTT_HOLD_MS) activateSpaceHold(currentHold);
       }
       return;
     }
+    if (event.repeat === true) return;
     var inEditor = composerFocused();
     if (!inEditor && !pageSpaceAllowed()) return;
     if (inEditor && !editorSelectionCollapsed()) return;
     if (state.status !== 'idle' && state.status !== 'error' && state.status !== 'feedback') return;
-    var hold = { count: 1, active: false, timer: 0, startedAt: Date.now(), inEditor: inEditor };
+    var hold = { active: false, timer: 0, startedAt: Date.now(), inEditor: inEditor, selection: null, range: null };
+    captureSpaceSelection(hold);
     hold.timer = setTimeout(function () {
       activateSpaceHold(hold);
     }, PTT_HOLD_MS);
@@ -900,6 +1003,17 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
       state.lastSpace.inEditor = inEditor;
     }
     if (state.wrap) state.wrap.dataset.holding = 'true';
+    if (inEditor) event.preventDefault();
+  }
+
+  function finishSpaceBeforeOtherKey(event) {
+    var hold = state.spaceHold;
+    if (!hold || !hold.inEditor || hold.active || hold.committed) return;
+    clearTimeout(hold.timer);
+    hold.timer = 0;
+    hold.committed = true;
+    if (event.key === 'Escape' || event.isComposing === true || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+    insertSpaceForHold(hold);
   }
 
   function onSpaceUp(event) {
@@ -908,14 +1022,24 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     if (!hold) {
       if (state.pttActive) {
         event.preventDefault();
-        endPushToTalk();
+        if (pageHasFocus()) endPushToTalk();
+        else cancelActive();
       }
       return;
     }
     state.spaceHold = null;
     if (state.wrap) state.wrap.dataset.holding = 'false';
     clearTimeout(hold.timer);
-    if (!hold.active) return;
+    if (!pageHasFocus()) {
+      if (hold.active || state.pttActive) cancelActive();
+      return;
+    }
+    if (!hold.active) {
+      if (!hold.inEditor) return;
+      event.preventDefault();
+      if (!hold.committed) insertSpaceForHold(hold);
+      return;
+    }
     event.preventDefault();
     endPushToTalk();
   }
@@ -1155,6 +1279,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     });
     state.lastBridgeAt = Date.now();
     state.keydown = function (event) {
+      if (event.key !== ' ' && event.code !== 'Space') finishSpaceBeforeOtherKey(event);
       if (event.key === 'Escape' && state.status !== 'idle') {
         event.preventDefault();
         event.stopPropagation();
@@ -1173,16 +1298,32 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
         clearTimeout(state.spaceHold.timer);
         state.spaceHold = null;
       }
+      if (state.mouseHold) cancelMouseHold(state.mouseHold);
       if (state.pttActive) {
         state.pttActive = false;
         cancelActive();
       }
     };
     state.visibility = function () {
-      if (document.hidden && (state.status === 'recording' || state.status === 'requesting')) cancelActive();
+      if (!document.hidden) return;
+      if (state.spaceHold) {
+        clearTimeout(state.spaceHold.timer);
+        state.spaceHold = null;
+      }
+      if (state.mouseHold) cancelMouseHold(state.mouseHold);
+      if (state.pttActive || state.status === 'recording' || state.status === 'requesting' || state.status === 'preparing' || state.status === 'downloading' || state.status === 'loading') cancelActive();
+      if (state.wrap) state.wrap.dataset.holding = 'false';
     };
+    state.pointerdown = onMouseDown;
+    state.pointermove = onMouseMove;
+    state.pointerup = onMouseUp;
+    state.pointercancel = onMouseCancel;
     document.addEventListener('keydown', state.keydown, true);
     document.addEventListener('keyup', state.keyup, true);
+    document.addEventListener('pointerdown', state.pointerdown, true);
+    document.addEventListener('pointermove', state.pointermove, true);
+    document.addEventListener('pointerup', state.pointerup, true);
+    document.addEventListener('pointercancel', state.pointercancel, true);
     document.addEventListener('visibilitychange', state.visibility);
     window.addEventListener('blur', state.blur, true);
     sync();
@@ -1278,10 +1419,15 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
         clearTimeout(state.spaceHold.timer);
         state.spaceHold = null;
       }
+      if (state.mouseHold) cancelMouseHold(state.mouseHold);
       state.pttActive = false;
       if (state.wrap) state.wrap.dataset.holding = 'false';
       if (state.keydown) document.removeEventListener('keydown', state.keydown, true);
       if (state.keyup) document.removeEventListener('keyup', state.keyup, true);
+      if (state.pointerdown) document.removeEventListener('pointerdown', state.pointerdown, true);
+      if (state.pointermove) document.removeEventListener('pointermove', state.pointermove, true);
+      if (state.pointerup) document.removeEventListener('pointerup', state.pointerup, true);
+      if (state.pointercancel) document.removeEventListener('pointercancel', state.pointercancel, true);
       if (state.visibility) document.removeEventListener('visibilitychange', state.visibility);
       if (state.blur) window.removeEventListener('blur', state.blur, true);
       state.wrap?.remove();
