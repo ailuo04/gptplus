@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { buildBalanceIndicatorScript, createDigitAnimationPlan, formatBalanceAmount, resumeChatGptBalance, startChatGptBalanceBridge, disposeChatGptBalance } = require('../src/core/chatgpt-balance.js');
+const { buildBalanceIndicatorScript, createDigitAnimationPlan, formatBalanceAmount, computeBalanceRingProgress, resumeChatGptBalance, startChatGptBalanceBridge, disposeChatGptBalance } = require('../src/core/chatgpt-balance.js');
 
 test('balance formatter keeps compact readable amounts with at most two decimals', () => {
   assert.equal(formatBalanceAmount('1234.005', 'USD', 'USD', 'en-US').text, '$1,234.01');
@@ -28,6 +28,23 @@ test('balance digit animation only rolls changed positions', () => {
   assert.equal(unchanged.changedCount, 0);
 });
 
+test('balance ring progress follows the remaining share and uses exact threshold boundaries', () => {
+  assert.deepEqual(computeBalanceRingProgress({ balance: '80', totalUsed: '20', unit: 'USD', totalUsedUnit: 'USD' }), { percent: '80', level: 'normal' });
+  assert.deepEqual(computeBalanceRingProgress({ balance: '20', totalUsed: '80', unit: 'USD', totalUsedUnit: 'USD' }), { percent: '20', level: 'normal' });
+  assert.deepEqual(computeBalanceRingProgress({ balance: '19.99', totalUsed: '80.01', unit: 'USD', totalUsedUnit: 'USD' }), { percent: '19.99', level: 'warning' });
+  assert.deepEqual(computeBalanceRingProgress({ balance: '5', totalUsed: '95', unit: 'USD', totalUsedUnit: 'USD' }), { percent: '5', level: 'warning' });
+  assert.deepEqual(computeBalanceRingProgress({ balance: '4.99', totalUsed: '95.01', unit: 'USD', totalUsedUnit: 'USD' }), { percent: '4.99', level: 'danger' });
+  assert.deepEqual(computeBalanceRingProgress({ balance: '0', totalUsed: '100', unit: 'USD', totalUsedUnit: 'USD' }), { percent: '0', level: 'danger' });
+  assert.deepEqual(computeBalanceRingProgress({ balance: '8', totalUsed: null, unit: 'USD', totalUsedUnit: 'USD' }), { percent: null, level: 'normal' });
+  assert.deepEqual(computeBalanceRingProgress({ balance: '8', totalUsed: '2', unit: 'USD', totalUsedUnit: 'CNY' }), { percent: null, level: 'normal' });
+  assert.deepEqual(computeBalanceRingProgress({ unlimited: true }), { percent: '100', level: 'normal' });
+});
+
+test('balance ring progress caps overfull quotas instead of drawing past a full circle', () => {
+  assert.deepEqual(computeBalanceRingProgress({ balance: '20', totalUsed: '0', unit: 'USD', totalUsedUnit: 'USD' }), { percent: '100', level: 'normal' });
+  assert.deepEqual(computeBalanceRingProgress({ balance: '8', totalUsed: null, unit: 'USD', totalUsedUnit: 'USD' }), { percent: null, level: 'normal' });
+});
+
 test('balance indicator script reads exact model prop and fails closed on unknown slug', async () => {
   const script = buildBalanceIndicatorScript({
     modelRoutes: [{ slug: 'fapi__model-a', providerId: 'p_a' }],
@@ -37,7 +54,13 @@ test('balance indicator script reads exact model prop and fails closed on unknow
   assert.match(script, /data-composer-navigation-target/);
   assert.match(script, /__gptplusBalance/);
   assert.match(script, /visualViewport/);
-  assert.match(script, /#gptplus-balance-indicator\{[^}]*border:4px solid[^}]*background:transparent/, 'indicator should be a hollow outline ring, not a filled circle');
+  assert.match(script, /#gptplus-balance-indicator\{[^}]*background:transparent/, 'indicator should be a hollow outline ring, not a filled circle');
+  assert.match(script, /conic-gradient/, 'indicator should render a progress ring');
+  assert.match(script, /background:conic-gradient\(from -90deg,var\(--gpb-ring-color\) 0% var\(--gpb-progress\)/, 'the remaining percentage must map directly to arc length');
+  assert.doesNotMatch(script, /--gpb-turn/, 'a percentage progress value must not be multiplied into degrees incorrectly');
+  assert.match(script, /--gpb-ring-color/, 'ring color should be driven by a shared threshold variable');
+  assert.match(script, /pointerenter/, 'details should be hover-triggered rather than click-triggered');
+  assert.match(script, /touch-action:none/, 'dragging must not be intercepted by touch scrolling');
   assert.doesNotMatch(script, /apiKey|Authorization|sk-[A-Za-z0-9]/);
 });
 
@@ -398,6 +421,305 @@ test('balance page runtime maps only exact slugs, rejects stale provider pushes,
   assert.equal(nodes.some((node) => node.id === 'gptplus-balance-indicator-root' && node.isConnected), false);
 });
 
+test('balance ring paints progress, threshold colors, and hover details with the requested fields', async () => {
+  const vm = require('node:vm');
+  const nodes = [];
+  const listeners = new Map();
+  class Node {
+    constructor(tag) {
+      this.tagName = tag.toUpperCase(); this.children = []; this.attributes = {}; this.style = { setProperty(name, value) { this[name] = value; } };
+      this.dataset = {}; this.listeners = {}; this.isConnected = true; this.className = ''; this.id = ''; this.textContent = ''; this.parentElement = null;
+    }
+    setAttribute(name, value) { this.attributes[name] = String(value); }
+    getAttribute(name) { return this.attributes[name] || null; }
+    removeAttribute(name) { delete this.attributes[name]; }
+    appendChild(child) { child.parentElement = this; this.children.push(child); return child; }
+    replaceChildren(...children) { this.children = []; for (const child of children) this.appendChild(child); }
+    addEventListener(name, callback) { this.listeners[name] = callback; }
+    removeEventListener() {}
+    remove() { this.isConnected = false; this.parentElement?.children?.splice(this.parentElement.children.indexOf(this), 1); }
+    querySelectorAll() { return this.children; }
+    getClientRects() { return this.isConnected ? [{}] : []; }
+    getBoundingClientRect() { return this.rect || { left: 12, top: 870, right: 48, bottom: 906, width: 36, height: 36 }; }
+    setPointerCapture() {}
+    contains(node) { return node === this; }
+  }
+  const profile = new Node('button'); profile.setAttribute('aria-label', '打开个人资料菜单');
+  const rail = new Node('nav'); rail.setAttribute('data-app-navigation-rail', 'true'); rail.appendChild(profile);
+  const modelLabel = new Node('span'); modelLabel.className = 'ModelPickerTriggerModelText-test'; modelLabel.__reactFiber$test = { memoizedProps: { model: 'fapi__model-a' }, return: null };
+  const composer = new Node('div'); composer.appendChild(modelLabel); composer.querySelectorAll = () => []; composer.closest = () => composer;
+  const head = new Node('head'); const body = new Node('body'); body.appendChild(rail); body.appendChild(composer);
+  const doc = { documentElement: { lang: 'en' }, body, head, hidden: false, createElement: (tag) => { const node = new Node(tag); nodes.push(node); return node; }, getElementById: (id) => nodes.find((node) => node.id === id && node.isConnected) || null, querySelector: (selector) => selector.includes('data-app-navigation-rail') ? rail : null, querySelectorAll: (selector) => selector.includes('ModelPickerTriggerModelText') ? [modelLabel] : selector.includes('data-composer-navigation-target') ? [composer] : selector.includes('button') ? [profile] : [] };
+  const sandbox = { document: doc, window: { addEventListener(name, callback) { listeners.set(name, callback); }, removeEventListener(name) { listeners.delete(name); } }, navigator: { language: 'en-US' }, visualViewport: { offsetLeft: 0, width: 1377, height: 943, addEventListener() {}, removeEventListener() {} }, innerWidth: 1377, innerHeight: 943, getComputedStyle: () => ({ display: 'block', visibility: 'visible' }), MutationObserver: class { observe() {} disconnect() {} }, ResizeObserver: class { observe() {} disconnect() {} }, setTimeout: () => 1, clearTimeout() {}, setInterval: () => 2, clearInterval() {}, Date, Intl, matchMedia: () => ({ matches: false }), Math, Map, Set, JSON, String, Number, BigInt, Object, Array };
+  const script = buildBalanceIndicatorScript({ modelRoutes: [{ slug: 'fapi__model-a', providerId: 'p_a' }] });
+  await vm.runInNewContext(script, sandbox);
+  const ring = nodes.find((node) => node.id === 'gptplus-balance-indicator');
+  const details = nodes.find((node) => node.id === 'gptplus-balance-indicator-details');
+  sandbox.__gptplusBalance.apply({ providerId: 'p_a', currentProviderId: 'p_a', balance: '20', totalUsed: '80', currency: 'USD', unit: 'USD', totalUsedUnit: 'USD', at: 1000, ok: true, providerSnapshots: { p_a: { providerId: 'p_a', providerName: 'Alpha Relay', balance: '20', totalUsed: '80', currency: 'USD', unit: 'USD', totalUsedUnit: 'USD', at: 1000 } }, providerList: [{ providerId: 'p_a', name: 'Alpha Relay' }] });
+  assert.equal(ring.dataset.level, 'normal');
+  assert.equal(ring.style['--gpb-progress'], '20%');
+  sandbox.__gptplusBalance.apply({ providerId: 'p_a', currentProviderId: 'p_a', balance: '19', totalUsed: '81', currency: 'USD', unit: 'USD', totalUsedUnit: 'USD', at: 1000, ok: true });
+  assert.equal(ring.dataset.level, 'warning');
+  assert.equal(ring.style['--gpb-progress'], '19%');
+  sandbox.__gptplusBalance.apply({ providerId: 'p_a', currentProviderId: 'p_a', balance: '4', totalUsed: '96', currency: 'USD', unit: 'USD', totalUsedUnit: 'USD', delta: '0.12', deltaKind: 'cumulative', at: 1000, ok: true });
+  assert.equal(ring.dataset.level, 'danger');
+  assert.equal(ring.style['--gpb-progress'], '4%');
+  assert.equal(details.dataset.open, 'false');
+  ring.listeners.pointerenter({ preventDefault() {}, stopPropagation() {} });
+  assert.equal(details.dataset.open, 'true');
+  assert.match(details.children.map((node) => node.textContent).join(' '), /Alpha Relay|p_a/);
+  const detailText = (node) => (node.textContent || '') + ' ' + (node.children || []).map(detailText).join(' ');
+  assert.match(details.children.map(detailText).join(' '), /余额/);
+  assert.match(details.children.map(detailText).join(' '), /消耗值/);
+  assert.match(details.children.map(detailText).join(' '), /最近一次消耗量/);
+  ring.listeners.pointerleave({ preventDefault() {}, stopPropagation() {} });
+  assert.equal(details.dataset.open, 'false');
+});
+
+test('balance toast stays inside every viewport edge while dragging', async () => {
+  const vm = require('node:vm');
+  const nodes = [];
+  class Node {
+    constructor(tag) { this.tagName = tag.toUpperCase(); this.children = []; this.attributes = {}; this.style = {}; this.dataset = {}; this.listeners = {}; this.isConnected = true; this.className = ''; this.id = ''; this.textContent = ''; this.parentElement = null; }
+    setAttribute(name, value) { this.attributes[name] = String(value); }
+    getAttribute(name) { return this.attributes[name] || null; }
+    removeAttribute(name) { delete this.attributes[name]; }
+    appendChild(child) { child.parentElement = this; this.children.push(child); return child; }
+    replaceChildren(...children) { this.children = []; for (const child of children) this.appendChild(child); }
+    addEventListener(name, callback) { this.listeners[name] = callback; }
+    removeEventListener() {}
+    remove() { this.isConnected = false; }
+    querySelectorAll() { return this.children; }
+    getClientRects() { return this.isConnected ? [{}] : []; }
+    getBoundingClientRect() {
+      if (this.id === 'gptplus-balance-indicator-toast') return { left: 100, top: 100, right: 100 + (this.textContent.length * 7), bottom: 120, width: this.textContent.length * 7, height: 20 };
+      return this.rect || { left: 8, top: 898, right: 44, bottom: 934, width: 36, height: 36 };
+    }
+    setPointerCapture() {}
+    contains(node) { return node === this; }
+  }
+  const profile = new Node('button'); profile.setAttribute('aria-label', '打开个人资料菜单');
+  const rail = new Node('nav'); rail.setAttribute('data-app-navigation-rail', 'true'); rail.appendChild(profile);
+  const modelLabel = new Node('span'); modelLabel.className = 'ModelPickerTriggerModelText-test'; modelLabel.__reactFiber$test = { memoizedProps: { model: 'fapi__model-a' }, return: null };
+  const composer = new Node('div'); composer.appendChild(modelLabel); composer.querySelectorAll = () => []; composer.closest = () => composer;
+  const head = new Node('head'); const body = new Node('body'); body.appendChild(rail); body.appendChild(composer);
+  const doc = { documentElement: { lang: 'en' }, body, head, hidden: false, createElement: (tag) => { const node = new Node(tag); nodes.push(node); return node; }, getElementById: (id) => nodes.find((node) => node.id === id && node.isConnected) || null, querySelector: (selector) => selector.includes('data-app-navigation-rail') ? rail : null, querySelectorAll: (selector) => selector.includes('ModelPickerTriggerModelText') ? [modelLabel] : selector.includes('data-composer-navigation-target') ? [composer] : selector.includes('button') ? [profile] : [] };
+  const sandbox = { document: doc, window: { addEventListener() {}, removeEventListener() {} }, navigator: { language: 'en-US' }, visualViewport: { offsetLeft: 0, width: 320, height: 240, addEventListener() {}, removeEventListener() {} }, innerWidth: 320, innerHeight: 240, getComputedStyle: () => ({ display: 'block', visibility: 'visible' }), MutationObserver: class { observe() {} disconnect() {} }, ResizeObserver: class { observe() {} disconnect() {} }, setTimeout: () => 1, clearTimeout() {}, setInterval: () => 2, clearInterval() {}, Date, Intl, matchMedia: () => ({ matches: false }), Math, Map, Set, JSON, String, Number, BigInt, Object, Array };
+  await vm.runInNewContext(buildBalanceIndicatorScript({ modelRoutes: [{ slug: 'fapi__model-a', providerId: 'p_a' }] }), sandbox);
+  const ring = nodes.find((node) => node.id === 'gptplus-balance-indicator');
+  const toast = nodes.find((node) => node.id === 'gptplus-balance-indicator-toast');
+  sandbox.__gptplusBalance.apply({ providerId: 'p_a', currentProviderId: 'p_a', balance: '99', totalUsed: '1', currency: 'USD', unit: 'USD', totalUsedUnit: 'USD', delta: '12345678901234567890.1234', deltaKind: 'cumulative', at: 1000, ok: true });
+  ring.rect = { left: 8, top: 898, right: 44, bottom: 934, width: 36, height: 36 };
+  ring.listeners.pointerdown({ button: 0, pointerId: 3, clientX: 20, clientY: 910, preventDefault() {}, stopPropagation() {} });
+  ring.listeners.pointermove({ pointerId: 3, clientX: 0, clientY: 0, preventDefault() {} });
+  ring.rect = { left: 8, top: 8, right: 44, bottom: 44, width: 36, height: 36 };
+  ring.listeners.pointerup({ pointerId: 3, clientX: 0, clientY: 0, preventDefault() {} });
+  const left = Number(String(toast.style.left).replace('px', ''));
+  const top = Number(String(toast.style.top).replace('px', ''));
+  const width = toast.textContent.length * 7;
+  assert.ok(left >= 8, 'toast must keep its left edge inside viewport');
+  assert.ok(left + width <= 312, 'toast must keep its right edge inside viewport');
+  assert.ok(top >= 8, 'toast must not be clipped at the top edge');
+  assert.ok(top + 20 <= 232, 'toast must not be clipped at the bottom edge');
+});
+
+test('balance toast is shown once per successful snapshot and ignores cache replays', async () => {
+  const vm = require('node:vm');
+  const nodes = [];
+  class Node {
+    constructor(tag) { this.tagName = tag.toUpperCase(); this.children = []; this.attributes = {}; this.style = {}; this.dataset = {}; this.listeners = {}; this.isConnected = true; this.className = ''; this.id = ''; this.textContent = ''; this.parentElement = null; }
+    setAttribute(name, value) { this.attributes[name] = String(value); }
+    getAttribute(name) { return this.attributes[name] || null; }
+    removeAttribute(name) { delete this.attributes[name]; }
+    appendChild(child) { child.parentElement = this; this.children.push(child); return child; }
+    replaceChildren(...children) { this.children = []; for (const child of children) this.appendChild(child); }
+    addEventListener(name, callback) { this.listeners[name] = callback; }
+    removeEventListener() {}
+    remove() { this.isConnected = false; }
+    querySelectorAll() { return this.children; }
+    getClientRects() { return this.isConnected ? [{}] : []; }
+    getBoundingClientRect() { return this.rect || { left: 8, top: 898, right: 44, bottom: 934, width: 36, height: 36 }; }
+    setPointerCapture() {}
+    contains(node) { return node === this; }
+  }
+  const profile = new Node('button'); profile.setAttribute('aria-label', '打开个人资料菜单');
+  const rail = new Node('nav'); rail.setAttribute('data-app-navigation-rail', 'true'); rail.appendChild(profile);
+  const modelLabel = new Node('span'); modelLabel.className = 'ModelPickerTriggerModelText-test'; modelLabel.__reactFiber$test = { memoizedProps: { model: 'fapi__model-a' }, return: null };
+  const composer = new Node('div'); composer.appendChild(modelLabel); composer.querySelectorAll = () => []; composer.closest = () => composer;
+  const head = new Node('head'); const body = new Node('body'); body.appendChild(rail); body.appendChild(composer);
+  const doc = { documentElement: { lang: 'en' }, body, head, hidden: false, createElement: (tag) => { const node = new Node(tag); nodes.push(node); return node; }, getElementById: (id) => nodes.find((node) => node.id === id && node.isConnected) || null, querySelector: (selector) => selector.includes('data-app-navigation-rail') ? rail : null, querySelectorAll: (selector) => selector.includes('ModelPickerTriggerModelText') ? [modelLabel] : selector.includes('data-composer-navigation-target') ? [composer] : selector.includes('button') ? [profile] : [] };
+  const sandbox = { document: doc, window: { addEventListener() {}, removeEventListener() {} }, navigator: { language: 'en-US' }, visualViewport: { offsetLeft: 0, width: 1377, height: 943, addEventListener() {}, removeEventListener() {} }, innerWidth: 1377, innerHeight: 943, getComputedStyle: () => ({ display: 'block', visibility: 'visible' }), MutationObserver: class { observe() {} disconnect() {} }, ResizeObserver: class { observe() {} disconnect() {} }, setTimeout: () => 1, clearTimeout() {}, setInterval: () => 2, clearInterval() {}, Date, Intl, matchMedia: () => ({ matches: false }), Math, Map, Set, JSON, String, Number, BigInt, Object, Array };
+  await vm.runInNewContext(buildBalanceIndicatorScript({ modelRoutes: [{ slug: 'fapi__model-a', providerId: 'p_a' }] }), sandbox);
+  const toast = nodes.find((node) => node.id === 'gptplus-balance-indicator-toast');
+  const snapshot = { providerId: 'p_a', currentProviderId: 'p_a', balance: '9', totalUsed: '1', currency: 'USD', unit: 'USD', totalUsedUnit: 'USD', delta: '0.02', deltaKind: 'cumulative', at: 1000, ok: true };
+  sandbox.__gptplusBalance.apply({ ...snapshot, at: 1000 });
+  assert.equal(toast.dataset.visible, 'true');
+  toast.dataset.visible = 'false';
+  sandbox.__gptplusBalance.apply({ ...snapshot, at: 1000 });
+  assert.equal(toast.dataset.visible, 'false', 'a cached snapshot must not trigger the same consumption toast again');
+  sandbox.__gptplusBalance.apply({ ...snapshot, at: 2000, delta: '0.03' });
+  assert.equal(toast.dataset.visible, 'true', 'a newer successful read should show its own consumption amount');
+  assert.match(toast.textContent, /0\.03/);
+});
+
+test('balance consumption toast keeps a non-zero tiny amount visible', async () => {
+  const vm = require('node:vm');
+  const nodes = [];
+  class Node {
+    constructor(tag) { this.tagName = tag.toUpperCase(); this.children = []; this.attributes = {}; this.style = {}; this.dataset = {}; this.listeners = {}; this.isConnected = true; this.className = ''; this.id = ''; this.textContent = ''; this.parentElement = null; }
+    setAttribute(name, value) { this.attributes[name] = String(value); }
+    getAttribute(name) { return this.attributes[name] || null; }
+    removeAttribute(name) { delete this.attributes[name]; }
+    appendChild(child) { child.parentElement = this; this.children.push(child); return child; }
+    replaceChildren(...children) { this.children = []; for (const child of children) this.appendChild(child); }
+    addEventListener(name, callback) { this.listeners[name] = callback; }
+    removeEventListener() {}
+    remove() { this.isConnected = false; }
+    querySelectorAll() { return this.children; }
+    getClientRects() { return this.isConnected ? [{}] : []; }
+    getBoundingClientRect() { return this.rect || { left: 8, top: 898, right: 44, bottom: 934, width: 36, height: 36 }; }
+    setPointerCapture() {}
+    contains(node) { return node === this; }
+  }
+  const profile = new Node('button'); profile.setAttribute('aria-label', '打开个人资料菜单');
+  const rail = new Node('nav'); rail.setAttribute('data-app-navigation-rail', 'true'); rail.appendChild(profile);
+  const modelLabel = new Node('span'); modelLabel.className = 'ModelPickerTriggerModelText-test'; modelLabel.__reactFiber$test = { memoizedProps: { model: 'fapi__model-a' }, return: null };
+  const composer = new Node('div'); composer.appendChild(modelLabel); composer.querySelectorAll = () => []; composer.closest = () => composer;
+  const head = new Node('head'); const body = new Node('body'); body.appendChild(rail); body.appendChild(composer);
+  const doc = { documentElement: { lang: 'en' }, body, head, hidden: false, createElement: (tag) => { const node = new Node(tag); nodes.push(node); return node; }, getElementById: (id) => nodes.find((node) => node.id === id && node.isConnected) || null, querySelector: (selector) => selector.includes('data-app-navigation-rail') ? rail : null, querySelectorAll: (selector) => selector.includes('ModelPickerTriggerModelText') ? [modelLabel] : selector.includes('data-composer-navigation-target') ? [composer] : selector.includes('button') ? [profile] : [] };
+  const sandbox = { document: doc, window: { addEventListener() {}, removeEventListener() {} }, navigator: { language: 'en-US' }, visualViewport: { offsetLeft: 0, width: 1377, height: 943, addEventListener() {}, removeEventListener() {} }, innerWidth: 1377, innerHeight: 943, getComputedStyle: () => ({ display: 'block', visibility: 'visible' }), MutationObserver: class { observe() {} disconnect() {} }, ResizeObserver: class { observe() {} disconnect() {} }, setTimeout: () => 1, clearTimeout() {}, setInterval: () => 2, clearInterval() {}, Date, Intl, matchMedia: () => ({ matches: false }), Math, Map, Set, JSON, String, Number, BigInt, Object, Array };
+  await vm.runInNewContext(buildBalanceIndicatorScript({ modelRoutes: [{ slug: 'fapi__model-a', providerId: 'p_a' }] }), sandbox);
+  const toast = nodes.find((node) => node.id === 'gptplus-balance-indicator-toast');
+  sandbox.__gptplusBalance.apply({ providerId: 'p_a', currentProviderId: 'p_a', balance: '9', totalUsed: '1.0000001', currency: 'USD', unit: 'USD', totalUsedUnit: 'USD', delta: '0.0000001', deltaKind: 'cumulative', at: 1000, ok: true });
+  assert.equal(toast.dataset.visible, 'true');
+  assert.match(toast.textContent, /^-\<\$0\.01$/);
+});
+
+test('balance details flip beside the ring and stay inside a narrow viewport', async () => {
+  const vm = require('node:vm');
+  const nodes = [];
+  class Node {
+    constructor(tag) { this.tagName = tag.toUpperCase(); this.children = []; this.attributes = {}; this.style = {}; this.dataset = {}; this.listeners = {}; this.isConnected = true; this.className = ''; this.id = ''; this.textContent = ''; this.parentElement = null; }
+    setAttribute(name, value) { this.attributes[name] = String(value); }
+    getAttribute(name) { return this.attributes[name] || null; }
+    removeAttribute(name) { delete this.attributes[name]; }
+    appendChild(child) { child.parentElement = this; this.children.push(child); return child; }
+    replaceChildren(...children) { this.children = []; for (const child of children) this.appendChild(child); }
+    addEventListener(name, callback) { this.listeners[name] = callback; }
+    removeEventListener() {}
+    remove() { this.isConnected = false; }
+    querySelectorAll() { return this.children; }
+    getClientRects() { return this.isConnected ? [{}] : []; }
+    getBoundingClientRect() {
+      if (this.id === 'gptplus-balance-indicator-details') return { left: 100, top: 100, right: 340, bottom: 240, width: 240, height: 140 };
+      return this.rect || { left: 8, top: 898, right: 44, bottom: 934, width: 36, height: 36 };
+    }
+    setPointerCapture() {}
+    contains(node) { return node === this; }
+  }
+  const profile = new Node('button'); profile.setAttribute('aria-label', '打开个人资料菜单');
+  const rail = new Node('nav'); rail.setAttribute('data-app-navigation-rail', 'true'); rail.appendChild(profile);
+  const modelLabel = new Node('span'); modelLabel.className = 'ModelPickerTriggerModelText-test'; modelLabel.__reactFiber$test = { memoizedProps: { model: 'fapi__model-a' }, return: null };
+  const composer = new Node('div'); composer.appendChild(modelLabel); composer.querySelectorAll = () => []; composer.closest = () => composer;
+  const head = new Node('head'); const body = new Node('body'); body.appendChild(rail); body.appendChild(composer);
+  const doc = { documentElement: { lang: 'en' }, body, head, hidden: false, createElement: (tag) => { const node = new Node(tag); nodes.push(node); return node; }, getElementById: (id) => nodes.find((node) => node.id === id && node.isConnected) || null, querySelector: (selector) => selector.includes('data-app-navigation-rail') ? rail : null, querySelectorAll: (selector) => selector.includes('ModelPickerTriggerModelText') ? [modelLabel] : selector.includes('data-composer-navigation-target') ? [composer] : selector.includes('button') ? [profile] : [] };
+  const sandbox = { document: doc, window: { addEventListener() {}, removeEventListener() {} }, navigator: { language: 'en-US' }, visualViewport: { offsetLeft: 0, width: 320, height: 240, addEventListener() {}, removeEventListener() {} }, innerWidth: 320, innerHeight: 240, getComputedStyle: () => ({ display: 'block', visibility: 'visible' }), MutationObserver: class { observe() {} disconnect() {} }, ResizeObserver: class { observe() {} disconnect() {} }, setTimeout: () => 1, clearTimeout() {}, setInterval: () => 2, clearInterval() {}, Date, Intl, matchMedia: () => ({ matches: false }), Math, Map, Set, JSON, String, Number, BigInt, Object, Array };
+  await vm.runInNewContext(buildBalanceIndicatorScript({ modelRoutes: [{ slug: 'fapi__model-a', providerId: 'p_a' }] }), sandbox);
+  const ring = nodes.find((node) => node.id === 'gptplus-balance-indicator');
+  const details = nodes.find((node) => node.id === 'gptplus-balance-indicator-details');
+  ring.rect = { left: 8, top: 190, right: 52, bottom: 234, width: 44, height: 44 };
+  ring.listeners.pointerenter({ preventDefault() {}, stopPropagation() {} });
+  assert.equal(details.dataset.open, 'true');
+  const left = Number(String(details.style.left).replace('px', ''));
+  assert.ok(left >= 8, 'details must stay to the right of the viewport edge');
+  assert.ok(left + 240 <= 312, 'details must stay inside the viewport after flipping');
+  const top = Number(String(details.style.top).replace('px', ''));
+  assert.ok(top >= 8, 'details must stay below the top edge');
+  assert.ok(top + 140 <= 232, 'details must stay above the bottom edge');
+});
+
+test('balance hover details remain open while moving from the ring into the popup', async () => {
+  const vm = require('node:vm');
+  const nodes = [];
+  class Node {
+    constructor(tag) { this.tagName = tag.toUpperCase(); this.children = []; this.attributes = {}; this.style = {}; this.dataset = {}; this.listeners = {}; this.isConnected = true; this.className = ''; this.id = ''; this.textContent = ''; this.parentElement = null; }
+    setAttribute(name, value) { this.attributes[name] = String(value); }
+    getAttribute(name) { return this.attributes[name] || null; }
+    removeAttribute(name) { delete this.attributes[name]; }
+    appendChild(child) { child.parentElement = this; this.children.push(child); return child; }
+    replaceChildren(...children) { this.children = []; for (const child of children) this.appendChild(child); }
+    addEventListener(name, callback) { this.listeners[name] = callback; }
+    removeEventListener() {}
+    remove() { this.isConnected = false; }
+    querySelectorAll() { return this.children; }
+    getClientRects() { return this.isConnected ? [{}] : []; }
+    getBoundingClientRect() { return this.rect || { left: 8, top: 898, right: 44, bottom: 934, width: 36, height: 36 }; }
+    setPointerCapture() {}
+    contains(node) { return node === this || this.children.includes(node); }
+  }
+  const profile = new Node('button'); profile.setAttribute('aria-label', '打开个人资料菜单');
+  const rail = new Node('nav'); rail.setAttribute('data-app-navigation-rail', 'true'); rail.appendChild(profile);
+  const modelLabel = new Node('span'); modelLabel.className = 'ModelPickerTriggerModelText-test'; modelLabel.__reactFiber$test = { memoizedProps: { model: 'fapi__model-a' }, return: null };
+  const composer = new Node('div'); composer.appendChild(modelLabel); composer.querySelectorAll = () => []; composer.closest = () => composer;
+  const head = new Node('head'); const body = new Node('body'); body.appendChild(rail); body.appendChild(composer);
+  const doc = { documentElement: { lang: 'en' }, body, head, hidden: false, createElement: (tag) => { const node = new Node(tag); nodes.push(node); return node; }, getElementById: (id) => nodes.find((node) => node.id === id && node.isConnected) || null, querySelector: (selector) => selector.includes('data-app-navigation-rail') ? rail : null, querySelectorAll: (selector) => selector.includes('ModelPickerTriggerModelText') ? [modelLabel] : selector.includes('data-composer-navigation-target') ? [composer] : selector.includes('button') ? [profile] : [] };
+  const sandbox = { document: doc, window: { addEventListener() {}, removeEventListener() {} }, navigator: { language: 'en-US' }, visualViewport: { offsetLeft: 0, width: 1377, height: 943, addEventListener() {}, removeEventListener() {} }, innerWidth: 1377, innerHeight: 943, getComputedStyle: () => ({ display: 'block', visibility: 'visible' }), MutationObserver: class { observe() {} disconnect() {} }, ResizeObserver: class { observe() {} disconnect() {} }, setTimeout: () => 1, clearTimeout() {}, setInterval: () => 2, clearInterval() {}, Date, Intl, matchMedia: () => ({ matches: false }), Math, Map, Set, JSON, String, Number, BigInt, Object, Array };
+  await vm.runInNewContext(buildBalanceIndicatorScript({ modelRoutes: [{ slug: 'fapi__model-a', providerId: 'p_a' }] }), sandbox);
+  const ring = nodes.find((node) => node.id === 'gptplus-balance-indicator');
+  const details = nodes.find((node) => node.id === 'gptplus-balance-indicator-details');
+  ring.listeners.pointerenter({ preventDefault() {}, stopPropagation() {} });
+  assert.equal(details.dataset.open, 'true');
+  ring.listeners.pointerleave({ preventDefault() {}, stopPropagation() {}, relatedTarget: details });
+  assert.equal(details.dataset.open, 'true', 'crossing toward details must not close the popup');
+  details.listeners.pointerenter({ preventDefault() {}, stopPropagation() {} });
+  details.listeners.pointerleave({ preventDefault() {}, stopPropagation() {}, relatedTarget: ring });
+  assert.equal(details.dataset.open, 'true');
+  details.listeners.pointerleave({ preventDefault() {}, stopPropagation() {}, relatedTarget: composer });
+  assert.equal(details.dataset.open, 'false');
+});
+
+test('balance indicator refresh replaces stale styles and progress markup after an update', async () => {
+  const vm = require('node:vm');
+  const nodes = [];
+  class Node {
+    constructor(tag) { this.tagName = tag.toUpperCase(); this.children = []; this.attributes = {}; this.style = {}; this.dataset = {}; this.listeners = {}; this.isConnected = true; this.className = ''; this.id = ''; this.textContent = ''; this.parentElement = null; }
+    setAttribute(name, value) { this.attributes[name] = String(value); }
+    getAttribute(name) { return this.attributes[name] || null; }
+    removeAttribute(name) { delete this.attributes[name]; }
+    appendChild(child) { child.parentElement = this; this.children.push(child); return child; }
+    replaceChildren(...children) { this.children = []; for (const child of children) this.appendChild(child); }
+    addEventListener(name, callback) { this.listeners[name] = callback; }
+    removeEventListener() {}
+    remove() { this.isConnected = false; this.parentElement?.children?.splice(this.parentElement.children.indexOf(this), 1); }
+    querySelectorAll() { return this.children; }
+    getClientRects() { return this.isConnected ? [{}] : []; }
+    getBoundingClientRect() { return this.rect || { left: 8, top: 898, right: 44, bottom: 934, width: 36, height: 36 }; }
+    setPointerCapture() {}
+    contains(node) { return node === this; }
+  }
+  const profile = new Node('button'); profile.setAttribute('aria-label', '打开个人资料菜单');
+  const rail = new Node('nav'); rail.setAttribute('data-app-navigation-rail', 'true'); rail.appendChild(profile);
+  const modelLabel = new Node('span'); modelLabel.className = 'ModelPickerTriggerModelText-test'; modelLabel.__reactFiber$test = { memoizedProps: { model: 'fapi__model-a' }, return: null };
+  const composer = new Node('div'); composer.appendChild(modelLabel); composer.querySelectorAll = () => []; composer.closest = () => composer;
+  const head = new Node('head'); const body = new Node('body'); body.appendChild(rail); body.appendChild(composer);
+  const doc = { documentElement: { lang: 'en' }, body, head, hidden: false, createElement: (tag) => { const node = new Node(tag); nodes.push(node); return node; }, getElementById: (id) => nodes.find((node) => node.id === id && node.isConnected) || null, querySelector: (selector) => selector.includes('data-app-navigation-rail') ? rail : null, querySelectorAll: (selector) => selector.includes('ModelPickerTriggerModelText') ? [modelLabel] : selector.includes('data-composer-navigation-target') ? [composer] : selector.includes('button') ? [profile] : [] };
+  const sandbox = { document: doc, window: { addEventListener() {}, removeEventListener() {} }, navigator: { language: 'en-US' }, visualViewport: { offsetLeft: 0, width: 1377, height: 943, addEventListener() {}, removeEventListener() {} }, innerWidth: 1377, innerHeight: 943, getComputedStyle: () => ({ display: 'block', visibility: 'visible' }), MutationObserver: class { observe() {} disconnect() {} }, ResizeObserver: class { observe() {} disconnect() {} }, setTimeout: () => 1, clearTimeout() {}, setInterval: () => 2, clearInterval() {}, Date, Intl, matchMedia: () => ({ matches: false }), Math, Map, Set, JSON, String, Number, BigInt, Object, Array };
+  const oldStyle = new Node('style'); oldStyle.id = 'gptplus-balance-indicator-style'; oldStyle.textContent = 'stale style'; head.appendChild(oldStyle);
+  const oldRoot = new Node('div'); oldRoot.id = 'gptplus-balance-indicator-root'; body.appendChild(oldRoot);
+  let disposed = 0;
+  sandbox.__gptplusBalanceRuntime = 'gptplus-balance-indicator-v1';
+  sandbox.__gptplusBalance = { dispose() { disposed += 1; oldStyle.remove(); oldRoot.remove(); } };
+  const refreshed = await vm.runInNewContext(buildBalanceIndicatorScript({ modelRoutes: [{ slug: 'fapi__model-a', providerId: 'p_a' }] }), sandbox);
+  assert.equal(refreshed.installed, true);
+  assert.equal(refreshed.reused, undefined, 'a newer page runtime must not reuse the previous injected UI');
+  assert.equal(disposed, 1, 'a newer page runtime must dispose the previous injected UI');
+  const ring = nodes.filter((node) => node.id === 'gptplus-balance-indicator' && node.isConnected).at(-1);
+  const styles = nodes.filter((node) => node.id === 'gptplus-balance-indicator-style' && node.isConnected);
+  assert.equal(styles.length, 1, 'a reinjection must not leave duplicate style nodes');
+  assert.match(styles[0].textContent, /--gpb-progress/);
+  assert.ok(ring.children.some((child) => child.className === 'gpb-ring'), 'a reinjected ring must contain its progress visual');
+});
+
 
 
 test('balance page shows the last successful value while waiting for a new read', async () => {
@@ -444,7 +766,8 @@ test('balance page shows the last successful value while waiting for a new read'
   const ring = nodes.find((node) => node.id === 'gptplus-balance-indicator');
   ring.listeners.click({ button: 0, preventDefault() {}, stopPropagation() {} });
   const details = nodes.find((node) => node.id === 'gptplus-balance-indicator-details');
-  assert.match(details.children.map((node) => node.textContent).join(' '), /454\.8/);
+  const detailText = (node) => (node.textContent || '') + ' ' + (node.children || []).map(detailText).join(' ');
+  assert.match(details.children.map(detailText).join(' '), /454\.8/);
 });
 
 test('balance page restores the last successful value after reinjection', async () => {

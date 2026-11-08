@@ -78,6 +78,35 @@ function roundDecimalString(value, maxFractionDigits) {
   const decimal = (digits % scale).toString().padStart(maxFractionDigits, '0').replace(/0+$/, '');
   return decimal ? `${integer}.${decimal}` : String(integer);
 }
+
+function computeBalanceRingProgress(snapshot = {}) {
+  if (snapshot?.unlimited === true) return { percent: '100', level: 'normal' };
+  const parse = (value) => {
+    const text = String(value == null ? '' : value).trim();
+    const match = text.match(/^(-?)(0|[1-9]\d*)(?:\.(\d+))?$/);
+    if (!match) return null;
+    const fraction = match[3] || '';
+    const coefficient = BigInt((match[2] + fraction).replace(/^0+(?=\d)/, '') || '0') * (match[1] ? -1n : 1n);
+    return { coefficient, scale: fraction.length };
+  };
+  const used = parse(snapshot?.totalUsed);
+  const balance = parse(snapshot?.balance);
+  if (!balance || balance.coefficient < 0n) return { percent: null, level: 'normal' };
+  if (snapshot?.totalUsedUnit && snapshot?.unit && String(snapshot.totalUsedUnit) !== String(snapshot.unit)) return { percent: null, level: 'normal' };
+  if (!used || used.coefficient < 0n) return { percent: null, level: 'normal' };
+  const scale = Math.max(used.scale, balance.scale);
+  const usedAtScale = used.coefficient * (10n ** BigInt(scale - used.scale));
+  const balanceAtScale = balance.coefficient * (10n ** BigInt(scale - balance.scale));
+  const total = usedAtScale + balanceAtScale;
+  if (total <= 0n) return { percent: null, level: 'normal' };
+  const level = balanceAtScale * 20n < total ? 'danger' : balanceAtScale * 5n < total ? 'warning' : 'normal';
+  const remainingAtScale = balanceAtScale > total ? total : balanceAtScale;
+  const hundredths = (remainingAtScale * 10000n + total / 2n) / total;
+  const whole = hundredths / 100n;
+  const fraction = (hundredths % 100n).toString().padStart(2, '0').replace(/0+$/, '');
+  return { percent: fraction ? `${whole}.${fraction}` : String(whole), level };
+}
+
 function buildBalanceIndicatorScript({ modelRoutes = [], readyWaitMs = INJECT_TIMEOUT_MS } = {}) {
   const routes = [];
   const seenSlugs = new Map();
@@ -100,6 +129,7 @@ function buildBalanceIndicatorScript({ modelRoutes = [], readyWaitMs = INJECT_TI
   const safeReadyWait = Math.max(500, Math.min(30000, Number(readyWaitMs) || INJECT_TIMEOUT_MS));
   const animationPlanSource = createDigitAnimationPlan.toString();
   const roundDecimalSource = roundDecimalString.toString();
+  const ringProgressSource = computeBalanceRingProgress.toString();
   const formatSource = formatBalanceAmount.toString();
   return `(() => {
   const ROUTES = ${mappingJson};
@@ -108,19 +138,24 @@ function buildBalanceIndicatorScript({ modelRoutes = [], readyWaitMs = INJECT_TI
   const ID = 'gptplus-balance-indicator';
   const STYLE_ID = 'gptplus-balance-indicator-style';
   const EXT_ATTR = 'data-gptplus-balance-indicator';
-  const RUNTIME_KEY = 'gptplus-balance-indicator-v1';
+  const RUNTIME_KEY = 'gptplus-balance-indicator-v2';
   const POSITION_KEY = 'gptplus-balance-indicator-position-v1';
   const CACHE_KEY = 'gptplus-balance-last-value-v1';
   const STYLE = ${JSON.stringify(`
-    #gptplus-balance-indicator-root{position:fixed;inset:0;z-index:2147483000;pointer-events:none;font-family:inherit;color:var(--text-primary,#1f1f1f)}
-    #gptplus-balance-indicator{position:fixed;width:44px;height:44px;border:4px solid currentColor;border-radius:50%;background:transparent;box-shadow:none;display:flex;align-items:center;justify-content:center;pointer-events:auto;cursor:pointer;padding:2px;box-sizing:border-box}
-    #gptplus-balance-indicator[data-state="error"]{border-color:#d92d20;color:#d92d20} #gptplus-balance-indicator[data-state="loading"]{opacity:.65}
+    #gptplus-balance-indicator-root{position:fixed;inset:0;z-index:2147483000;pointer-events:none;font-family:inherit;color:var(--text-primary,#1f1f1f);contain:layout style}
+    #gptplus-balance-indicator{--gpb-ring-color:#15803d;--gpb-progress:0%;position:fixed;width:44px;height:44px;border:0;border-radius:50%;background:transparent;box-shadow:none;display:flex;align-items:center;justify-content:center;pointer-events:auto;cursor:grab;padding:2px;box-sizing:border-box;touch-action:none;user-select:none}
+    #gptplus-balance-indicator[data-level="warning"]{--gpb-ring-color:#ca8a04}
+    #gptplus-balance-indicator[data-level="danger"],#gptplus-balance-indicator[data-state="error"]{--gpb-ring-color:#d92d20}
+    #gptplus-balance-indicator[data-dragging="true"]{cursor:grabbing}
+    #gptplus-balance-indicator[data-state="error"]{color:#d92d20} #gptplus-balance-indicator[data-state="loading"]{opacity:.65}
+    #gptplus-balance-indicator .gpb-ring{position:absolute;inset:0;width:100%;height:100%;border-radius:50%;pointer-events:none;background:conic-gradient(from -90deg,var(--gpb-ring-color) 0% var(--gpb-progress),color-mix(in srgb,var(--gpb-ring-color) 16%,transparent) var(--gpb-progress) 100%);-webkit-mask:radial-gradient(farthest-side,transparent calc(100% - 5px),#000 calc(100% - 4px));mask:radial-gradient(farthest-side,transparent calc(100% - 5px),#000 calc(100% - 4px));transition:background .22s ease}
     #gptplus-balance-indicator-value{font-size:9px;line-height:1.05;text-align:center;max-width:38px;max-height:36px;overflow:hidden;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
     #gptplus-balance-indicator-value[data-error="true"]{font-size:23px;font-weight:700;color:#d92d20}
-    #gptplus-balance-indicator-toast{position:fixed;pointer-events:none;color:#d92d20;font-size:12px;font-weight:600;max-width:calc(100vw - 16px);white-space:normal;overflow-wrap:anywhere;text-align:center;background:var(--background-primary,#fff);border-radius:8px;padding:3px 7px;box-shadow:0 1px 6px #0002;opacity:0;transition:opacity .18s ease;z-index:2147483001}
+    #gptplus-balance-indicator-toast{position:fixed;pointer-events:none;box-sizing:border-box;color:#d92d20;font-size:12px;font-weight:600;max-width:calc(100vw - 16px);white-space:nowrap;overflow-wrap:normal;text-align:center;background:var(--background-primary,#fff);border-radius:8px;padding:3px 7px;box-shadow:0 1px 6px #0002;opacity:0;transition:opacity .18s ease;z-index:2147483001}
     #gptplus-balance-indicator-toast[data-visible="true"]{opacity:1}
-    #gptplus-balance-indicator-details{position:fixed;pointer-events:auto;min-width:190px;max-width:min(300px,calc(100vw - 16px));padding:12px;border:1px solid var(--border-subtle,#ddd);border-radius:12px;background:var(--background-primary,#fff);box-shadow:0 5px 20px #0003;font-size:12px;line-height:1.5;display:none;z-index:2147483002}
+    #gptplus-balance-indicator-details{position:fixed;pointer-events:auto;min-width:190px;max-width:min(300px,calc(100vw - 16px));max-height:calc(100vh - 16px);overflow:auto;padding:12px;border:1px solid var(--border-subtle,#ddd);border-radius:12px;background:var(--background-primary,#fff);box-shadow:0 5px 20px #0003;font-size:12px;line-height:1.5;display:none;z-index:2147483002}
     #gptplus-balance-indicator-details[data-open="true"]{display:block} #gptplus-balance-indicator-details button{margin-top:8px;cursor:pointer}
+    #gptplus-balance-indicator-details .gpb-detail-row{display:flex;justify-content:space-between;gap:16px;padding:1px 0} #gptplus-balance-indicator-details .gpb-detail-row span:first-child{opacity:.7}
     #gptplus-balance-indicator-amount{display:inline-flex;white-space:nowrap;font-variant-numeric:tabular-nums;align-items:baseline}
     #gptplus-balance-indicator-amount .gpb-static{display:inline-block}
     #gptplus-balance-indicator-amount .gpb-track{display:inline-block;position:relative;overflow:hidden;height:1.05em;vertical-align:baseline;line-height:1.05em}
@@ -129,10 +164,11 @@ function buildBalanceIndicatorScript({ modelRoutes = [], readyWaitMs = INJECT_TI
     #gptplus-balance-indicator-amount .gpb-track[data-animate="true"] .gpb-new{animation:gpb-in .4s ease both}
     @keyframes gpb-out{to{transform:translateY(-110%);opacity:0}}
     @keyframes gpb-in{from{transform:translateY(110%);opacity:0}to{transform:translateY(0);opacity:1}}
-    @media(prefers-reduced-motion:reduce){#gptplus-balance-indicator-toast{transition:none}#gptplus-balance-indicator-amount .gpb-track .gpb-old,#gptplus-balance-indicator-amount .gpb-track .gpb-new{animation:none!important}}
+    @media(prefers-reduced-motion:reduce){#gptplus-balance-indicator-toast,#gptplus-balance-indicator .gpb-ring{transition:none}#gptplus-balance-indicator-amount .gpb-track .gpb-old,#gptplus-balance-indicator-amount .gpb-track .gpb-new{animation:none!important}}
   `)};
   const createDigitAnimationPlan = ${animationPlanSource};
   const roundDecimalString = ${roundDecimalSource};
+  const computeBalanceRingProgress = ${ringProgressSource};
   const formatBalanceAmount = ${formatSource};
   if (globalThis.__gptplusBalanceRuntime === RUNTIME_KEY && globalThis.__gptplusBalance) return { ok:true,installed:true,reused:true };
   globalThis.__gptplusBalance?.dispose?.();
@@ -239,13 +275,14 @@ function buildBalanceIndicatorScript({ modelRoutes = [], readyWaitMs = INJECT_TI
     const live=state.snapshot&&state.snapshot.providerId===current.providerId?state.snapshot:null;
     const cached=(!live||live.ok===false)?lastSnapshot(current.providerId):null;
     const snapshot=cached||live;
-    const title=document.createElement('strong');title.textContent=current.providerName||snapshot?.providerName||'中转站余额';state.details.appendChild(title);
-    const line=document.createElement('div');
-    if(snapshot?.ok===false)line.textContent=snapshot.error||current.reason||'刷新失败';
-    else if(snapshot?.unlimited)line.textContent='不限额';
-    else if(snapshot?.balance!=null){line.textContent=makeDisplayParts(snapshot.balance,snapshot.currency,snapshot.unit).text;}
-    else line.textContent=current.reason||'等待余额刷新';
-    state.details.appendChild(line);
+    const providerName=current.providerName||snapshot?.providerName||(state.providerList.find((item)=>String(item.providerId)===String(current.providerId))?.name)||'中转站余额';
+    const title=document.createElement('strong');title.textContent=providerName;state.details.appendChild(title);
+    const addRow=(label,value)=>{const row=document.createElement('div');row.className='gpb-detail-row';const name=document.createElement('span');name.textContent=label;const text=document.createElement('span');text.textContent=value;row.appendChild(name);row.appendChild(text);state.details.appendChild(row);return text;};
+    const balanceText=snapshot?.unlimited?'不限额':snapshot?.balance!=null?makeDisplayParts(snapshot.balance,snapshot.currency,snapshot.unit).text:current.reason||'等待余额刷新';
+    addRow('余额',balanceText);
+    addRow('消耗值',snapshot?.totalUsed!=null?makeDisplayParts(snapshot.totalUsed,snapshot.currency,snapshot.unit).text:'暂无');
+    addRow('最近一次消耗量',snapshot?.delta!=null?makeDisplayParts(snapshot.delta,snapshot.currency,snapshot.unit).text:'暂无');
+    if(snapshot?.ok===false){const failure=document.createElement('div');failure.textContent=snapshot.error||current.reason||'刷新失败';failure.style.marginTop='4px';failure.style.color='#d92d20';state.details.appendChild(failure);}
     if(cached){const stale=document.createElement('div');stale.textContent='显示上一次读取值';stale.style.marginTop='4px';state.details.appendChild(stale);}
     if(cached&&live?.ok===false){const failure=document.createElement('div');failure.textContent='本次刷新失败：'+(live.error||'未知错误');failure.style.marginTop='4px';failure.style.color='#d92d20';state.details.appendChild(failure);}
     if(snapshot?.at){const time=document.createElement('div');time.textContent=(cached?'上次读取于 ':'更新于 ')+new Date(snapshot.at).toLocaleTimeString();state.details.appendChild(time);}
@@ -268,16 +305,20 @@ function buildBalanceIndicatorScript({ modelRoutes = [], readyWaitMs = INJECT_TI
     state.details.style.display='block'; const measured=state.details.getBoundingClientRect();const vp=globalThis.visualViewport;
     const leftEdge=(vp?.offsetLeft||0)+8;const rightEdge=(vp?.offsetLeft||0)+(vp?.width||innerWidth)-8;
     const topEdge=(vp?.offsetTop||0)+8;const bottomEdge=(vp?.offsetTop||0)+(vp?.height||innerHeight)-8;
-    const left=clamp(ring.right+8,leftEdge,Math.max(leftEdge,rightEdge-(measured.width||220)));
-    const top=clamp(ring.bottom-(measured.height||120),topEdge,Math.max(topEdge,bottomEdge-(measured.height||120)));
+    const width=Math.min(measured.width||220,rightEdge-leftEdge);const height=Math.min(measured.height||120,bottomEdge-topEdge);
+    let left=ring.right+8;if(left+width>rightEdge)left=ring.left-width-8;left=clamp(left,leftEdge,Math.max(leftEdge,rightEdge-width));
+    const top=clamp(ring.top+ring.height/2-height/2,topEdge,Math.max(topEdge,bottomEdge-height));
     setFixed(state.details,left,top);
   }
   function positionToast(){
     if(!state.toast||state.toast.dataset.visible!=='true'||!state.ring)return;
-    const ring=state.ring.getBoundingClientRect();state.toast.style.display='block';const width=state.toast.getBoundingClientRect().width||Math.max(48,state.toast.textContent.length*7);
-    const vp=globalThis.visualViewport;const leftEdge=(vp?.offsetLeft||0)+8;const rightEdge=(vp?.offsetLeft||0)+(vp?.width||innerWidth)-8;
+    const ring=state.ring.getBoundingClientRect();state.toast.style.display='block';
+    const vp=globalThis.visualViewport;const leftEdge=(vp?.offsetLeft||0)+8;const rightEdge=(vp?.offsetLeft||0)+(vp?.width||innerWidth)-8;const topEdge=(vp?.offsetTop||0)+8;const bottomEdge=(vp?.offsetTop||0)+(vp?.height||innerHeight)-8;
+    state.toast.style.maxWidth=(rightEdge-leftEdge)+'px';
+    const width=state.toast.getBoundingClientRect().width||Math.max(48,state.toast.textContent.length*7);
     const left=clamp(ring.left+(ring.width-width)/2,leftEdge,Math.max(leftEdge,rightEdge-width));
-    setFixed(state.toast,left,Math.max(8,ring.top-29));
+    const height=state.toast.getBoundingClientRect().height||24;const top=clamp(ring.top-height-6,topEdge,Math.max(topEdge,bottomEdge-height));
+    setFixed(state.toast,left,top);
   }
   function showToast(snapshot){
     if(!snapshot||snapshot.delta==null||!['cumulative','net-balance-change'].includes(snapshot.deltaKind))return;
@@ -293,7 +334,11 @@ function buildBalanceIndicatorScript({ modelRoutes = [], readyWaitMs = INJECT_TI
     if((balance==null||balance==='')&&!unlimited)return null;
     const at=Number(value.at);
     const providerName=String(value.providerName||'').trim().slice(0,100);
-    return {providerId:id,...(providerName?{providerName}:{}),...(value.adapter?{adapter:String(value.adapter)}:{}),...(balance?{balance}:{}),...(value.currency?{currency:String(value.currency)}:{}),...(value.unit?{unit:String(value.unit)}:{}),...(unlimited?{unlimited:true}:{}),...(Number.isFinite(at)?{at}:{})};
+    const totalUsed=value.totalUsed==null?null:String(value.totalUsed).trim();
+    const delta=value.delta==null?null:String(value.delta).trim();
+    const totalUsedUnit=String(value.totalUsedUnit||'').trim().slice(0,20);
+    const deltaKind=String(value.deltaKind||'').trim().slice(0,30);
+    return {providerId:id,...(providerName?{providerName}:{}),...(value.adapter?{adapter:String(value.adapter)}:{}),...(balance?{balance}:{}),...(value.currency?{currency:String(value.currency)}:{}),...(value.unit?{unit:String(value.unit)}:{}),...(totalUsed?{totalUsed}:{}),...(totalUsedUnit?{totalUsedUnit}:{}),...(delta?{delta}:{}),...(deltaKind?{deltaKind}:{}),...(unlimited?{unlimited:true}:{}),...(Number.isFinite(at)?{at}:{})};
   }
   function restoreBalanceCache(){
     try{
@@ -330,10 +375,14 @@ function buildBalanceIndicatorScript({ modelRoutes = [], readyWaitMs = INJECT_TI
     const cached=(!live||live.ok===false)?lastSnapshot(current.providerId):null;
     const shown=cached||live;
     const error=!shown||shown.ok===false;
+    const progress=computeBalanceRingProgress(shown||{});
     state.ring.dataset.state=error?'error':shown?'ready':'loading';
     state.ring.dataset.stale=String(Boolean(cached));
+    state.ring.dataset.level=error?'danger':progress.level;
+    if(state.ring.style?.setProperty)state.ring.style.setProperty('--gpb-progress',(progress.percent||'0')+'%');else state.ring.style['--gpb-progress']=(progress.percent||'0')+'%';
     state.value.setAttribute('aria-hidden','false');
-    state.ring.setAttribute('aria-label',error?(live?.error||current.reason||'未关联余额提供商'):cached?'显示上一次读取的中转站余额 '+(shown?.balance??(shown?.unlimited?'不限额':'')):'中转站剩余 '+(shown?.balance??(shown?.unlimited?'不限额':'')));
+    const percentText=progress.percent==null?'':'，剩余 '+progress.percent+'%';
+    state.ring.setAttribute('aria-label',error?(live?.error||current.reason||'未关联余额提供商'):cached?'显示上一次读取的中转站余额 '+(shown?.balance??(shown?.unlimited?'不限额':''))+percentText:'中转站剩余 '+(shown?.balance??(shown?.unlimited?'不限额':''))+percentText);
     if(!shown){renderAmount({status:current.providerId&&live?.ok===false?'error':current.providerId?'loading':'unmapped'});}
     else renderAmount(shown);
     if(state.details?.dataset.open==='true')renderDetails();
@@ -355,22 +404,30 @@ function buildBalanceIndicatorScript({ modelRoutes = [], readyWaitMs = INJECT_TI
     const merged={};for(const [id,value] of Object.entries(incoming)){const safe=balanceCacheValue(value,id);if(safe)merged[safe.providerId||id]=safe;}
     state.providerSnapshots={...(state.providerSnapshots||{}),...merged};
     state.providerStatuses=snapshot.providerStatuses&&typeof snapshot.providerStatuses==='object'?snapshot.providerStatuses:{};
-    state.providerList=Array.isArray(snapshot.providerList)?snapshot.providerList:[];
-    if(String(snapshot.providerId||'')===String(state.current?.providerId||'')){state.snapshot={...snapshot};if(snapshot.ok!==false)rememberSnapshot({...snapshot,providerName:state.current?.providerName||snapshot.providerName});render();showToast(snapshot);}
+    if(Array.isArray(snapshot.providerList))state.providerList=snapshot.providerList;
+    if(String(snapshot.providerId||'')===String(state.current?.providerId||'')){const previousAt=state.snapshot?.at;state.snapshot={...snapshot};if(snapshot.ok!==false)rememberSnapshot({...snapshot,providerName:state.current?.providerName||snapshot.providerName});render();if(String(previousAt||'')!==String(snapshot.at||''))showToast(snapshot);}
     else if(state.details?.dataset.open==='true')renderDetails();
     return true;
   }
   function install(){
-    if(!document.getElementById(STYLE_ID)){const style=document.createElement('style');style.id=STYLE_ID;style.setAttribute(EXT_ATTR,'true');style.textContent=STYLE;document.head?.appendChild(style);}
+    document.getElementById(STYLE_ID)?.remove();const style=document.createElement('style');style.id=STYLE_ID;style.setAttribute(EXT_ATTR,'true');style.textContent=STYLE;document.head?.appendChild(style);
     document.getElementById(ID+'-root')?.remove();
     const root=document.createElement('div');root.id=ID+'-root';root.setAttribute(EXT_ATTR,'true');state.root=root;
     const ring=document.createElement('button');ring.id=ID;ring.type='button';ring.setAttribute(EXT_ATTR,'true');ring.setAttribute('aria-label','中转站余额');ring.setAttribute('title','拖动调整位置，双击恢复默认位置');
+    ring.dataset.level='normal';if(ring.style?.setProperty)ring.style.setProperty('--gpb-progress','0%');else ring.style['--gpb-progress']='0%';
+    const ringVisual=document.createElement('span');ringVisual.className='gpb-ring';ringVisual.setAttribute('aria-hidden','true');ring.appendChild(ringVisual);
     const value=document.createElement('span');value.id=ID+'-value';ring.appendChild(value);state.ring=ring;state.value=value;
     const toast=document.createElement('div');toast.id=ID+'-toast';toast.setAttribute(EXT_ATTR,'true');state.toast=toast;
-    const details=document.createElement('section');details.id=ID+'-details';details.setAttribute(EXT_ATTR,'true');details.setAttribute('role','dialog');details.setAttribute('aria-label','中转站余额详情');state.details=details;
-    ring.addEventListener('click',(event)=>{event.stopPropagation();if(state.suppressClick){state.suppressClick=false;return;}details.dataset.open=details.dataset.open==='true'?'false':'true';renderDetails();});
+    const details=document.createElement('section');details.id=ID+'-details';details.setAttribute(EXT_ATTR,'true');details.setAttribute('role','dialog');details.setAttribute('aria-label','中转站余额详情');details.dataset.open='false';state.details=details;
+    const openDetails=()=>{if(state.drag)return;details.dataset.open='true';renderDetails();};
+    const closeDetails=()=>{details.dataset.open='false';};
+    ring.addEventListener('pointerenter',(event)=>{event.stopPropagation();if(!state.drag)openDetails();});
+    ring.addEventListener('pointerleave',(event)=>{if(state.drag)return;event.stopPropagation();if(event.relatedTarget===details||details.contains?.(event.relatedTarget))return;closeDetails();});
+    details.addEventListener('pointerenter',(event)=>{event.stopPropagation();openDetails();});
+    details.addEventListener('pointerleave',(event)=>{event.stopPropagation();if(event.relatedTarget===ring||ring.contains?.(event.relatedTarget))return;closeDetails();});
+    ring.addEventListener('click',(event)=>{event.stopPropagation();if(state.suppressClick){state.suppressClick=false;return;}openDetails();});
     ring.addEventListener('pointerdown',(event)=>{
-      if(event.button!==0)return;event.preventDefault();event.stopPropagation();
+      if(event.button!==0)return;event.preventDefault();event.stopPropagation();closeDetails();
       const rect=ring.getBoundingClientRect();
       state.drag={pointerId:event.pointerId,offsetX:event.clientX-rect.left,offsetY:event.clientY-rect.top,moved:false};
       ring.setPointerCapture?.(event.pointerId);ring.dataset.dragging='true';
@@ -378,14 +435,14 @@ function buildBalanceIndicatorScript({ modelRoutes = [], readyWaitMs = INJECT_TI
     const finishDrag=(event,commit)=>{
       const drag=state.drag;if(!drag||event.pointerId!==drag.pointerId)return;
       state.drag=null;ring.dataset.dragging='false';
-      if(commit&&drag.moved){const bounds=viewportBounds();const left=clamp(Number(ring.style.left.replace('px',''))||0,bounds.left,Math.max(bounds.left,bounds.right-44));const top=clamp(Number(ring.style.top.replace('px',''))||0,bounds.top,Math.max(bounds.top,bounds.bottom-44));state.position={left,top};savePosition(left,top);setFixed(ring,left,top);state.suppressClick=true;}
+      if(commit&&drag.moved){const bounds=viewportBounds();const left=clamp(Number(ring.style.left.replace('px',''))||0,bounds.left,Math.max(bounds.left,bounds.right-44));const top=clamp(Number(ring.style.top.replace('px',''))||0,bounds.top,Math.max(bounds.top,bounds.bottom-44));state.position={left,top};savePosition(left,top);setFixed(ring,left,top);state.suppressClick=true;if(details.dataset.open==='true')positionDetails();}
       if(!drag.moved)state.suppressClick=false;
     };
-    ring.addEventListener('pointermove',(event)=>{const drag=state.drag;if(!drag||event.pointerId!==drag.pointerId)return;const bounds=viewportBounds();const left=clamp(event.clientX-drag.offsetX,bounds.left,Math.max(bounds.left,bounds.right-44));const top=clamp(event.clientY-drag.offsetY,bounds.top,Math.max(bounds.top,bounds.bottom-44));if(Math.abs(left-Number(ring.style.left.replace('px',''))||0)>2||Math.abs(top-Number(ring.style.top.replace('px',''))||0)>2)drag.moved=true;setFixed(ring,left,top);if(state.toast?.dataset.visible==='true')positionToast();});
-    ring.addEventListener('pointerup',(event)=>finishDrag(event,true));
+    ring.addEventListener('pointermove',(event)=>{const drag=state.drag;if(!drag||event.pointerId!==drag.pointerId)return;const bounds=viewportBounds();const left=clamp(event.clientX-drag.offsetX,bounds.left,Math.max(bounds.left,bounds.right-44));const top=clamp(event.clientY-drag.offsetY,bounds.top,Math.max(bounds.top,bounds.bottom-44));if(Math.abs(left-Number(ring.style.left.replace('px',''))||0)>2||Math.abs(top-Number(ring.style.top.replace('px',''))||0)>2)drag.moved=true;setFixed(ring,left,top);if(state.toast?.dataset.visible==='true')positionToast();if(details.dataset.open==='true')positionDetails();});
+    ring.addEventListener('pointerup',(event)=>{finishDrag(event,true);if(!state.drag)openDetails();});
     ring.addEventListener('pointercancel',(event)=>finishDrag(event,false));
     ring.addEventListener('dblclick',(event)=>{event.preventDefault();event.stopPropagation();state.position=null;clearPosition();const fallback=defaultPosition();if(fallback)setFixed(ring,fallback.left,fallback.top);});
-    window.addEventListener('pointerdown',(event)=>{if(details.dataset.open!=='true'||state.drag)return;if(event.target===details||details.contains?.(event.target)||event.target===ring)return;details.dataset.open='false';});
+    window.addEventListener('pointerdown',(event)=>{if(details.dataset.open!=='true'||state.drag)return;if(event.target===details||details.contains?.(event.target)||event.target===ring)return;closeDetails();});
     root.appendChild(ring);root.appendChild(toast);root.appendChild(details);document.body.appendChild(root);
     state.current=resolveCurrent();render();
     state.observer=new MutationObserver(()=>{syncContext();updatePosition();});state.observer.observe(document.body,{subtree:true,childList:true,attributes:true,characterData:true,attributeFilter:['aria-label','data-composer-navigation-target','style','class']});
@@ -424,6 +481,8 @@ function applyBalanceExpression(snapshot, currentProviderId = snapshot?.provider
     ok: snapshot?.ok !== false,
     ...(snapshot?.error ? { error: String(snapshot.error).slice(0, 240) } : {}),
     ...(snapshot?.balance != null ? { balance: String(snapshot.balance) } : {}),
+    ...(snapshot?.totalUsed != null ? { totalUsed: String(snapshot.totalUsed) } : {}),
+    ...(snapshot?.totalUsedUnit ? { totalUsedUnit: String(snapshot.totalUsedUnit) } : {}),
     ...(snapshot?.currency ? { currency: String(snapshot.currency) } : {}),
     ...(snapshot?.unit ? { unit: String(snapshot.unit) } : {}),
     ...(snapshot?.unlimited === true ? { unlimited: true } : {}),
@@ -651,4 +710,4 @@ async function disposeChatGptBalance({ cdpPort, target = null, timeoutMs = COMMA
   return { ok: true, target: page };
 }
 
-module.exports = { buildBalanceIndicatorScript, createDigitAnimationPlan, formatBalanceAmount, PAGE_SYNC_INTERVAL_MS, injectChatGptBalance, resumeChatGptBalance, startChatGptBalanceBridge, disposeChatGptBalance, stopChatGptBalanceBridge, installChatGptBalanceOnPort, launchChatGptWithBalance, applyBalanceExpression, balanceRoutes, balanceProviderList };
+module.exports = { buildBalanceIndicatorScript, createDigitAnimationPlan, formatBalanceAmount, computeBalanceRingProgress, PAGE_SYNC_INTERVAL_MS, injectChatGptBalance, resumeChatGptBalance, startChatGptBalanceBridge, disposeChatGptBalance, stopChatGptBalanceBridge, installChatGptBalanceOnPort, launchChatGptWithBalance, applyBalanceExpression, balanceRoutes, balanceProviderList };
