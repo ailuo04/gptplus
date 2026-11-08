@@ -142,13 +142,13 @@ function buildBalanceIndicatorScript({ modelRoutes = [], readyWaitMs = INJECT_TI
   const POSITION_KEY = 'gptplus-balance-indicator-position-v1';
   const CACHE_KEY = 'gptplus-balance-last-value-v1';
   const STYLE = ${JSON.stringify(`
-    #gptplus-balance-indicator-root{position:fixed;inset:0;z-index:2147483000;pointer-events:none;font-family:inherit;color:var(--text-primary,#1f1f1f);contain:layout style}
+    #gptplus-balance-indicator-root{display:none!important;position:fixed;inset:0;z-index:2147483000;pointer-events:none;font-family:inherit;color:var(--text-primary,#1f1f1f);contain:layout style}
     #gptplus-balance-indicator{--gpb-ring-color:#15803d;--gpb-progress:0%;position:fixed;width:44px;height:44px;border:0;border-radius:50%;background:transparent;box-shadow:none;display:flex;align-items:center;justify-content:center;pointer-events:auto;cursor:grab;padding:2px;box-sizing:border-box;touch-action:none;user-select:none}
     #gptplus-balance-indicator[data-level="warning"]{--gpb-ring-color:#ca8a04}
     #gptplus-balance-indicator[data-level="danger"],#gptplus-balance-indicator[data-state="error"]{--gpb-ring-color:#d92d20}
     #gptplus-balance-indicator[data-dragging="true"]{cursor:grabbing}
     #gptplus-balance-indicator[data-state="error"]{color:#d92d20} #gptplus-balance-indicator[data-state="loading"]{opacity:.65}
-    #gptplus-balance-indicator .gpb-ring{position:absolute;inset:0;width:100%;height:100%;border-radius:50%;pointer-events:none;background:conic-gradient(from -90deg,var(--gpb-ring-color) 0% var(--gpb-progress),color-mix(in srgb,var(--gpb-ring-color) 16%,transparent) var(--gpb-progress) 100%);-webkit-mask:radial-gradient(farthest-side,transparent calc(100% - 5px),#000 calc(100% - 4px));mask:radial-gradient(farthest-side,transparent calc(100% - 5px),#000 calc(100% - 4px));transition:background .22s ease}
+    #gptplus-balance-indicator .gpb-ring{position:absolute;inset:0;width:100%;height:100%;border-radius:50%;pointer-events:none;background:conic-gradient(from 0deg,var(--gpb-ring-color) 0% var(--gpb-progress),color-mix(in srgb,var(--gpb-ring-color) 16%,transparent) var(--gpb-progress) 100%);-webkit-mask:radial-gradient(farthest-side,transparent calc(100% - 5px),#000 calc(100% - 4px));mask:radial-gradient(farthest-side,transparent calc(100% - 5px),#000 calc(100% - 4px));transition:background .22s ease}
     #gptplus-balance-indicator-value{font-size:9px;line-height:1.05;text-align:center;max-width:38px;max-height:36px;overflow:hidden;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
     #gptplus-balance-indicator-value[data-error="true"]{font-size:23px;font-weight:700;color:#d92d20}
     #gptplus-balance-indicator-toast{position:fixed;pointer-events:none;box-sizing:border-box;color:#d92d20;font-size:12px;font-weight:600;max-width:calc(100vw - 16px);white-space:nowrap;overflow-wrap:normal;text-align:center;background:var(--background-primary,#fff);border-radius:8px;padding:3px 7px;box-shadow:0 1px 6px #0002;opacity:0;transition:opacity .18s ease;z-index:2147483001}
@@ -286,17 +286,6 @@ function buildBalanceIndicatorScript({ modelRoutes = [], readyWaitMs = INJECT_TI
     if(cached){const stale=document.createElement('div');stale.textContent='显示上一次读取值';stale.style.marginTop='4px';state.details.appendChild(stale);}
     if(cached&&live?.ok===false){const failure=document.createElement('div');failure.textContent='本次刷新失败：'+(live.error||'未知错误');failure.style.marginTop='4px';failure.style.color='#d92d20';state.details.appendChild(failure);}
     if(snapshot?.at){const time=document.createElement('div');time.textContent=(cached?'上次读取于 ':'更新于 ')+new Date(snapshot.at).toLocaleTimeString();state.details.appendChild(time);}
-    if(state.providerList.length){
-      const list=document.createElement('div');list.setAttribute('aria-label','已配置提供商余额');list.style.marginTop='8px';
-      for(const provider of state.providerList){
-        const row=document.createElement('div');row.style.display='flex';row.style.justifyContent='space-between';row.style.gap='12px';
-        const name=document.createElement('span');name.textContent=provider.name||provider.providerId;
-        const value=document.createElement('span');const cached=state.providerSnapshots[provider.providerId];const status=state.providerStatuses[provider.providerId];
-        value.textContent=cached?.unlimited?'不限额':cached?.balance!=null?makeDisplayParts(cached.balance,cached.currency,cached.unit).text:status?.error||'尚未查询';
-        row.appendChild(name);row.appendChild(value);list.appendChild(row);
-      }
-      state.details.appendChild(list);
-    }
     const refresh=document.createElement('button');refresh.type='button';refresh.textContent='刷新';refresh.addEventListener('click',(event)=>{event.stopPropagation();state.manualRefresh+=1;});state.details.appendChild(refresh);
     positionDetails();
   }
@@ -425,9 +414,8 @@ function buildBalanceIndicatorScript({ modelRoutes = [], readyWaitMs = INJECT_TI
     ring.addEventListener('pointerleave',(event)=>{if(state.drag)return;event.stopPropagation();if(event.relatedTarget===details||details.contains?.(event.relatedTarget))return;closeDetails();});
     details.addEventListener('pointerenter',(event)=>{event.stopPropagation();openDetails();});
     details.addEventListener('pointerleave',(event)=>{event.stopPropagation();if(event.relatedTarget===ring||ring.contains?.(event.relatedTarget))return;closeDetails();});
-    ring.addEventListener('click',(event)=>{event.stopPropagation();if(state.suppressClick){state.suppressClick=false;return;}openDetails();});
     ring.addEventListener('pointerdown',(event)=>{
-      if(event.button!==0)return;event.preventDefault();event.stopPropagation();closeDetails();
+      if(event.button!==0)return;event.preventDefault();event.stopPropagation();
       const rect=ring.getBoundingClientRect();
       state.drag={pointerId:event.pointerId,offsetX:event.clientX-rect.left,offsetY:event.clientY-rect.top,moved:false};
       ring.setPointerCapture?.(event.pointerId);ring.dataset.dragging='true';
@@ -438,8 +426,8 @@ function buildBalanceIndicatorScript({ modelRoutes = [], readyWaitMs = INJECT_TI
       if(commit&&drag.moved){const bounds=viewportBounds();const left=clamp(Number(ring.style.left.replace('px',''))||0,bounds.left,Math.max(bounds.left,bounds.right-44));const top=clamp(Number(ring.style.top.replace('px',''))||0,bounds.top,Math.max(bounds.top,bounds.bottom-44));state.position={left,top};savePosition(left,top);setFixed(ring,left,top);state.suppressClick=true;if(details.dataset.open==='true')positionDetails();}
       if(!drag.moved)state.suppressClick=false;
     };
-    ring.addEventListener('pointermove',(event)=>{const drag=state.drag;if(!drag||event.pointerId!==drag.pointerId)return;const bounds=viewportBounds();const left=clamp(event.clientX-drag.offsetX,bounds.left,Math.max(bounds.left,bounds.right-44));const top=clamp(event.clientY-drag.offsetY,bounds.top,Math.max(bounds.top,bounds.bottom-44));if(Math.abs(left-Number(ring.style.left.replace('px',''))||0)>2||Math.abs(top-Number(ring.style.top.replace('px',''))||0)>2)drag.moved=true;setFixed(ring,left,top);if(state.toast?.dataset.visible==='true')positionToast();if(details.dataset.open==='true')positionDetails();});
-    ring.addEventListener('pointerup',(event)=>{finishDrag(event,true);if(!state.drag)openDetails();});
+    ring.addEventListener('pointermove',(event)=>{const drag=state.drag;if(!drag||event.pointerId!==drag.pointerId)return;const bounds=viewportBounds();const left=clamp(event.clientX-drag.offsetX,bounds.left,Math.max(bounds.left,bounds.right-44));const top=clamp(event.clientY-drag.offsetY,bounds.top,Math.max(bounds.top,bounds.bottom-44));if(Math.abs(left-Number(ring.style.left.replace('px',''))||0)>2||Math.abs(top-Number(ring.style.top.replace('px',''))||0)>2){drag.moved=true;closeDetails();}setFixed(ring,left,top);if(state.toast?.dataset.visible==='true')positionToast();if(details.dataset.open==='true')positionDetails();});
+    ring.addEventListener('pointerup',(event)=>finishDrag(event,true));
     ring.addEventListener('pointercancel',(event)=>finishDrag(event,false));
     ring.addEventListener('dblclick',(event)=>{event.preventDefault();event.stopPropagation();state.position=null;clearPosition();const fallback=defaultPosition();if(fallback)setFixed(ring,fallback.left,fallback.top);});
     window.addEventListener('pointerdown',(event)=>{if(details.dataset.open!=='true'||state.drag)return;if(event.target===details||details.contains?.(event.target)||event.target===ring)return;closeDetails();});
@@ -459,14 +447,14 @@ const balanceScriptIds = new Map();
 let activeBalanceBridge = null;
 
 function balanceRoutes(ctx) {
-  const configured = new Map((ctx?.plugins?.config?.('provider-balance')?.providers || []).map((item) => [String(item.providerId), item.adapter]));
+  const configured = new Map((ctx?.plugins?.config?.('usage-statusline')?.balance?.providers || []).map((item) => [String(item.providerId), item.adapter]));
   const models = typeof ctx?.models === 'function' ? ctx.models() : [];
   return (Array.isArray(models) ? models : []).filter((model) => model?.enabled !== false && configured.has(String(model?.providerId || '')))
     .map((model) => ({ slug: model.slug, providerId: model.providerId, providerName: model.providerName }));
 }
 
 function balanceProviderList(ctx) {
-  const configured = ctx?.plugins?.config?.('provider-balance')?.providers || [];
+  const configured = ctx?.plugins?.config?.('usage-statusline')?.balance?.providers || [];
   const providers = typeof ctx?.store?.providers === 'function' ? ctx.store.providers() : [];
   const names = new Map(providers.map((provider) => [String(provider.id), String(provider.name || provider.id)]));
   const modelNames = new Map(balanceRoutes(ctx).map((route) => [String(route.providerId), String(route.providerName || route.providerId)]));
@@ -494,7 +482,7 @@ function applyBalanceExpression(snapshot, currentProviderId = snapshot?.provider
     providerStatuses,
     providerList,
   };
-  return 'globalThis.__gptplusBalance?.apply?.(' + JSON.stringify(safe) + ')';
+  return 'globalThis.__gptplusUsageStatusline?.applyBalance?.(' + JSON.stringify(safe) + ')';
 }
 
 async function ensureBalancePageScript(target, options = {}) {
@@ -529,7 +517,6 @@ function startChatGptBalanceBridge({
   let currentProviderId = '';
   let manualRefresh = 0;
   let detailsOpen = false;
-  let detailsLoaded = false;
   const providerList = balanceProviderList(ctx);
   const providerStatuses = new Map();
 
@@ -570,7 +557,6 @@ function startChatGptBalanceBridge({
       const providerId = route && String(pageContext.providerId || '') === String(route.providerId) ? route.providerId : '';
       if (providerId !== currentProviderId) {
         currentProviderId = providerId;
-        detailsLoaded = false;
         runtime.setCurrentProvider?.(providerId);
         if (providerId) void runtime.refresh(providerId, { reason: 'model-change' });
         if (providerId) {
@@ -579,11 +565,6 @@ function startChatGptBalanceBridge({
         }
       }
       detailsOpen = pageContext.detailsOpen === true;
-      if (detailsOpen && !detailsLoaded) {
-        detailsLoaded = true;
-        for (const item of providerList) if (!providerId || item.providerId !== providerId) void runtime.refresh(item.providerId, { reason: 'details' });
-      }
-      if (!detailsOpen) detailsLoaded = false;
       if (!providerId) return;
       const refreshCount = Number(pageContext.manualRefresh) || 0;
       if (refreshCount > manualRefresh) {
@@ -646,7 +627,7 @@ async function injectChatGptBalance({ cdpPort, target = null, timeoutMs = INJECT
 }
 
 async function resumeChatGptBalance({ ctx, timeoutMs = 10000, findPort = findChatGptDebugPort, listTargetsImpl = listTargets, inject = injectChatGptBalance, startBridge = startChatGptBalanceBridge } = {}) {
-  if (!ctx?.plugins?.isActive?.('provider-balance')) {
+  if (!ctx?.plugins?.isActive?.('usage-statusline') || ctx?.plugins?.config?.('usage-statusline')?.balance?.enabled !== true) {
     activeBalanceBridge?.stop?.();
     return { ok: false, skipped: true, disabled: true };
   }
@@ -675,7 +656,7 @@ async function installChatGptBalanceOnPort({ ctx, cdpPort, target = null, timeou
 
 async function launchChatGptWithBalance({ ctx, launch, launchOptions = {}, wrapperDir, findPort = findAvailablePort, inject = injectChatGptBalance, startBridge = startChatGptBalanceBridge } = {}) {
   if (typeof launch !== 'function') throw new Error('ChatGPT 启动函数不可用');
-  if (!ctx?.plugins?.isActive?.('provider-balance')) throw new Error('中转站余额插件未启用');
+  if (!ctx?.plugins?.isActive?.('usage-statusline') || ctx?.plugins?.config?.('usage-statusline')?.balance?.enabled !== true) throw new Error('中转站余额插件未启用');
   activeBalanceBridge?.stop?.();
   const cdpPort = await findPort(9229);
   const launched = await launch({ ...launchOptions, cdpPort, ...(wrapperDir ? { wrapperDir } : {}) });

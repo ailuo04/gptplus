@@ -9,6 +9,7 @@ const DEFAULT_USAGE_METRICS = Object.freeze({
   cache: true,
   context: true,
 });
+const DEFAULT_BALANCE_CONFIG = Object.freeze({ enabled: false, providers: Object.freeze([]), refreshIntervalSeconds: 60 });
 
 const DEFAULT_VOICE_SPACE_HOLD_MS = 1000;
 const MIN_VOICE_SPACE_HOLD_MS = 300;
@@ -23,7 +24,6 @@ const DEFAULT_VOICE_CONFIG = Object.freeze({
 });
 
 const DEFAULT_IMAGE_CONFIG = Object.freeze({ baseUrl: '', apiKey: '', model: '', preferDefault: true, resolution: '1K', aspectRatio: '1:1', quality: 'auto', background: 'auto' });
-const DEFAULT_BALANCE_CONFIG = Object.freeze({ providers: Object.freeze([]), refreshIntervalSeconds: 60 });
 const MIN_BALANCE_REFRESH_SECONDS = 10;
 const MAX_BALANCE_REFRESH_SECONDS = 86400;
 const BALANCE_ADAPTERS = new Set(['sub2api', 'newapi']);
@@ -58,28 +58,13 @@ const BUILTIN_PLUGIN_DEFINITIONS = Object.freeze([
     author: 'gpt++',
     category: '效率',
     icon: 'activity',
-    description: '在 ChatGPT 输入框下方显示生成速度、缓存命中率和上下文占用。',
-    detail: '数据来自本机 Codex 会话记录，不读取消息正文；可单独选择显示哪些指标。',
+    description: '在 ChatGPT 输入框下方显示生成速度、缓存命中率、上下文占用和当前模型额度。',
+    detail: '用量来自本机 Codex 会话记录；额度仅调用已配置提供商的只读接口。可分别配置显示指标和额度来源。',
     builtIn: true,
     defaultInstalled: true,
     defaultEnabled: true,
     configurable: true,
-    defaultConfig: { metrics: DEFAULT_USAGE_METRICS },
-  }),
-  Object.freeze({
-    id: 'provider-balance',
-    name: '中转站余额',
-    version: '1.0.0',
-    author: 'gpt++',
-    category: '效率',
-    icon: 'activity',
-    description: '在 ChatGPT 页面显示当前模型上游的剩余额度。',
-    detail: '仅调用 Sub2API / New API 的只读额度接口，不发送生成请求或消耗模型 Token；启用后复用已保存的提供商凭据。',
-    builtIn: true,
-    defaultInstalled: false,
-    defaultEnabled: false,
-    configurable: true,
-    defaultConfig: DEFAULT_BALANCE_CONFIG,
+    defaultConfig: { metrics: DEFAULT_USAGE_METRICS, balance: DEFAULT_BALANCE_CONFIG },
   }),
   Object.freeze({
     id: 'chatgpt-plugin-catalog',
@@ -125,15 +110,17 @@ function normalizePluginId(value) {
   return /^[a-z0-9][a-z0-9._-]{0,63}$/i.test(id) ? id : '';
 }
 
-function normalizeUsageConfig(raw) {
+function normalizeUsageConfig(raw, options = {}) {
   const source = isPlainObject(raw) ? raw : {};
   const metrics = isPlainObject(source.metrics) ? source.metrics : {};
+  const balance = isPlainObject(source.balance) ? source.balance : DEFAULT_BALANCE_CONFIG;
   return {
     metrics: {
       speed: metrics.speed !== false,
       cache: metrics.cache !== false,
       context: metrics.context !== false,
     },
+    balance: { enabled: balance.enabled === true, ...normalizeBalanceConfig(balance, options) },
   };
 }
 
@@ -202,9 +189,8 @@ function normalizeBalanceConfig(raw, { validProviderIds, strict = false } = {}) 
 
 function normalizePluginConfig(definition, raw, options = {}) {
   if (definition.id === 'custom-imagegen') return normalizeImageConfig(raw);
-  if (definition.id === 'usage-statusline') return normalizeUsageConfig(raw);
+  if (definition.id === 'usage-statusline') return normalizeUsageConfig(raw, options);
   if (definition.id === 'voice-input') return normalizeVoiceConfig(raw);
-  if (definition.id === 'provider-balance') return normalizeBalanceConfig(raw, options);
   return isPlainObject(raw) ? deepCopy(raw) : {};
 }
 
@@ -277,6 +263,30 @@ function createPluginManager({ store, definitions = BUILTIN_PLUGIN_DEFINITIONS }
       defaultEnabled: raw.defaultEnabled !== false,
       configurable: raw.configurable === true,
       defaultConfig: raw.defaultConfig,
+    });
+  }
+
+  const usageDefinition = definitionMap.get('usage-statusline');
+  const legacyBalance = store.get()?.plugins?.['provider-balance'];
+  if (usageDefinition && isPlainObject(legacyBalance)) {
+    store.update((draft) => {
+      if (!isPlainObject(draft.plugins)) draft.plugins = {};
+      const usage = isPlainObject(draft.plugins['usage-statusline']) ? draft.plugins['usage-statusline'] : defaultPluginState(usageDefinition);
+      const usageConfig = isPlainObject(usage.config) ? usage.config : {};
+      const hasBalanceConfig = isPlainObject(usageConfig.balance);
+      const migrateActiveBalance = legacyBalance.installed === true && legacyBalance.enabled === true && (!hasBalanceConfig || usageConfig.balance.enabled === true);
+      if (!hasBalanceConfig) {
+        usage.config = { ...usageConfig, balance: {
+          ...(isPlainObject(legacyBalance.config) ? legacyBalance.config : {}),
+          enabled: migrateActiveBalance,
+        } };
+      }
+      draft.plugins['usage-statusline'] = {
+        installed: migrateActiveBalance || usage.installed !== false,
+        enabled: migrateActiveBalance || (usage.installed !== false && usage.enabled !== false),
+        config: normalizePluginConfig(usageDefinition, usage.config, { validProviderIds: store.providers().map((provider) => provider.id) }),
+      };
+      delete draft.plugins['provider-balance'];
     });
   }
 
@@ -378,8 +388,17 @@ function createPluginManager({ store, definitions = BUILTIN_PLUGIN_DEFINITIONS }
         }),
       }), 'configure');
     }
-    const config = normalizePluginConfig(def, rawConfig, {
-      strict: def.id === 'provider-balance',
+    const current = readState(def.id);
+    const source = def.id === 'usage-statusline'
+      ? {
+        ...current.config,
+        ...(isPlainObject(rawConfig) ? rawConfig : {}),
+        metrics: { ...current.config.metrics, ...(isPlainObject(rawConfig?.metrics) ? rawConfig.metrics : {}) },
+        balance: { ...current.config.balance, ...(isPlainObject(rawConfig?.balance) ? rawConfig.balance : {}) },
+      }
+      : rawConfig;
+    const config = normalizePluginConfig(def, source, {
+      strict: def.id === 'usage-statusline' && isPlainObject(rawConfig?.balance),
       validProviderIds: store.providers().map((provider) => provider.id),
     });
     return update(def.id, (current) => ({ ...current, config }), 'configure');

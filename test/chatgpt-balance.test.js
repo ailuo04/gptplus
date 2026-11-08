@@ -56,7 +56,7 @@ test('balance indicator script reads exact model prop and fails closed on unknow
   assert.match(script, /visualViewport/);
   assert.match(script, /#gptplus-balance-indicator\{[^}]*background:transparent/, 'indicator should be a hollow outline ring, not a filled circle');
   assert.match(script, /conic-gradient/, 'indicator should render a progress ring');
-  assert.match(script, /background:conic-gradient\(from -90deg,var\(--gpb-ring-color\) 0% var\(--gpb-progress\)/, 'the remaining percentage must map directly to arc length');
+  assert.match(script, /background:conic-gradient\(from 0deg,var\(--gpb-ring-color\) 0% var\(--gpb-progress\)/, 'remaining quota should start at 12 o’clock and progress clockwise');
   assert.doesNotMatch(script, /--gpb-turn/, 'a percentage progress value must not be multiplied into degrees incorrectly');
   assert.match(script, /--gpb-ring-color/, 'ring color should be driven by a shared threshold variable');
   assert.match(script, /pointerenter/, 'details should be hover-triggered rather than click-triggered');
@@ -304,15 +304,17 @@ test('balance details close on outside pointerdown and refresh without closing',
   assert.equal(result.installed, true);
   const ring = nodes.find((node) => node.id === 'gptplus-balance-indicator');
   const details = nodes.find((node) => node.id === 'gptplus-balance-indicator-details');
-  ring.listeners.click({ button: 0, preventDefault() {}, stopPropagation() {} });
+  assert.equal(ring.listeners.click, undefined, 'details should not be click-triggered');
+  assert.equal(details.dataset.open, 'false');
+  ring.listeners.pointerenter({ stopPropagation() {} });
   const refresh = details.children[details.children.length - 1];
   listeners.get('pointerdown')({ target: composer, preventDefault() {} });
   assert.equal(typeof listeners.get('pointerdown'), 'function', 'outside close listener should be installed');
-  ring.listeners.click({ button: 0, preventDefault() {}, stopPropagation() {} });
+  ring.listeners.pointerenter({ stopPropagation() {} });
   assert.equal(details.dataset.open, 'true');
   listeners.get('pointerdown')({ target: composer, preventDefault() {} });
   assert.equal(details.dataset.open, 'false');
-  ring.listeners.click({ button: 0, preventDefault() {}, stopPropagation() {} });
+  ring.listeners.pointerenter({ stopPropagation() {} });
   assert.equal(details.dataset.open, 'true');
   refresh.listeners.click({ button: 0, preventDefault() {}, stopPropagation() {} });
   assert.equal(details.dataset.open, 'true');
@@ -455,7 +457,7 @@ test('balance ring paints progress, threshold colors, and hover details with the
   await vm.runInNewContext(script, sandbox);
   const ring = nodes.find((node) => node.id === 'gptplus-balance-indicator');
   const details = nodes.find((node) => node.id === 'gptplus-balance-indicator-details');
-  sandbox.__gptplusBalance.apply({ providerId: 'p_a', currentProviderId: 'p_a', balance: '20', totalUsed: '80', currency: 'USD', unit: 'USD', totalUsedUnit: 'USD', at: 1000, ok: true, providerSnapshots: { p_a: { providerId: 'p_a', providerName: 'Alpha Relay', balance: '20', totalUsed: '80', currency: 'USD', unit: 'USD', totalUsedUnit: 'USD', at: 1000 } }, providerList: [{ providerId: 'p_a', name: 'Alpha Relay' }] });
+  sandbox.__gptplusBalance.apply({ providerId: 'p_a', currentProviderId: 'p_a', balance: '20', totalUsed: '80', currency: 'USD', unit: 'USD', totalUsedUnit: 'USD', at: 1000, ok: true, providerSnapshots: { p_a: { providerId: 'p_a', providerName: 'Alpha Relay', balance: '20', totalUsed: '80', currency: 'USD', unit: 'USD', totalUsedUnit: 'USD', at: 1000 }, p_b: { providerId: 'p_b', providerName: 'Beta Relay', balance: '999', currency: 'USD', unit: 'USD' } }, providerList: [{ providerId: 'p_a', name: 'Alpha Relay' }, { providerId: 'p_b', name: 'Beta Relay' }] });
   assert.equal(ring.dataset.level, 'normal');
   assert.equal(ring.style['--gpb-progress'], '20%');
   sandbox.__gptplusBalance.apply({ providerId: 'p_a', currentProviderId: 'p_a', balance: '19', totalUsed: '81', currency: 'USD', unit: 'USD', totalUsedUnit: 'USD', at: 1000, ok: true });
@@ -472,6 +474,7 @@ test('balance ring paints progress, threshold colors, and hover details with the
   assert.match(details.children.map(detailText).join(' '), /余额/);
   assert.match(details.children.map(detailText).join(' '), /消耗值/);
   assert.match(details.children.map(detailText).join(' '), /最近一次消耗量/);
+  assert.doesNotMatch(details.children.map(detailText).join(' '), /Beta Relay|999/);
   ring.listeners.pointerleave({ preventDefault() {}, stopPropagation() {} });
   assert.equal(details.dataset.open, 'false');
 });
@@ -764,7 +767,7 @@ test('balance page shows the last successful value while waiting for a new read'
   sandbox.__gptplusBalance.apply({ providerId: 'p_a', currentProviderId: 'p_a', ok: true, balance: '454.8', currency: 'USD', unit: 'USD', at: 2000 });
   assert.match(value.children.map((node) => node.textContent).join(''), /^\$45/);
   const ring = nodes.find((node) => node.id === 'gptplus-balance-indicator');
-  ring.listeners.click({ button: 0, preventDefault() {}, stopPropagation() {} });
+  ring.listeners.pointerenter({ stopPropagation() {} });
   const details = nodes.find((node) => node.id === 'gptplus-balance-indicator-details');
   const detailText = (node) => (node.textContent || '') + ' ' + (node.children || []).map(detailText).join(' ');
   assert.match(details.children.map(detailText).join(' '), /454\.8/);
@@ -836,7 +839,7 @@ test('chatgpt balance lifecycle injects, follows model switches, pushes only saf
   const config = { providers: [{ providerId: 'p_a', adapter: 'sub2api' }, { providerId: 'p_b', adapter: 'newapi' }], refreshIntervalSeconds: 60 };
   const ctx = {
     store: { get: () => ({ providers: [], chatgpt: {} }), providers: () => [{ id: 'p_a', name: 'Provider A' }, { id: 'p_b', name: 'Provider B' }] },
-    plugins: { isActive: (id) => id === 'provider-balance', config: () => config },
+    plugins: { isActive: (id) => id === 'usage-statusline', config: () => ({ balance: { ...config, enabled: true } }) },
     balanceRuntime: runtime,
     models: () => [
       { slug: 'a__m1', providerId: 'p_a', providerName: 'A', enabled: true },
@@ -868,7 +871,7 @@ test('chatgpt balance lifecycle injects, follows model switches, pushes only saf
   assert.ok(calls.some((call) => call[0] === 'refresh' && call[1] === 'p_b'));
   current = { modelSlug: 'b__m2', providerId: 'p_b', manualRefresh: 0, detailsOpen: true };
   await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.ok(calls.some((call) => call[0] === 'refresh' && call[1] === 'p_a' && call[2].reason === 'details'), 'opening details reads other mapped balances once');
+  assert.equal(calls.some((call) => call[0] === 'refresh' && call[2].reason === 'details'), false, 'opening details must not refresh other providers');
   assert.equal(JSON.stringify(pageState.value).includes('apiKey'), false);
   const port = result.cdpPort;
   const disposed = await disposeChatGptBalance({ cdpPort: port, target, evaluateImpl: async () => ({ ok: true }), removeScriptImpl: async () => ({}) });

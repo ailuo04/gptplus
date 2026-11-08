@@ -152,7 +152,7 @@ test('usage statusline script retains the composer placement, icons, and valid s
   assert.match(script, /__gptplusUsageStatusline/);
   assert.match(script, /READY_WAIT_MS = 2000/);
   assert.match(script, /SYNC_INTERVAL_MS = 1000/);
-  assert.match(script, /gptplus-usage-statusline-v8/);
+  assert.match(script, /gptplus-usage-statusline-v10/);
   assert.match(script, /request\.speed/);
   assert.match(script, /function apply\(id, events, request\)/);
   assert.match(script, /requestTime >= latestTime - 15000/);
@@ -160,6 +160,14 @@ test('usage statusline script retains the composer placement, icons, and valid s
   assert.match(script, /color:var\(--color-token-text-primary,#000\)!important/);
   assert.ok(script.includes('html[data-theme=\\"light\\"] #gptplus-codex-usage-statusline'));
   assert.match(script, /gptplus-usage-item svg\{flex:0 0 auto\}/);
+  assert.match(script, /gptplus-balance-delta[^}]*position:absolute/, 'temporary spend amount must not participate in statusline layout');
+  assert.match(script, /grid-template-columns:repeat\(3,minmax\(0,1fr\)\)/, 'disabled balance must not reserve an empty status slot');
+  assert.match(script, /applyBalance/, 'statusline should receive live balance snapshots');
+  const integrated = buildUsageStatuslineScript({ balance: { enabled: true } });
+  assert.match(integrated, /gptplus-balance-item/);
+  assert.match(integrated, /applyBalance/);
+  assert.match(integrated, /grid-template-columns:repeat\(4,minmax\(0,1fr\)\)/, 'integrated balance must occupy its own stable fourth slot');
+  assert.match(integrated, /position:absolute/);
   assert.doesNotMatch(script, /data-stale=.*gptplus-usage-item\{opacity:\.55\}/);
   assert.doesNotMatch(script, /fetch\(endpoint/);
 });
@@ -199,7 +207,7 @@ test('statusline launch starts the gateway first and shares one CDP injection pa
   assert.deepEqual(calls[2][1], {
     preferredPath: 'C:\\ChatGPT.exe', cdpPort: 9331, wrapperDir: 'C:\\gptplus\\cdp',
   });
-  assert.deepEqual(calls[3][1], { cdpPort: 9331 });
+  assert.deepEqual(calls[3][1], { cdpPort: 9331, balance: { enabled: false } });
 });
 
 test('statusline launch starts a data bridge when a live usage reader is available', async () => {
@@ -416,7 +424,7 @@ test('injected statusline renders one decimal immediately when usage is applied'
   class Node {
     constructor() { this.dataset = {}; this.children = []; this.attributes = {}; this.isConnected = true; nodes.push(this); }
     setAttribute(key, value) { this.attributes[key] = value; }
-    appendChild(node) { this.children.push(node); }
+    appendChild(node) { node.parentElement = this; this.children.push(node); }
     remove() { this.isConnected = false; }
   }
   const anchor = { insertAdjacentElement(_position, node) { node.isConnected = true; node.previousElementSibling = anchor; } };
@@ -437,7 +445,7 @@ test('injected statusline renders one decimal immediately when usage is applied'
     MutationObserver: class { observe() {} disconnect() {} },
     setTimeout: () => 1, clearTimeout: () => {},
   };
-  const script = buildUsageStatuslineScript();
+  const script = buildUsageStatuslineScript({ balance: { enabled: true } });
   assert.equal((await vm.runInNewContext(script, sandbox)).installed, true);
   const api = sandbox.__gptplusUsageStatusline;
   api.apply('thread_render_1234', [], { at: Date.now(), speed: 42.36, speedAvailable: true });
@@ -448,6 +456,13 @@ test('injected statusline renders one decimal immediately when usage is applied'
   assert.equal(speedValue.textContent, '42.0 tok/s');
   api.apply('thread_render_1234', [], { at: Date.now(), speed: null, speedAvailable: false });
   assert.equal(speedValue.textContent, '-- tok/s');
+  assert.equal(api.applyBalance({ providerId: 'p_a', balance: '443.48', totalUsed: '79.07', delta: '0.12349', deltaKind: 'cumulative', currency: 'USD', at: Date.now(), ok: true }), true);
+  const balanceItem = status.children.find((node) => node.dataset.usage === 'balance');
+  api.context();
+  assert.ok(balanceItem, 'balance occupies the fourth status item');
+  assert.equal(balanceItem.children[1].textContent, '443.48', 'the dollar symbol is only shown in the icon');
+  assert.equal(balanceItem.children[2].textContent, '-0.123', 'spend amount is rounded to three decimals');
+  assert.equal(balanceItem.children[2].dataset.hidden, 'false');
   assert.equal((await vm.runInNewContext(script, sandbox)).reused, true);
   sandbox.__gptplusUsageStatuslineDispose();
 });

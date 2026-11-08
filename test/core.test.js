@@ -251,11 +251,13 @@ test('plugin manager: 内置插件可安装、启停、配置和卸载，并保�
 
   const manager = createPluginManager({ store });
   const initial = manager.list();
-  assert.deepEqual(initial.map((plugin) => plugin.id), ['custom-imagegen', 'weixin', 'usage-statusline', 'provider-balance', 'chatgpt-plugin-catalog', 'voice-input']);
-  assert.ok(initial.filter((plugin) => !['chatgpt-plugin-catalog', 'custom-imagegen', 'provider-balance'].includes(plugin.id)).every((plugin) => plugin.installed && plugin.enabled));
+  assert.deepEqual(initial.map((plugin) => plugin.id), ['custom-imagegen', 'weixin', 'usage-statusline', 'chatgpt-plugin-catalog', 'voice-input']);
+  assert.ok(initial.filter((plugin) => !['chatgpt-plugin-catalog', 'custom-imagegen'].includes(plugin.id)).every((plugin) => plugin.installed && plugin.enabled));
   assert.equal(manager.get('chatgpt-plugin-catalog').installed, false, '目录修复需要用户明确安装并启用');
   assert.equal(manager.get('chatgpt-plugin-catalog').enabled, false);
   assert.deepEqual(manager.get('usage-statusline').config.metrics, { speed: true, cache: true, context: true });
+  assert.deepEqual(manager.get('usage-statusline').config.balance, { enabled: false, providers: [], refreshIntervalSeconds: 60 });
+  assert.equal(initial.some((plugin) => plugin.id === 'provider-balance'), false, 'balance is configured through the usage statusline, not a separate plugin');
   assert.deepEqual(manager.get('voice-input').config, { engine: 'local', providerId: '', model: 'whisper-1', language: '', spaceHoldMs: 1000 });
 
   manager.setEnabled('weixin', false);
@@ -276,51 +278,76 @@ test('plugin manager: 内置插件可安装、启停、配置和卸载，并保�
   assert.deepEqual(reloaded.config('usage-statusline').metrics, { speed: false, cache: true, context: false });
 });
 
-test('provider balance plugin config: 只保存已知 providerId、adapter 和刷新间隔', (t) => {
-  const dir = tmpDir('provider-balance-plugin');
+test('integrated balance config migrates legacy plugin settings and validates mappings', (t) => {
+  const dir = tmpDir('integrated-balance-config');
   cleanup(t, dir);
   const store = createStore({ configPath: path.join(dir, 'config.json') });
   store.upsertProvider({ id: 'p_demo0001', name: 'Sub2API', baseUrl: 'https://one.example/v1', apiKey: 'sk-private-one', headers: { 'X-Secret': 'header-secret' }, models: [{ id: 'model-a' }] });
-  store.upsertProvider({ id: 'p_demo0002', name: 'New API', baseUrl: 'https://two.example/v1', apiKey: 'sk-private-two', models: [{ id: 'model-b' }] });
-
+  store.update((draft) => {
+    draft.plugins['usage-statusline'] = { installed: true, enabled: true, config: { metrics: { speed: false } } };
+    draft.plugins['provider-balance'] = { installed: true, enabled: true, config: { providers: [{ providerId: 'p_demo0001', adapter: 'sub2api' }], refreshIntervalSeconds: 90 } };
+  });
   const manager = createPluginManager({ store });
-  const initial = manager.get('provider-balance');
-  assert.equal(initial.installed, false);
-  assert.equal(initial.enabled, false);
-  assert.deepEqual(initial.config, { providers: [], refreshIntervalSeconds: 60 });
-
-  manager.setConfig('provider-balance', {
-    providers: [
-      { providerId: 'p_demo0001', adapter: 'sub2api' },
-      { providerId: 'p_demo0002', adapter: 'newapi' },
-      { providerId: 'p_unknown', adapter: 'newapi' },
-      { providerId: 'p_demo0001', adapter: 'newapi' },
-    ],
-    refreshIntervalSeconds: 60,
+  assert.equal(manager.list().some((plugin) => plugin.id === 'provider-balance'), false);
+  assert.deepEqual(manager.config('usage-statusline'), {
+    metrics: { speed: false, cache: true, context: true },
+    balance: { enabled: true, providers: [{ providerId: 'p_demo0001', adapter: 'sub2api' }], refreshIntervalSeconds: 90 },
   });
-  assert.deepEqual(manager.config('provider-balance'), {
-    providers: [
-      { providerId: 'p_demo0001', adapter: 'sub2api' },
-      { providerId: 'p_demo0002', adapter: 'newapi' },
-    ],
-    refreshIntervalSeconds: 60,
-  });
-  assert.throws(() => manager.setConfig('provider-balance', {
-    providers: [{ providerId: 'p_demo0001', adapter: 'guess' }], refreshIntervalSeconds: 60,
-  }), /adapter/);
-  assert.throws(() => manager.setConfig('provider-balance', {
-    providers: [], refreshIntervalSeconds: 9,
-  }), /刷新间隔/);
-
-  for (const seconds of [10, 86400]) {
-    manager.setConfig('provider-balance', { providers: [], refreshIntervalSeconds: seconds });
-    assert.equal(manager.config('provider-balance').refreshIntervalSeconds, seconds);
-  }
-  const exposed = JSON.stringify(manager.get('provider-balance'));
+  assert.equal(store.get().plugins['provider-balance'], undefined, 'legacy plugin state is migrated away');
+  assert.throws(() => manager.setConfig('usage-statusline', { balance: { enabled: true, providers: [{ providerId: 'p_demo0001', adapter: 'guess' }], refreshIntervalSeconds: 60 } }), /adapter/);
+  assert.throws(() => manager.setConfig('usage-statusline', { balance: { enabled: true, providers: [], refreshIntervalSeconds: 9 } }), /刷新间隔/);
+  const exposed = JSON.stringify(manager.get('usage-statusline'));
   assert.equal(exposed.includes('sk-private'), false);
   assert.equal(exposed.includes('header-secret'), false);
   assert.equal(exposed.includes('apiKey'), false);
 });
+
+test('active legacy balance migration enables the usage statusline carrier', (t) => {
+  const dir = tmpDir('legacy-balance-enables-statusline');
+  cleanup(t, dir);
+  const store = createStore({ configPath: path.join(dir, 'config.json') });
+  store.update((draft) => {
+    draft.plugins['usage-statusline'] = {
+      installed: false,
+      enabled: false,
+      config: { metrics: { speed: false, cache: true, context: false } },
+    };
+    draft.plugins['provider-balance'] = {
+      installed: true,
+      enabled: true,
+      config: { providers: [], refreshIntervalSeconds: 60 },
+    };
+  });
+
+  const manager = createPluginManager({ store });
+
+  assert.equal(manager.isInstalled('usage-statusline'), true, 'the active legacy feature needs its new host plugin installed');
+  assert.equal(manager.isActive('usage-statusline'), true, 'the active legacy feature needs its new host plugin enabled');
+  assert.deepEqual(manager.config('usage-statusline').metrics, { speed: false, cache: true, context: false }, 'existing metric choices must be preserved');
+  assert.equal(manager.config('usage-statusline').balance.enabled, true);
+});
+
+test('active legacy balance honors existing enabled config when enabling its carrier', (t) => {
+  const dir = tmpDir('legacy-balance-existing-enabled-config');
+  cleanup(t, dir);
+  const store = createStore({ configPath: path.join(dir, 'config.json') });
+  store.update((draft) => {
+    draft.plugins['usage-statusline'] = {
+      installed: false,
+      enabled: false,
+      config: { metrics: { speed: false }, balance: { enabled: true } },
+    };
+    draft.plugins['provider-balance'] = { installed: true, enabled: true, config: {} };
+  });
+
+  const manager = createPluginManager({ store });
+
+  assert.equal(manager.isInstalled('usage-statusline'), true);
+  assert.equal(manager.isActive('usage-statusline'), true);
+  assert.equal(manager.config('usage-statusline').balance.enabled, true);
+  assert.equal(manager.config('usage-statusline').metrics.speed, false);
+});
+
 test('ipc: 中转站余额刷新通道只注册一次', (t) => {
   const { registerIpc } = require(path.join(CORE, 'ipc.js'));
   const dir = tmpDir('ipc-balance-handler');
@@ -2942,11 +2969,11 @@ test('context: 余额运行时接入插件配置、事件桥接和启停生命�
     `  const ctx = await createContext({});`,
     `  const providerId = 'p_balance01';`,
     `  ctx.store.upsertProvider({ id: providerId, name: 'Balance Test', baseUrl: 'https://balance.example/v1', apiKey: 'test-key', models: [{ id: 'm1' }] });`,
-    `  ctx.plugins.install('provider-balance');`,
-    `  ctx.plugins.setConfig('provider-balance', { providers: [{ providerId, adapter: 'sub2api' }], refreshIntervalSeconds: 60 });`,
-    `  ctx.plugins.setEnabled('provider-balance', true);`,
+    `  ctx.plugins.setConfig('usage-statusline', { balance: { enabled: true, providers: [{ providerId, adapter: 'sub2api' }], refreshIntervalSeconds: 60 } });`,
+    `  `,
+    `  `,
     `  const selectedProvider = ctx.balanceRuntime?.setCurrentProvider(providerId) || '';`,
-    `  ctx.plugins.setEnabled('provider-balance', false);`,
+    `  ctx.plugins.setConfig('usage-statusline', { balance: { enabled: false, providers: [{ providerId, adapter: 'sub2api' }], refreshIntervalSeconds: 60 } });`,
     `  const stopped = ctx.balanceRuntime ? await ctx.balanceRuntime.refresh(providerId) : null;`,
     `  process.stdout.write(JSON.stringify({ hasRuntime: !!ctx.balanceRuntime, hasEventBridge: typeof ctx.onBalanceEvent === 'function', selectedProvider, disabledCode: stopped?.code || null }));`,
     `  ctx.balanceRuntime?.stop();`,

@@ -52,7 +52,7 @@ function setup(options = {}) {
       ...(options.activePlugins ? {
         gateway: {},
         paths: { APP_DIR: 'C:\\gptplus' },
-        plugins: { isActive: (id) => options.activePlugins.includes(id) },
+        plugins: { isActive: (id) => options.activePlugins.includes(id), config: () => ({ balance: { enabled: options.balanceEnabled === true } }) },
       } : {}),
     },
     launchChatGptAndVerify: async (launchOptions) => {
@@ -112,15 +112,14 @@ test('login launch restarts ChatGPT with CDP when the usage statusline is active
   }]);
 });
 
-test('login launch uses CDP when only provider balance is active', async () => {
-  const { api, calls } = setup({ activePlugins: ['provider-balance'] });
+test('quota configuration relies on the usage statusline launch path', async () => {
+  const { api, calls } = setup({ activePlugins: ['usage-statusline'], balanceEnabled: true });
   await api.launch();
-  assert.equal(calls[0].type, 'balance-launch');
-  assert.deepEqual(calls[1], { type: 'launch', preferredPath: null, cdpPort: 9229 });
+  assert.equal(calls[0].type, 'relaunch');
 });
 
-test('login launch injects balance beside the usage statusline without changing its CDP port', async () => {
-  const { api, calls } = setup({ activePlugins: ['usage-statusline', 'provider-balance'] });
+test('login launch attaches the hidden balance bridge to the integrated statusline', async () => {
+  const { api, calls } = setup({ activePlugins: ['usage-statusline'], balanceEnabled: true });
   await api.launch();
   assert.deepEqual(calls[0], { type: 'relaunch', preferredPath: null, cdpPort: 9229, wrapperDir: String.raw`C:\gptplus\cdp` });
   assert.deepEqual(calls[1], { type: 'balance-inject', cdpPort: 9229 });

@@ -66,11 +66,12 @@ async function createContext(opts = {}) {
   const usageLive = createUsageLiveReader({ codexHome: paths.CODEX_HOME });
   const plugins = createPluginManager({ store });
   const syncBalanceRuntime = () => {
-    if (plugins.isActive('provider-balance')) balanceRuntime.configure(plugins.config('provider-balance'));
+    const config = plugins.config('usage-statusline')?.balance;
+    if (plugins.isActive('usage-statusline') && config?.enabled === true) balanceRuntime.configure(config);
     else balanceRuntime.stop();
   };
   syncBalanceRuntime();
-  plugins.onChange((event) => { if (event?.plugin?.id === 'provider-balance') syncBalanceRuntime(); });
+  plugins.onChange((event) => { if (event?.plugin?.id === 'usage-statusline') syncBalanceRuntime(); });
   const imageGeneration = createImageGeneration({ plugins, fetchImpl: network });
   const chatgptPluginRecovery = createChatGptPluginRecovery({
     codexHome: paths.CODEX_HOME, configPath: paths.CODEX_CONFIG_PATH, appDir: paths.APP_DIR, backup: codex.backup,

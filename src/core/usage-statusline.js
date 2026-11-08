@@ -2,7 +2,7 @@
 
 const { buildUsageStatuslineStyle, computeUsageSnapshot, formatTokenRate, mergeUsageCacheEntry } = require('./usage-metrics.js');
 
-function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
+function buildUsageStatuslineScript({ readyWaitMs, metrics, balance } = {}) {
   const readyWait = Math.max(500, Number(readyWaitMs) || 12000);
   const selectedMetrics = {
     speed: metrics?.speed !== false,
@@ -10,16 +10,19 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
     context: metrics?.context !== false,
   };
   const metricsJson = JSON.stringify(selectedMetrics);
+  const balanceJson = JSON.stringify({ enabled: balance?.enabled === true });
+  const columnCount = Object.values(selectedMetrics).filter(Boolean).length + (balance?.enabled === true ? 1 : 0);
   return `(() => {
   const READY_WAIT_MS = ${readyWait};
   const METRICS = ${metricsJson};
+  const BALANCE = ${balanceJson};
   const ID = "gptplus-codex-usage-statusline";
   const STYLE_ID = "gptplus-codex-usage-statusline-style";
   const EXT_ATTR = "data-gptplus-usage-statusline";
   const CIRCUMFERENCE = 37.7;
   const SYNC_INTERVAL_MS = 1000;
-  const runtimeKey = "gptplus-usage-statusline-v8";
-  const STYLE_TEXT = ${JSON.stringify(buildUsageStatuslineStyle())};
+  const runtimeKey = "gptplus-usage-statusline-v10";
+  const STYLE_TEXT = ${JSON.stringify(buildUsageStatuslineStyle(columnCount))};
   const computeUsageSnapshot = ${computeUsageSnapshot.toString()};
   const formatTokenRate = ${formatTokenRate.toString()};
   const mergeUsageCacheEntry = ${mergeUsageCacheEntry.toString()};
@@ -28,7 +31,7 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
   }
   globalThis.__gptplusUsageStatuslineDispose?.();
   globalThis.__gptplusUsageStatuslineRuntime = runtimeKey;
-  const state = { node: null, parts: null, threadId: "", timer: 0, observer: null, cache: new Map(), fingerprint: "", disposed: false };
+  const state = { node: null, parts: null, threadId: "", timer: 0, observer: null, cache: new Map(), fingerprint: "", balanceSnapshot: null, balanceTimer: 0, disposed: false };
   const NS = "http://www.w3.org/2000/svg";
 
   function visible(node) {
@@ -107,8 +110,78 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
       parts.context = makeItem(node, "context", ring.svg);
       parts.ring = ring.ring;
     }
+    if (BALANCE.enabled) {
+      const item = document.createElement("span");
+      item.className = "gptplus-usage-item gptplus-balance-item";
+      item.dataset.usage = "balance";
+      const coin = document.createElement("span");
+      coin.className = "gptplus-balance-coin";
+      coin.textContent = "$";
+      item.appendChild(coin);
+      parts.balance = document.createElement("span");
+      parts.balance.className = "gptplus-balance-amount";
+      parts.balance.textContent = "--";
+      item.appendChild(parts.balance);
+      parts.delta = document.createElement("span");
+      parts.delta.className = "gptplus-balance-delta";
+      parts.delta.dataset.hidden = "true";
+      item.appendChild(parts.delta);
+      node.appendChild(item);
+    }
     state.parts = parts;
+    if (state.balanceSnapshot) paintBalance(state.balanceSnapshot, false);
     return state.parts;
+  }
+
+  function groupDigits(value) {
+    let output = "";
+    const text = String(value);
+    for (let index = 0; index < text.length; index += 1) {
+      if (index > 0 && (text.length - index) % 3 === 0) output += ",";
+      output += text[index];
+    }
+    return output;
+  }
+
+  function formatBalanceAmount(value) {
+    const text = String(value == null ? "" : value).trim();
+    if (!/^-?(?:0|[1-9][0-9]*)(?:[.][0-9]+)?$/.test(text)) return "--";
+    const [whole, fraction = ""] = text.split(".");
+    return groupDigits(whole) + (fraction ? "." + fraction.slice(0, 2).replace(/0+$/, "") : "");
+  }
+
+  function formatBalanceDelta(value) {
+    const match = String(value == null ? "" : value).trim().match(/^-?(0|[1-9][0-9]*)(?:[.]([0-9]+))?$/);
+    if (!match) return "";
+    const fraction = match[2] || "";
+    let digits = BigInt(match[1] + fraction.slice(0, 3).padEnd(3, "0"));
+    if ((fraction[3] || "0") >= "5") digits += 1n;
+    return "-" + groupDigits(digits / 1000n) + "." + String(digits % 1000n).padStart(3, "0");
+  }
+
+  function paintBalance(snapshot, showDelta) {
+    const parts = state.parts;
+    if (!parts?.balance) return;
+    const amount = snapshot?.unlimited === true ? "不限额" : formatBalanceAmount(snapshot?.balance);
+    parts.balance.textContent = snapshot?.ok === false ? "!" : amount;
+    const details = ["余额 " + amount];
+    if (snapshot?.totalUsed != null) details.push("消耗值 " + formatBalanceAmount(snapshot.totalUsed));
+    if (snapshot?.error) details.push(snapshot.error);
+    if (snapshot?.delta != null) details.push("最近消耗 " + formatBalanceDelta(snapshot.delta));
+    if (snapshot?.at) details.push("更新于 " + new Date(snapshot.at).toLocaleTimeString());
+    parts.balance.parentElement.title = details.join(" · ");
+    const delta = snapshot?.ok !== false && ["cumulative", "net-balance-change"].includes(snapshot?.deltaKind) ? formatBalanceDelta(snapshot.delta) : "";
+    parts.delta.textContent = delta;
+    parts.delta.dataset.hidden = String(!showDelta || !delta);
+    clearTimeout(state.balanceTimer);
+    if (showDelta && delta) state.balanceTimer = setTimeout(() => { if (parts.delta) parts.delta.dataset.hidden = "true"; }, 2000);
+  }
+
+  function applyBalance(snapshot) {
+    if (state.disposed || !snapshot || typeof snapshot !== "object") return false;
+    state.balanceSnapshot = { ...snapshot };
+    if (state.parts?.balance) paintBalance(state.balanceSnapshot, snapshot.ok !== false);
+    return true;
   }
 
   function composerCard() {
@@ -247,7 +320,7 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
     state.observer.observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ["data-above-composer-conversation-id", "data-composer-placement", "data-app-action-sidebar-thread-selected", "data-app-action-sidebar-thread-id"] });
     sync();
     state.timer = setTimeout(tick, 2000);
-    globalThis.__gptplusUsageStatusline = { context, apply };
+    globalThis.__gptplusUsageStatusline = { context, apply, applyBalance };
     globalThis.__gptplusUsageStatuslineReady = true;
     globalThis.__gptplusUsageStatuslineDispose = () => {
       state.disposed = true;
@@ -255,6 +328,7 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics } = {}) {
       if (globalThis.__gptplusUsageStatuslineRuntime === runtimeKey) globalThis.__gptplusUsageStatuslineRuntime = "";
       delete globalThis.__gptplusUsageStatusline;
       clearTimeout(state.timer);
+      clearTimeout(state.balanceTimer);
       state.observer?.disconnect();
       state.node?.remove();
       document.getElementById(STYLE_ID)?.remove();

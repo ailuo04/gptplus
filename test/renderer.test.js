@@ -1774,7 +1774,7 @@ test('主页最近请求把英文思考强度放在独立列，旧记录不伪�
     assert.equal(rows.length, 3, '三条最近请求都应渲染请求行');
     assert.deepEqual(
       rows[0].children.map((child) => String(child.className || '').split(/\s+/)[0]),
-      ['home-recent-time', 'home-recent-main', 'home-recent-effort', 'home-recent-ms', 'chip'],
+      ['home-recent-time', 'home-recent-main', 'home-recent-effort', 'home-recent-ms', 'home-recent-status'],
       '思考强度必须位于模型与耗时之间，耗时列不能错位',
     );
 
@@ -1792,6 +1792,54 @@ test('主页最近请求把英文思考强度放在独立列，旧记录不伪�
 
     const providers = findNodes(root, (n) => String(n.className || '').split(/\s+/).includes('home-recent-provider'));
     assert.deepEqual(providers.map((n) => n.textContent), ['梦幻API', '梦幻API', '梦幻API'], '渠道行不再混入思考强度');
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('主页最近请求悬停状态码显示中文结果与可能原因', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const homeMod = await import(pathToFileURL(path.join(tmp, 'views', 'home.js')).href);
+    installFakeDom();
+    const now = Date.now();
+    const base = { providerId: 'p_demo0001', providerName: '梦幻API', model: 'a__m', ms: 120, final: true };
+    const state = fixtureState({
+      logs: [
+        { ...base, at: now, status: 200 },
+        { ...base, at: now - 1, status: 401 },
+        { ...base, at: now - 2, status: 429 },
+        { ...base, at: now - 3, status: 502 },
+        { ...base, at: now - 4, status: 500 },
+      ],
+    });
+    const root = new FakeNode('main');
+    homeMod.renderHome(root, makeCtx(appMod, state), new FakeNode('div'));
+
+    const statuses = findNodes(root, (node) => String(node.className || '').split(/\s+/).includes('home-recent-status'));
+    assert.equal(statuses.length, 5, '每条状态都应能悬停查看说明');
+    const tips = statuses.map((status) => findNodes(status, (node) => String(node.className || '').split(/\s+/).includes('home-recent-status-tip'))[0]);
+    assert.deepEqual(tips.map((tip) => tip.textContent), [
+      '请求正常HTTP 200上游已成功响应。',
+      '身份验证失败HTTP 401可能是 API Key 无效或过期，请检查渠道密钥。',
+      '请求触发限制HTTP 429可能触发限流或额度不足，请稍后重试。',
+      '上游服务异常HTTP 502可能是上游不可用或接口地址异常，请检查服务状态。',
+      '上游服务异常HTTP 500上游服务内部出错，建议稍后重试或检查服务状态。',
+    ]);
+    for (const [index, status] of statuses.entries()) {
+      const tipId = status.getAttribute('aria-describedby');
+      assert.ok(tipId, '状态项应关联其说明，支持键盘与读屏器');
+      assert.equal(status.getAttribute('tabindex'), '0', '状态项应可通过键盘聚焦');
+      assert.equal(tips[index].getAttribute('id'), tipId);
+      assert.equal(tips[index].getAttribute('role'), 'tooltip');
+    }
+
+    const css = read(CSS);
+    assert.match(css, /\.home-recent-status-tip\s*\{[^}]*bottom:\s*calc\(100%\s*\+\s*7px\)/s, '说明应从状态码上方向上弹出');
   } finally {
     delete globalThis.document;
     delete globalThis.window;
@@ -3925,8 +3973,8 @@ test('中转站余额配置：按已有提供商选择适配器并校验刷新�
     const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
     const pluginsMod = await import(pathToFileURL(path.join(tmp, 'views', 'plugins.js')).href);
     installFakeDom();
-    const plugin = { id: 'provider-balance', name: '中转站余额', icon: 'activity', installed: true, enabled: false,
-      config: { providers: [{ providerId: 'p_demo0001', adapter: 'sub2api' }], refreshIntervalSeconds: 60 } };
+    const plugin = { id: 'usage-statusline', name: 'ChatGPT 用量信息栏', icon: 'activity', installed: true, enabled: true,
+      config: { metrics: { speed: true, cache: true, context: true }, balance: { enabled: true, providers: [{ providerId: 'p_demo0001', adapter: 'sub2api' }], refreshIntervalSeconds: 60 } } };
     const state = fixtureState({ view: 'plugins', plugins: [plugin] });
     const calls = [];
     const ctx = makeCtx(appMod, state, calls);
@@ -3939,7 +3987,9 @@ test('中转站余额配置：按已有提供商选择适配器并校验刷新�
     const root = new FakeNode('main');
     pluginsMod.renderPlugins(root, ctx, new FakeNode('div'));
     root.findTag('button').find((node) => node.textContent.includes('配置')).listeners.click[0]();
-    const modal = calls.find((call) => call[0] === 'openModal')[1];
+    const usageModal = calls.find((call) => call[0] === 'openModal')[1];
+    usageModal.findTag('button').find((node) => node.textContent.includes('配置额度来源')).listeners.click[0]();
+    const modal = calls.filter((call) => call[0] === 'openModal').at(-1)[1];
     assert.match(modal.allText(), /只读取固定额度接口/);
     assert.equal(modal.findTag('select').length, 3);
     const inputs = modal.findTag('input');
@@ -3959,7 +4009,8 @@ test('中转站余额配置：按已有提供商选择适配器并校验刷新�
     modal.findTag('button').find((button) => button.textContent.includes('保存配置')).listeners.click[0]();
     await new Promise((resolve) => setImmediate(resolve));
     const saved = calls.find((call) => call[0] === 'setPluginConfig')[1].config;
-    assert.deepEqual(saved, {
+    assert.deepEqual(saved.balance, {
+      enabled: true,
       providers: [
         { providerId: 'p_demo0001', adapter: 'sub2api' },
         { providerId: 'p_demo0002', adapter: 'newapi' },

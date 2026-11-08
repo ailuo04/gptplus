@@ -30,10 +30,10 @@ function sleep(ms) {
   });
 }
 
-function buildScriptSources(metrics) {
+function buildScriptSources(metrics, balance) {
   return {
-    add: buildUsageStatuslineScript({ readyWaitMs: SCRIPT_READY_WAIT_MS, metrics }),
-    probe: buildUsageStatuslineScript({ readyWaitMs: PROBE_READY_WAIT_MS, metrics }),
+    add: buildUsageStatuslineScript({ readyWaitMs: SCRIPT_READY_WAIT_MS, metrics, balance }),
+    probe: buildUsageStatuslineScript({ readyWaitMs: PROBE_READY_WAIT_MS, metrics, balance }),
   };
 }
 
@@ -71,7 +71,7 @@ async function injectUsageStatusline({
   const port = Number(cdpPort);
   if (!Number.isInteger(port) || port <= 0) throw new Error('ChatGPT 调试端口无效');
 
-  const scripts = buildScriptSources(metrics);
+  const scripts = buildScriptSources(metrics, balance);
   const prepared = new Set();
   const deadline = Date.now() + Math.max(1000, Number(timeoutMs) || DEFAULT_INJECT_TIMEOUT_MS);
   let lastError = null;
@@ -150,6 +150,11 @@ function usageMetrics(ctx) {
  * 页面自身受 CSP connect-src 限制，不能直接访问 127.0.0.1；
  * 用量由 gpt++ 读取后通过 CDP 推送，顺便负责页面重载后的重新注入。
  */
+function usageBalance(ctx) {
+  const balance = ctx?.plugins?.config?.("usage-statusline")?.balance;
+  return balance?.enabled === true ? { enabled: true } : { enabled: false };
+}
+
 function startUsageStatuslineBridge({
   cdpPort,
   read,
@@ -157,6 +162,7 @@ function startUsageStatuslineBridge({
   subscribe,
   log,
   metrics,
+  balance,
   visibleIntervalMs = VISIBLE_INTERVAL_MS,
   hiddenIntervalMs = HIDDEN_INTERVAL_MS,
   listTargetsImpl = listTargets,
@@ -167,7 +173,7 @@ function startUsageStatuslineBridge({
   if (typeof read !== 'function') throw new Error('本机会话用量读取器不可用');
 
   stopUsageStatuslineBridge();
-  const scripts = buildScriptSources(metrics);
+  const scripts = buildScriptSources(metrics, balance);
   const prepared = new Set();
   let stopped = false;
   let target = null;
@@ -336,7 +342,7 @@ async function resumeUsageStatusline({
 
   try {
     const metrics = usageMetrics(ctx);
-    const result = await inject({ cdpPort: port, target, timeoutMs, ...(metrics ? { metrics } : {}) });
+    const result = await inject({ cdpPort: port, target, timeoutMs, ...(metrics ? { metrics } : {}), balance: usageBalance(ctx) });
     if (result?.installed !== true) throw new Error('页面状态栏未安装');
     let bridge = null;
     if (typeof ctx?.usageLive?.read === 'function' && typeof startBridge === 'function') {
@@ -348,6 +354,7 @@ async function resumeUsageStatusline({
         ...(typeof ctx.gateway?.on === 'function' ? { subscribe: (cb) => ctx.gateway.on('log', cb) } : {}),
         log: ctx.log,
         ...(metrics ? { metrics } : {}),
+        balance: usageBalance(ctx),
       });
     }
     ctx?.log?.({ level: 'info', msg: `已恢复 ChatGPT 输入框用量状态栏（调试端口 ${port}）` });
@@ -384,7 +391,7 @@ async function launchChatGptWithUsageStatusline({
 
   try {
     const metrics = usageMetrics(ctx);
-    await inject({ cdpPort, ...(metrics ? { metrics } : {}) });
+    await inject({ cdpPort, ...(metrics ? { metrics } : {}), balance: usageBalance(ctx) });
     ctx.log?.({ level: 'info', msg: '已将用量状态栏注入 ChatGPT 输入框下方' });
     let bridge = null;
     if (typeof ctx?.usageLive?.read === 'function' && typeof startBridge === 'function') {
@@ -396,6 +403,7 @@ async function launchChatGptWithUsageStatusline({
         ...(typeof ctx.gateway?.on === 'function' ? { subscribe: (cb) => ctx.gateway.on('log', cb) } : {}),
         log: ctx.log,
         ...(metrics ? { metrics } : {}),
+        balance: usageBalance(ctx),
       });
     }
     return { ...launched, injected: true, cdpPort, bridge: !!bridge };
