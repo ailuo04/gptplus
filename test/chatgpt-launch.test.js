@@ -3,6 +3,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const {
   launchChatGpt,
   launchChatGptAndVerify,
@@ -111,6 +114,37 @@ test('已解析出应用入口时不再重复查询包信息', async () => {
   assert.equal(result.ok, true);
   assert.equal(result.appId, 'OpenAI.Codex_pub!App');
   assert.equal(calls[0].command, 'explorer.exe');
+});
+
+test('MSIX CDP 启动通过包内 cmd 代理传入参数且脚本使用有效的 /c 引号', async (t) => {
+  const calls = [];
+  const wrapperDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gptplus-cdp-launch-'));
+  t.after(() => fs.rmSync(wrapperDir, { recursive: true, force: true }));
+  const result = await launchChatGpt({
+    resolveExe: async () => 'C:\\Program Files\\WindowsApps\\OpenAI.Codex_1.0.0.0_x64__pub\\app\\ChatGPT.exe',
+    resolveAppId: async () => 'OpenAI.Codex_pub!App',
+    cdpPort: 9345,
+    wrapperDir,
+    spawnImpl: (command, args) => {
+      calls.push({ command, args });
+      const child = new EventEmitter();
+      process.nextTick(() => child.emit('close', 0));
+      return child;
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].command, 'powershell.exe');
+  assert.match(calls[0].args[3], /-Command 'cmd\.exe' -Args '\/d \/c ""[^"]*chatgpt-9345\.cmd""'/);
+  assert.doesNotMatch(calls[0].args[3], /\\"/);
+  assert.equal(fs.readFileSync(path.join(wrapperDir, 'chatgpt-9345.cmd'), 'utf8'), [
+    '@echo off',
+    'setlocal',
+    'start "" /b "C:\\Program Files\\WindowsApps\\OpenAI.Codex_1.0.0.0_x64__pub\\app\\ChatGPT.exe" --remote-debugging-port=9345 --remote-allow-origins=http://127.0.0.1:9345',
+    'endlocal',
+    '',
+  ].join('\r\n'));
 });
 
 test('重启前先确认应用入口；解析失败时不会先杀掉 ChatGPT', async () => {

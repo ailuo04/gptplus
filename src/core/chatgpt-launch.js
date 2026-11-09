@@ -47,7 +47,7 @@ function packageCdpCommand(appId, wrapperPath) {
   const wrapper = powershellLiteral(wrapperPath);
   return [
     "$ErrorActionPreference = 'Stop'",
-    `$created = Invoke-CommandInDesktopPackage -PackageFamilyName '${powershellLiteral(family)}' -AppId '${powershellLiteral(application)}' -Command 'cmd.exe' -Args '/d /c \"${wrapper}\"' -PreventBreakaway`,
+    `$created = Invoke-CommandInDesktopPackage -PackageFamilyName '${powershellLiteral(family)}' -AppId '${powershellLiteral(application)}' -Command 'cmd.exe' -Args '/d /c ""${wrapper}""' -PreventBreakaway`,
     'if ($created -and $created.Id) { Write-Output ("PID=" + $created.Id) }',
   ].join('; ');
 }

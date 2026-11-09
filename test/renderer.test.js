@@ -32,7 +32,7 @@ const HTML = path.join(RENDERER, 'index.html');
 const CSS = path.join(RENDERER, 'styles.css');
 
 const VIEW_FILES = ['home.js', 'providers.js', 'models.js', 'usage.js', 'plugins.js', 'settings.js', 'weixin.js'];
-const JS_FILES = ['app.js', ...VIEW_FILES.map((f) => path.join('views', f))];
+const JS_FILES = ['app.js', 'request-status.js', ...VIEW_FILES.map((f) => path.join('views', f))];
 
 function read(file) {
   // Windows 上 core.autocrlf=true 会把工作区里的部分文件换成 CRLF，而下面按 '\n'
@@ -1839,7 +1839,8 @@ test('主页最近请求悬停状态码显示中文结果与可能原因', async
     }
 
     const css = read(CSS);
-    assert.match(css, /\.home-recent-status-tip\s*\{[^}]*bottom:\s*calc\(100%\s*\+\s*7px\)/s, '说明应从状态码上方向上弹出');
+    assert.match(css, /\.home-recent-status-tip\s*\{[^}]*bottom:\s*calc\(100%\s*\+\s*4px\)/s, '说明应紧凑地从状态码上方向上弹出');
+    assert.match(css, /\.home-recent-status-tip\s*\{[^}]*width:\s*max-content/s, '说明框宽度应按内容收紧');
   } finally {
     delete globalThis.document;
     delete globalThis.window;
@@ -2912,8 +2913,13 @@ test('使用量页：优先使用 state.usage，并纳入 final/usageRecord 失�
     for (const row of rows) {
       const status = row.childNodes[7];
       assert.ok(status, '请求明细应包含状态列');
-      assert.match(status.className, /\bchip-err\b/, '失败终结请求的状态列必须使用 chip-err');
-      assert.match(status.textContent, /^HTTP (?:502|499)$/);
+      const statusChip = findNodes(status, (node) => String(node.className || '').split(/\s+/).includes('home-recent-status-chip'))[0];
+      assert.match(statusChip?.className || '', /\bchip-err\b/, '失败终结请求的状态列必须使用 chip-err');
+      assert.match(statusChip?.textContent || '', /^HTTP (?:502|499)$/);
+      const tip = findNodes(status, (node) => String(node.className || '').split(/\s+/).includes('home-recent-status-tip'))[0];
+      assert.ok(tip, '使用记录状态应和主页一样提供详情');
+      assert.match(tip.textContent, /HTTP (?:502|499)/);
+      assert.equal(status.getAttribute('tabindex'), '0', '状态详情应支持键盘聚焦');
     }
     assert.match(root.allText(), /请求数/);
     assert.match(root.allText(), /成功率 0%/);

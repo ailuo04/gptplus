@@ -9,6 +9,7 @@ const { createUsageLiveReader, usageEvent } = require('../src/core/usage-live.js
 const { buildUsageStatuslineScript } = require('../src/core/usage-statusline.js');
 const {
   launchChatGptWithUsageStatusline,
+  injectUsageStatusline,
   resumeUsageStatusline,
   startUsageStatuslineBridge,
   usageStatuslineEndpoint,
@@ -170,6 +171,24 @@ test('usage statusline script retains the composer placement, icons, and valid s
   assert.match(integrated, /position:absolute/);
   assert.doesNotMatch(script, /data-stale=.*gptplus-usage-item\{opacity:\.55\}/);
   assert.doesNotMatch(script, /fetch\(endpoint/);
+});
+
+test('statusline injection carries enabled balance configuration into the page scripts', async () => {
+  let installedScripts = null;
+  const target = { id: 'chatgpt-page' };
+  const result = await injectUsageStatusline({
+    cdpPort: 9331,
+    target,
+    balance: { enabled: true },
+    ensurePageScriptImpl: async (_target, scripts) => {
+      installedScripts = scripts;
+      return { installed: true };
+    },
+  });
+
+  assert.deepEqual(result, { ok: true, installed: true, target });
+  assert.match(installedScripts.add, /gptplus-balance-item/);
+  assert.match(installedScripts.probe, /gptplus-balance-item/);
 });
 
 test('statusline launch starts the gateway first and shares one CDP injection path', async () => {

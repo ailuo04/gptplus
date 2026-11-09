@@ -55,8 +55,12 @@ function setup(options = {}) {
         plugins: { isActive: (id) => options.activePlugins.includes(id), config: () => ({ balance: { enabled: options.balanceEnabled === true } }) },
       } : {}),
     },
+    findAvailablePort: async (port) => port,
+    findChatGptDebugPort: async () => options.runningCdpPort || null,
+    listChatGptPids: async () => options.runningPids || [],
+    waitForTarget: async (port) => { calls.push({ type: 'wait-cdp', port }); },
     launchChatGptAndVerify: async (launchOptions) => {
-      calls.push({ type: 'launch', preferredPath: launchOptions.preferredPath, ...('cdpPort' in launchOptions ? { cdpPort: launchOptions.cdpPort } : {}) });
+      calls.push({ type: 'launch', preferredPath: launchOptions.preferredPath, ...('cdpPort' in launchOptions ? { cdpPort: launchOptions.cdpPort } : {}), ...('wrapperDir' in launchOptions ? { wrapperDir: launchOptions.wrapperDir } : {}) });
       if (options.launchError) throw new Error(options.launchError);
       return options.launchResult || { ok: true, exe: 'C:\\ChatGPT.exe', pid: 1234 };
     },
@@ -69,12 +73,6 @@ function setup(options = {}) {
       });
       if (options.launchError) throw new Error(options.launchError);
       return options.launchResult || { ok: true, exe: 'C:\\ChatGPT.exe', pid: 1234, cdpPort: launchOptions.cdpPort };
-    },
-    launchChatGptWithUsageStatusline: async ({ launch, launchOptions, wrapperDir }) => {
-      return launch({ ...launchOptions, cdpPort: 9229, wrapperDir });
-    },
-    launchChatGptWithVoiceInput: async ({ launch, launchOptions, wrapperDir }) => {
-      return launch({ ...launchOptions, cdpPort: 9229, wrapperDir });
     },
     launchChatGptWithBalance: async ({ launch, launchOptions, wrapperDir }) => {
       calls.push({ type: 'balance-launch' });
@@ -101,28 +99,51 @@ test('Windows login marker launches ChatGPT even though wasOpenedAtLogin is fals
   assert.deepEqual(calls, [{ type: 'launch', preferredPath: null }]);
 });
 
-test('login launch restarts ChatGPT with CDP when the usage statusline is active', async () => {
+test('cold login starts ChatGPT with CDP and does not wait for plugin injection', async () => {
   const { api, calls } = setup({ activePlugins: ['usage-statusline'] });
   await api.launch();
   assert.deepEqual(calls, [{
-    type: 'relaunch',
-    preferredPath: null,
-    cdpPort: 9229,
-    wrapperDir: 'C:\\gptplus\\cdp',
+    type: 'launch', preferredPath: null, cdpPort: 9229, wrapperDir: 'C:\\gptplus\\cdp',
   }]);
 });
 
-test('quota configuration relies on the usage statusline launch path', async () => {
-  const { api, calls } = setup({ activePlugins: ['usage-statusline'], balanceEnabled: true });
+test('voice-only login starts ChatGPT with CDP for later background injection', async () => {
+  const { api, calls } = setup({ activePlugins: ['voice-input'] });
   await api.launch();
-  assert.equal(calls[0].type, 'relaunch');
+  assert.deepEqual(calls, [
+    { type: 'launch', preferredPath: null, cdpPort: 9229, wrapperDir: 'C:\\gptplus\\cdp' },
+  ]);
 });
 
-test('login launch attaches the hidden balance bridge to the integrated statusline', async () => {
+test('login reuses the CDP port of an already running ChatGPT', async () => {
+  const { api, calls } = setup({ activePlugins: ['voice-input'], runningPids: [123], runningCdpPort: 9230 });
+  await api.launch();
+  assert.deepEqual(calls, [
+    { type: 'launch', preferredPath: null, cdpPort: 9230, wrapperDir: 'C:\\gptplus\\cdp' },
+  ]);
+});
+
+test('login restarts an already running ChatGPT only when it has no CDP port', async () => {
+  const { api, calls } = setup({ activePlugins: ['voice-input'], runningPids: [123] });
+  await api.launch();
+  assert.deepEqual(calls, [{
+    type: 'relaunch', preferredPath: null, cdpPort: 9229, wrapperDir: 'C:\\gptplus\\cdp',
+  }]);
+});
+
+test('quota configuration does not delay the ChatGPT launch for bridge injection', async () => {
   const { api, calls } = setup({ activePlugins: ['usage-statusline'], balanceEnabled: true });
   await api.launch();
-  assert.deepEqual(calls[0], { type: 'relaunch', preferredPath: null, cdpPort: 9229, wrapperDir: String.raw`C:\gptplus\cdp` });
-  assert.deepEqual(calls[1], { type: 'balance-inject', cdpPort: 9229 });
+  assert.equal(calls[0].type, 'launch');
+  assert.equal(calls.some((call) => call.type === 'balance-inject'), false);
+});
+
+test('balance bridge injection is deferred until after ChatGPT starts', async () => {
+  const { api, calls } = setup({ activePlugins: ['usage-statusline'], balanceEnabled: true });
+  await api.launch();
+  assert.deepEqual(calls, [
+    { type: 'launch', preferredPath: null, cdpPort: 9229, wrapperDir: String.raw`C:\gptplus\cdp` },
+  ]);
 });
 
 test('login launch keeps normal activation when no CDP plugin is active', async () => {

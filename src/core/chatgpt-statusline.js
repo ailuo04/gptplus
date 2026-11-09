@@ -67,6 +67,8 @@ async function injectUsageStatusline({
   timeoutMs = DEFAULT_INJECT_TIMEOUT_MS,
   pause = sleep,
   metrics,
+  balance,
+  ensurePageScriptImpl = ensurePageScript,
 } = {}) {
   const port = Number(cdpPort);
   if (!Number.isInteger(port) || port <= 0) throw new Error('ChatGPT 调试端口无效');
@@ -84,7 +86,7 @@ async function injectUsageStatusline({
     }
     if (page) {
       try {
-        const result = await ensurePageScript(page, scripts, prepared);
+        const result = await ensurePageScriptImpl(page, scripts, prepared);
         if (result?.installed === true) return { ok: true, installed: true, target: page };
         if (result?.ok === false) lastError = new Error(result.error || 'ChatGPT 用量状态栏脚本未成功执行');
         else lastError = new Error('ChatGPT 页面尚未就绪');

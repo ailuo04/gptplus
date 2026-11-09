@@ -1,6 +1,7 @@
 // 使用量页：从主进程已持久化的网关完成日志聚合请求数、Token 与响应耗时。
 
 import { createSelectPicker } from '../app.js';
+import { requestStatusDetails } from '../request-status.js';
 
 const viewState = { range: 'all', display: '20' };
 
@@ -543,14 +544,14 @@ export function renderUsage(root, ctx, actions) {
     ]),
     rows.length ? el('div', { class: 'usage-table' }, [
       el('div', { class: 'usage-table-row usage-table-head' }, ['时间', '渠道 · 模型', '未缓存输入', '缓存输入', '输出', '缓存命中率', '耗时', '状态', '缓存写入', '推理', '总 Token', '来源'].map((text) => el('span', { text }))),
-      ...tableRows.map((row) => el('div', { class: 'usage-table-row' }, [
+      ...tableRows.map((row, index) => el('div', { class: 'usage-table-row' }, [
         el('span', { class: 'mono muted', text: fmt.dateTime(row.at) }), el('span', { class: 'ellipsis', text: requestModelName(row) }),
         el('span', { class: 'nums', text: compactNumber(Math.max(0, inputTokenCount(row) - cachedTokenCount(row) - cacheWriteTokenCount(row))) }),
         el('span', { class: 'nums', text: compactNumber(cachedTokenCount(row)) }),
         el('span', { class: 'nums', text: compactNumber(tokenMetrics(row).output) }),
         el('span', { class: 'nums', text: cacheHitRateText(row) }),
         el('span', { class: 'nums muted', text: duration(row.ms, fmt) }),
-        el('span', { class: `chip ${isSuccessStatus(row.status) ? 'chip-ok' : 'chip-err'}`, text: `HTTP ${row.status}` }),
+        requestStatusDetails({ el }, row.status, `usage-request-status-tip-${index}`),
         el('span', { class: 'nums', text: compactNumber(cacheWriteTokenCount(row)) }),
         el('span', { class: 'nums', text: compactNumber(reasoningTokenCount(row)) }),
         el('span', { class: 'nums', text: compactNumber(tokenCount(row)) }),

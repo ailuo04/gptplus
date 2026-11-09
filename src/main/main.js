@@ -54,14 +54,16 @@ const { createWindowLifecycle } = require('./window-lifecycle.js');
 const { TRAY_ICON_DATA_URL } = require('./tray-icon.js');
 const { setupAutoUpdater, cleanupInstalledUpdateCache } = require('./updater.js');
 const { autoUpdater } = require('electron-updater');
-const { launchChatGptAndVerify, relaunchChatGpt, findChatGptDebugPort } = require('../core/chatgpt-launch.js');
+const { launchChatGptAndVerify, relaunchChatGpt, findChatGptDebugPort, listChatGptPids } = require('../core/chatgpt-launch.js');
+const { findAvailablePort, waitForTarget } = require('../core/cdp.js');
+const { launchThenRestore, restoreEnabledPagePlugins } = require('../core/plugin-startup.js');
 const {
   disposeUsageStatusline,
-  launchChatGptWithUsageStatusline,
+  ensureUsageGateway,
   resumeUsageStatusline,
   stopUsageStatuslineBridge,
 } = require('../core/chatgpt-statusline.js');
-const { disposeChatGptBalance, resumeChatGptBalance, stopChatGptBalanceBridge, installChatGptBalanceOnPort } = require('../core/chatgpt-balance.js');
+const { disposeChatGptBalance, resumeChatGptBalance, stopChatGptBalanceBridge } = require('../core/chatgpt-balance.js');
 
 const isDev = process.argv.includes('--dev');
 const isQuitRequest = process.argv.includes('--quit');
@@ -89,9 +91,7 @@ if (isSmoke) {
 // 语音模块会在加载时读取 paths.js；必须先完成冒烟测试目录隔离。
 const {
   disposeVoiceInput,
-  launchChatGptWithVoiceInput,
   resumeVoiceInput,
-  startVoiceInputOnPort,
   stopVoiceInputBridge,
 } = require('../core/voice-input.js');
 const { stopLocalSpeech } = require('../core/local-speech.js');
@@ -224,6 +224,7 @@ function migrateStartupSettings() {
 }
 
 let loginChatGptLaunchRequested = false;
+let loginChatGptCdpPort = null;
 
 async function launchChatGptAtLogin(commandLine = process.argv) {
   if (isDev || isSmoke || typeof app.getLoginItemSettings !== 'function') return;
@@ -239,38 +240,31 @@ async function launchChatGptAtLogin(commandLine = process.argv) {
   loginChatGptLaunchRequested = true;
 
   const preferredPath = ctx?.store?.get?.()?.chatgpt?.executablePath || null;
+  loginChatGptCdpPort = null;
   try {
-    // 日志里必须区分“已请求唤起”和“客户端真的起来了”：登录时没有界面反馈，
-    // 只 spawn explorer 成功并不代表 ChatGPT 主窗口出现。
-    const usageStatuslineEnabled = ctx?.plugins?.isActive ? ctx.plugins.isActive('usage-statusline') === true : true;
-    const balanceEnabled = ctx?.plugins?.isActive?.('usage-statusline') === true && ctx?.plugins?.config?.('usage-statusline')?.balance?.enabled === true;
-    const voiceInputEnabled = ctx?.plugins?.isActive?.('voice-input') === true;
+    const pagePluginsEnabled = ['usage-statusline', 'voice-input']
+      .some((id) => ctx?.plugins?.isActive?.(id) === true);
     let result;
-    if (ctx?.gateway && usageStatuslineEnabled) {
-      result = await launchChatGptWithUsageStatusline({
-        ctx,
-        launchOptions: { preferredPath },
-        wrapperDir: path.join(ctx.paths.APP_DIR, 'cdp'),
-        launch: (options) => relaunchChatGpt({ preferredPath, ...options }),
-      });
-      if (result?.ok && voiceInputEnabled && result.cdpPort) {
+    if (pagePluginsEnabled) {
+      const imageName = preferredPath ? path.win32.basename(preferredPath) : undefined;
+      const existingPids = await listChatGptPids(imageName ? { imageName } : {});
+      if (existingPids.length > 0) {
         try {
-          await startVoiceInputOnPort({ ctx, cdpPort: result.cdpPort });
+          loginChatGptCdpPort = await findChatGptDebugPort(imageName ? { imageName } : {});
         } catch (error) {
-          ctx?.log?.({ level: 'warn', msg: '语音输入注入失败: ' + error.message });
+          ctx?.log?.({ level: 'warn', msg: '无法读取 ChatGPT 调试端口: ' + error.message });
         }
       }
-      if (result?.ok && balanceEnabled && result.cdpPort) {
-        try { await installChatGptBalanceOnPort({ ctx, cdpPort: result.cdpPort }); }
-        catch (error) { ctx?.log?.({ level: 'warn', msg: '用量信息栏额度桥接失败: ' + error.message }); }
-      }
-    } else if (voiceInputEnabled) {
-      result = await launchChatGptWithVoiceInput({
-        ctx,
-        launchOptions: { preferredPath },
+      const runningCdpPort = loginChatGptCdpPort;
+      if (!runningCdpPort) loginChatGptCdpPort = await findAvailablePort(9229);
+      const launchOptions = {
+        preferredPath,
+        cdpPort: loginChatGptCdpPort,
         wrapperDir: path.join(ctx.paths.APP_DIR, 'cdp'),
-        launch: (options) => launchChatGptAndVerify({ preferredPath, ...options }),
-      });
+      };
+      result = existingPids.length > 0 && !runningCdpPort
+        ? await relaunchChatGpt(launchOptions)
+        : await launchChatGptAndVerify(launchOptions);
     } else {
       result = await launchChatGptAndVerify({ preferredPath });
     }
@@ -286,6 +280,26 @@ async function launchChatGptAtLogin(commandLine = process.argv) {
   } catch (err) {
     ctx?.log?.({ level: 'warn', msg: `开机自启动 ChatGPT 失败: ${err.message}` });
   }
+}
+
+async function restoreChatGptPagePlugins() {
+  const preferredPath = ctx?.store?.get?.()?.chatgpt?.executablePath || '';
+  const imageName = preferredPath ? path.win32.basename(preferredPath) : undefined;
+  if (ctx?.plugins?.isActive?.('usage-statusline')) {
+    try { await ensureUsageGateway(ctx); }
+    catch (error) { ctx?.log?.({ level: 'warn', msg: '用量信息栏依赖的本地网关准备失败: ' + error.message }); }
+  }
+  let cdpPort = loginChatGptCdpPort;
+  try {
+    if (!cdpPort) cdpPort = await findChatGptDebugPort(imageName ? { imageName } : {});
+    if (cdpPort) await waitForTarget(cdpPort, { timeoutMs: 15000 });
+  } catch (error) {
+    ctx?.log?.({ level: 'warn', msg: '等待 ChatGPT 插件注入页面失败: ' + error.message });
+  }
+  return restoreEnabledPagePlugins({
+    ctx, cdpPort, timeoutMs: 8000,
+    resumeUsageStatusline, resumeChatGptBalance, resumeVoiceInput,
+  });
 }
 
 async function refreshUsageStatuslineRuntime() {
@@ -619,11 +633,11 @@ async function boot() {
       refreshTrayMenu();
     }
   })();
-  void gatewayReady
-    .then(() => launchChatGptAtLogin())
-    .then(() => resumeUsageStatusline({ ctx }))
-    .then(() => resumeVoiceInput({ ctx }))
-    .catch((error) => ctx?.log?.({ level: 'warn', msg: '恢复插件页面失败: ' + error.message }));
+  void launchThenRestore({
+    launch: () => launchChatGptAtLogin(),
+    prerequisites: gatewayReady,
+    restore: () => restoreChatGptPagePlugins(),
+  }).catch((error) => ctx?.log?.({ level: 'warn', msg: '恢复插件页面失败: ' + error.message }));
 
   app.on('second-instance', (_event, commandLine) => {
     if (commandLine.includes('--quit')) {
@@ -631,7 +645,11 @@ async function boot() {
       return;
     }
     showWindow();
-    void gatewayReady.then(() => launchChatGptAtLogin(commandLine));
+    void launchThenRestore({
+      launch: () => launchChatGptAtLogin(commandLine),
+      prerequisites: gatewayReady,
+      restore: () => restoreChatGptPagePlugins(),
+    }).catch((error) => ctx?.log?.({ level: 'warn', msg: '恢复插件页面失败: ' + error.message }));
   });
 }
 
