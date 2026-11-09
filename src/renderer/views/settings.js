@@ -348,14 +348,14 @@ function updateCard(ctx) {
       icon('download', 14),
       el('span', { class: 'card-title', text: '软件更新' }),
       el('span', { class: 'chip ' + (pending ? 'chip-warn' : update.status === 'latest' ? 'chip-ok' : ''), text: `当前 v${current}` }),
-      el('span', { class: 'card-desc', text: '更新前需要确认，不会自动下载' }),
+      el('span', { class: 'card-desc', text: '点击更新后自动安装并重新打开' }),
     ]),
     el('div', { class: 'card-body' }, [
       el('div', { class: 'setting' }, [
         el('div', { class: 'setting-main' }, [
           el('div', { class: 'setting-title', text: statusText }),
           el('div', { class: 'setting-desc', text: hasVersion && pending
-            ? '可以现在更新，也可以稍后从左侧“设置”旁的更新提示进入。暂不更新不会影响当前版本使用。'
+            ? '点击“立即更新”后将自动下载、安装并重新打开 gpt++；也可以稍后再更新。'
             : '手动检查会立即请求 GitHub Release；发现新版本后会先询问是否更新。' }),
           pending ? updateSummary(ctx, update) : null,
         ]),

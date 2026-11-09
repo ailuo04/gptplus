@@ -153,7 +153,7 @@ test('usage statusline script retains the composer placement, icons, and valid s
   assert.match(script, /__gptplusUsageStatusline/);
   assert.match(script, /READY_WAIT_MS = 2000/);
   assert.match(script, /SYNC_INTERVAL_MS = 1000/);
-  assert.match(script, /gptplus-usage-statusline-v10/);
+  assert.match(script, /gptplus-usage-statusline-v12/);
   assert.match(script, /request\.speed/);
   assert.match(script, /function apply\(id, events, request\)/);
   assert.match(script, /requestTime >= latestTime - 15000/);
@@ -161,14 +161,10 @@ test('usage statusline script retains the composer placement, icons, and valid s
   assert.match(script, /color:var\(--color-token-text-primary,#000\)!important/);
   assert.ok(script.includes('html[data-theme=\\"light\\"] #gptplus-codex-usage-statusline'));
   assert.match(script, /gptplus-usage-item svg\{flex:0 0 auto\}/);
-  assert.match(script, /gptplus-balance-delta[^}]*position:absolute/, 'temporary spend amount must not participate in statusline layout');
-  assert.match(script, /grid-template-columns:repeat\(3,minmax\(0,1fr\)\)/, 'disabled balance must not reserve an empty status slot');
   assert.match(script, /applyBalance/, 'statusline should receive live balance snapshots');
   const integrated = buildUsageStatuslineScript({ balance: { enabled: true } });
   assert.match(integrated, /gptplus-balance-item/);
   assert.match(integrated, /applyBalance/);
-  assert.match(integrated, /grid-template-columns:repeat\(4,minmax\(0,1fr\)\)/, 'integrated balance must occupy its own stable fourth slot');
-  assert.match(integrated, /position:absolute/);
   assert.doesNotMatch(script, /data-stale=.*gptplus-usage-item\{opacity:\.55\}/);
   assert.doesNotMatch(script, /fetch\(endpoint/);
 });
@@ -441,7 +437,8 @@ test('injected statusline renders one decimal immediately when usage is applied'
   const vm = require('node:vm');
   const nodes = [];
   class Node {
-    constructor() { this.dataset = {}; this.children = []; this.attributes = {}; this.isConnected = true; nodes.push(this); }
+    constructor() { this.dataset = {}; this.children = []; this.attributes = {}; this.style = {}; this.offsetWidth = 50; this.offsetHeight = 17; this.isConnected = true; nodes.push(this); }
+    getBoundingClientRect() { return { x: 100, y: 100, top: 100, right: 150, bottom: 117, width: 50, height: 17 }; }
     setAttribute(key, value) { this.attributes[key] = value; }
     appendChild(node) { node.parentElement = this; this.children.push(node); }
     remove() { this.isConnected = false; }
@@ -454,12 +451,14 @@ test('injected statusline renders one decimal immediately when usage is applied'
     querySelector: () => ({}),
   };
   const sandbox = {
-    document: { body: {}, head: new Node(), documentElement: { lang: 'zh-CN' },
+    document: { body: new Node(), head: new Node(), addEventListener() {}, removeEventListener() {}, documentElement: { lang: 'zh-CN' },
       querySelectorAll: () => [card], querySelector: () => null,
       createElement: () => new Node(), createElementNS: () => new Node(),
       getElementById: id => nodes.find(node => node.id === id && node.isConnected),
     },
     navigator: { language: 'zh-CN' },
+    innerWidth: 600, innerHeight: 400, addEventListener() {}, removeEventListener() {},
+    ResizeObserver: class { observe() {} disconnect() {} },
     getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
     MutationObserver: class { observe() {} disconnect() {} },
     setTimeout: () => 1, clearTimeout: () => {},
@@ -479,9 +478,12 @@ test('injected statusline renders one decimal immediately when usage is applied'
   const balanceItem = status.children.find((node) => node.dataset.usage === 'balance');
   api.context();
   assert.ok(balanceItem, 'balance occupies the fourth status item');
-  assert.equal(balanceItem.children[1].textContent, '443.48', 'the dollar symbol is only shown in the icon');
-  assert.equal(balanceItem.children[2].textContent, '-0.123', 'spend amount is rounded to three decimals');
-  assert.equal(balanceItem.children[2].dataset.hidden, 'false');
+  assert.equal(balanceItem.children.find(node => node.className === 'gptplus-balance-amount').textContent, '443.48', 'the dollar symbol is only shown in the icon');
+  const delta = nodes.find(node => node.id === 'gptplus-codex-usage-statusline-delta');
+  assert.equal(delta.parentElement, sandbox.document.body, 'popup lives outside the metric row');
+  assert.equal(delta.textContent, '-0.123', 'spend amount is rounded to three decimals');
+  assert.equal(delta.dataset.hidden, 'false');
   assert.equal((await vm.runInNewContext(script, sandbox)).reused, true);
   sandbox.__gptplusUsageStatuslineDispose();
+  assert.equal(delta.isConnected, false, 'disposing the plugin removes its popup');
 });

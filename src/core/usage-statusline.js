@@ -11,7 +11,6 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics, balance } = {}) {
   };
   const metricsJson = JSON.stringify(selectedMetrics);
   const balanceJson = JSON.stringify({ enabled: balance?.enabled === true });
-  const columnCount = Object.values(selectedMetrics).filter(Boolean).length + (balance?.enabled === true ? 1 : 0);
   return `(() => {
   const READY_WAIT_MS = ${readyWait};
   const METRICS = ${metricsJson};
@@ -21,8 +20,8 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics, balance } = {}) {
   const EXT_ATTR = "data-gptplus-usage-statusline";
   const CIRCUMFERENCE = 37.7;
   const SYNC_INTERVAL_MS = 1000;
-  const runtimeKey = "gptplus-usage-statusline-v10";
-  const STYLE_TEXT = ${JSON.stringify(buildUsageStatuslineStyle(columnCount))};
+  const runtimeKey = "gptplus-usage-statusline-v12";
+  const STYLE_TEXT = ${JSON.stringify(buildUsageStatuslineStyle())};
   const computeUsageSnapshot = ${computeUsageSnapshot.toString()};
   const formatTokenRate = ${formatTokenRate.toString()};
   const mergeUsageCacheEntry = ${mergeUsageCacheEntry.toString()};
@@ -31,7 +30,7 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics, balance } = {}) {
   }
   globalThis.__gptplusUsageStatuslineDispose?.();
   globalThis.__gptplusUsageStatuslineRuntime = runtimeKey;
-  const state = { node: null, parts: null, threadId: "", timer: 0, observer: null, cache: new Map(), fingerprint: "", balanceSnapshot: null, balanceTimer: 0, disposed: false };
+  const state = { node: null, parts: null, threadId: "", timer: 0, observer: null, cache: new Map(), fingerprint: "", balanceSnapshot: null, balanceTimer: 0, resizeObserver: null, disposed: false };
   const NS = "http://www.w3.org/2000/svg";
 
   function visible(node) {
@@ -43,8 +42,8 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics, balance } = {}) {
   function textLabels() {
     const lang = String(document.documentElement?.lang || navigator.language || "").toLowerCase();
     return lang.startsWith("zh")
-      ? { speed: (v) => v + " tok/s", cache: (v) => "缓存命中 " + v, aria: "用量状态栏" }
-      : { speed: (v) => v + " tok/s", cache: (v) => "cache hit " + v, aria: "Usage status line" };
+      ? { speed: (v) => v + " tok/s", cache: (v) => "缓存命中 " + v, context: (v) => "上下文 " + v, balance: "余额", aria: "用量状态栏" }
+      : { speed: (v) => v + " tok/s", cache: (v) => "cache hit " + v, context: (v) => "context " + v, balance: "balance", aria: "Usage status line" };
   }
 
   function svgIcon(shapes) {
@@ -118,14 +117,21 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics, balance } = {}) {
       coin.className = "gptplus-balance-coin";
       coin.textContent = "$";
       item.appendChild(coin);
+      const label = document.createElement("span");
+      label.textContent = textLabels().balance;
+      item.appendChild(label);
       parts.balance = document.createElement("span");
       parts.balance.className = "gptplus-balance-amount";
       parts.balance.textContent = "--";
       item.appendChild(parts.balance);
       parts.delta = document.createElement("span");
+      parts.delta.id = ID + "-delta";
       parts.delta.className = "gptplus-balance-delta";
+      parts.delta.setAttribute(EXT_ATTR, "true");
+      parts.delta.setAttribute("aria-hidden", "true");
       parts.delta.dataset.hidden = "true";
-      item.appendChild(parts.delta);
+      // 独立悬浮层不参与信息栏排版，也不受输入框祖先的 overflow 裁切。
+      document.body.appendChild(parts.delta);
       node.appendChild(item);
     }
     state.parts = parts;
@@ -159,6 +165,33 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics, balance } = {}) {
     return "-" + groupDigits(digits / 1000n) + "." + String(digits % 1000n).padStart(3, "0");
   }
 
+  function positionBalanceDelta() {
+    const parts = state.parts;
+    if (!parts?.delta || !parts.balance?.isConnected || !state.node?.isConnected) return;
+    const anchor = parts.balance.getBoundingClientRect();
+    const bar = state.node.getBoundingClientRect();
+    const viewport = globalThis.visualViewport;
+    const left = (viewport?.offsetLeft || 0) + 8;
+    const top = (viewport?.offsetTop || 0) + 8;
+    const right = (viewport?.offsetLeft || 0) + (viewport?.width || innerWidth) - 8;
+    const bottom = (viewport?.offsetTop || 0) + (viewport?.height || innerHeight) - 8;
+    parts.delta.style.font = getComputedStyle(state.node).font;
+    parts.delta.style.fontWeight = "600";
+    // offsetWidth/Height 不受弹出动画的 transform 影响。
+    const width = parts.delta.offsetWidth;
+    const height = parts.delta.offsetHeight;
+    let x = anchor.right + 6;
+    let y = anchor.top + (anchor.height - height) / 2;
+    if (x + width > right) {
+      x = Math.max(left, Math.min(anchor.right - width, right - width));
+      // 右侧不够时放在整栏外，避免窄窗口换行后遮住其它指标。
+      y = bar.bottom + 6;
+      if (y + height > bottom) y = bar.top - height - 6;
+    }
+    parts.delta.style.left = Math.max(left, Math.min(x, right - width)) + "px";
+    parts.delta.style.top = Math.max(top, Math.min(y, bottom - height)) + "px";
+  }
+
   function paintBalance(snapshot, showDelta) {
     const parts = state.parts;
     if (!parts?.balance) return;
@@ -172,6 +205,11 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics, balance } = {}) {
     parts.balance.parentElement.title = details.join(" · ");
     const delta = snapshot?.ok !== false && ["cumulative", "net-balance-change"].includes(snapshot?.deltaKind) ? formatBalanceDelta(snapshot.delta) : "";
     parts.delta.textContent = delta;
+    if (showDelta && delta) {
+      positionBalanceDelta();
+      // 先落下收起态，再触发弹出；两秒后的隐藏态会沿相反方向收回。
+      void parts.delta.offsetWidth;
+    }
     parts.delta.dataset.hidden = String(!showDelta || !delta);
     clearTimeout(state.balanceTimer);
     if (showDelta && delta) state.balanceTimer = setTimeout(() => { if (parts.delta) parts.delta.dataset.hidden = "true"; }, 2000);
@@ -240,7 +278,7 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics, balance } = {}) {
     state.fingerprint = fingerprint;
     if (parts.speed) parts.speed.textContent = labels.speed(speed);
     if (parts.cache) parts.cache.textContent = labels.cache(cache);
-    if (parts.context) parts.context.textContent = context;
+    if (parts.context) parts.context.textContent = labels.context(context);
     if (parts.ring) {
       const filled = value?.context == null ? 0 : value.context / 100 * CIRCUMFERENCE;
       parts.ring.setAttribute("stroke-dasharray", filled.toFixed(2) + " " + CIRCUMFERENCE);
@@ -257,6 +295,8 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics, balance } = {}) {
 
   function hide() {
     if (state.node) state.node.dataset.hidden = "true";
+    if (state.parts?.delta) state.parts.delta.dataset.hidden = "true";
+    clearTimeout(state.balanceTimer);
     state.fingerprint = "";
   }
 
@@ -269,6 +309,7 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics, balance } = {}) {
     ensureNode(card);
     const cached = state.cache.get(id);
     render(computeUsageSnapshot(cached?.events, cached?.request));
+    if (state.parts?.delta?.dataset.hidden === "false") positionBalanceDelta();
     return { id, changed: id !== previous };
   }
 
@@ -306,6 +347,7 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics, balance } = {}) {
       document.head?.appendChild(style);
     }
     document.getElementById(ID)?.remove();
+    document.getElementById(ID + "-delta")?.remove();
     const composerSelector = "[data-codex-composer-root], [data-composer-surface-variant], [data-above-composer-conversation-id]";
     state.observer = new MutationObserver((records) => {
       const relevant = records.some((record) => {
@@ -319,6 +361,12 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics, balance } = {}) {
     });
     state.observer.observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ["data-above-composer-conversation-id", "data-composer-placement", "data-app-action-sidebar-thread-selected", "data-app-action-sidebar-thread-id"] });
     sync();
+    state.resizeObserver = new ResizeObserver(positionBalanceDelta);
+    if (state.node) state.resizeObserver.observe(state.node);
+    document.addEventListener("scroll", positionBalanceDelta, true);
+    globalThis.addEventListener("resize", positionBalanceDelta);
+    globalThis.visualViewport?.addEventListener("resize", positionBalanceDelta);
+    globalThis.visualViewport?.addEventListener("scroll", positionBalanceDelta);
     state.timer = setTimeout(tick, 2000);
     globalThis.__gptplusUsageStatusline = { context, apply, applyBalance };
     globalThis.__gptplusUsageStatuslineReady = true;
@@ -330,6 +378,12 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics, balance } = {}) {
       clearTimeout(state.timer);
       clearTimeout(state.balanceTimer);
       state.observer?.disconnect();
+      state.resizeObserver?.disconnect();
+      document.removeEventListener("scroll", positionBalanceDelta, true);
+      globalThis.removeEventListener("resize", positionBalanceDelta);
+      globalThis.visualViewport?.removeEventListener("resize", positionBalanceDelta);
+      globalThis.visualViewport?.removeEventListener("scroll", positionBalanceDelta);
+      state.parts?.delta?.remove();
       state.node?.remove();
       document.getElementById(STYLE_ID)?.remove();
     };

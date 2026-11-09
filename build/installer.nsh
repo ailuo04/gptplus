@@ -3,6 +3,14 @@
 !include "getProcessInfo.nsh"
 Var pid
 
+; Older app versions launch updates without /S. Switch only update installs to
+; silent mode so this upgrade also finishes without wizard clicks.
+!macro customInit
+  ${if} ${isUpdated}
+    SetSilent silent
+  ${endIf}
+!macroend
+
 !macro GPTPLUS_FIND_APP _RETURN
   ${if} $IsPowerShellAvailable == 0
     nsExec::Exec `"$PowerShellPath" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "if ((Get-CimInstance -ClassName Win32_Process | ? {$$_.Name -ieq '${APP_EXECUTABLE_FILENAME}' -and $$_.Path -and $$_.Path.StartsWith('$INSTDIR', 'CurrentCultureIgnoreCase')}).Count -gt 0) { exit 0 } else { exit 1 }"`

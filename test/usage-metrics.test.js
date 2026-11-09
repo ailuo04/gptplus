@@ -149,14 +149,6 @@ test('usage statusline style never dims stale or empty state', () => {
   assert.doesNotMatch(css, /color-mix/);
 });
 
-test('usage statusline reserves stable columns while balance deltas pop out beside the value', () => {
-  const css = buildUsageStatuslineStyle(4);
-  assert.match(css, /display:grid/);
-  assert.match(css, /grid-template-columns:repeat\(4,minmax\(0,1fr\)\)/);
-  assert.match(css, /justify-self:center/);
-  assert.match(css, /gptplus-balance-delta\{position:absolute;left:100%/);
-});
-
 test('request-only bridge updates preserve the last rollout events', () => {
   const previous = { events: [{ t: '2026-10-29T02:00:00.000Z', input_tokens: 100 }], request: { speed: 10 } };
   const nextRequest = { speed: 25, at: Date.now() };

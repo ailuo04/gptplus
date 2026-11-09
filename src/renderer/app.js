@@ -1335,7 +1335,11 @@ async function startUpdateDownload() {
   try {
     const next = await api.downloadUpdate();
     if (next && typeof next === 'object') handleUpdateState(next);
-    toast('已开始下载更新，下载完成后会自动重启安装', 'info');
+    if (next?.status === 'error') {
+      toast(next.error || '更新失败', 'error');
+      return;
+    }
+    toast('正在更新，安装完成后会自动重新打开 gpt++', 'info');
   } catch (err) {
     toastError(err, '开始更新失败');
   }
@@ -1416,7 +1420,7 @@ function openUpdateModal() {
         icon(current.status === 'downloading' ? 'download' : 'zap', 15),
         el('div', { class: 'grow' }, [
           el('div', { text: current.status === 'downloading' ? `正在下载 v${current.version || ''}` : current.status === 'downloaded' ? '更新已下载，正在准备安装' : `检测到最新版 v${current.version || ''}` }),
-          el('div', { class: 'faint', text: current.status === 'downloading' ? `下载进度 ${Math.round(current.percent || 0)}%，完成后会自动重启安装。` : '更新会下载并安装新版本，暂不更新不影响使用。' }),
+          el('div', { class: 'faint', text: current.status === 'downloading' ? `下载进度 ${Math.round(current.percent || 0)}%，完成后会自动安装并重新打开 gpt++。` : '点击更新后将自动下载安装并重新打开 gpt++，无需操作安装向导。' }),
         ]),
       ]),
       summary,

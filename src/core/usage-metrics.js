@@ -89,23 +89,22 @@ function computeUsageSnapshot(events, request, now = Date.now()) {
   };
 }
 
-function buildUsageStatuslineStyle(columnCount = 4) {
+function buildUsageStatuslineStyle() {
   const id = 'gptplus-codex-usage-statusline';
   const textColor = 'var(--color-token-text-primary,#000)';
-  const columns = Math.max(1, Math.min(4, Math.floor(Number(columnCount) || 1)));
-  return `#${id}{display:grid;grid-template-columns:repeat(${columns},minmax(0,1fr));align-items:center;gap:24px;box-sizing:border-box;width:100%;margin:6px 0 0;padding:0 10px;font:inherit;font-size:12px;line-height:17px;color:${textColor};opacity:1!important;user-select:none;cursor:default}`
+  return `#${id}{display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:6px clamp(16px,3vw,28px);box-sizing:border-box;width:100%;margin:6px 0 0;padding:3px 10px;font:inherit;font-size:12px;line-height:17px;color:${textColor};opacity:1!important;user-select:none;cursor:default}`
     + `#${id}[data-hidden="true"]{display:none}`
-    + `#${id} .gptplus-usage-item{display:inline-flex;align-items:center;justify-self:center;min-width:0;gap:5px;white-space:nowrap;font-variant-numeric:tabular-nums;color:${textColor}!important;opacity:1!important;filter:none!important}`
+    + `#${id} .gptplus-usage-item{display:inline-flex;align-items:center;flex:0 0 auto;min-width:0;gap:5px;white-space:nowrap;font-variant-numeric:tabular-nums;color:${textColor}!important;opacity:1!important;filter:none!important}`
     + `#${id} .gptplus-usage-value,#${id} .gptplus-usage-item svg{color:${textColor}!important;opacity:1!important;filter:none!important}`
     + `#${id} .gptplus-usage-value{font-weight:500}`
     + `#${id} .gptplus-usage-item svg{flex:0 0 auto}`
     + `#${id} .gptplus-balance-item{position:relative;color:#16803c!important}`
     + `#${id} .gptplus-balance-coin{display:inline-grid;place-items:center;width:13px;height:13px;border:1.4px solid currentColor;border-radius:50%;font-size:9px;line-height:1;font-weight:700;box-sizing:border-box}`
     + `#${id} .gptplus-balance-amount{font-weight:600}`
-    + `#${id} .gptplus-balance-delta{position:absolute;left:100%;top:0;margin-left:5px;color:#d92d20!important;font-weight:600;white-space:nowrap;pointer-events:none}`
-    + `#${id} .gptplus-balance-delta[data-hidden="true"]{visibility:hidden}`
-    + `html[data-theme="light"] #${id},html[data-theme="light"] #${id} *{color:#000!important}`
-    + `html[data-theme="light"] #${id} .gptplus-balance-delta{color:#d92d20!important}`;
+    + `#${id}-delta{position:fixed;z-index:2147483000;box-sizing:border-box;max-width:calc(100vw - 16px);margin:0;color:#d92d20!important;font-size:12px;line-height:17px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap;pointer-events:none;user-select:none;opacity:1;visibility:visible;transform:translateX(0) scale(1);transform-origin:left center;transition:opacity 180ms ease,transform 220ms cubic-bezier(.2,.8,.2,1),visibility 0s}`
+    + `#${id}-delta[data-hidden="true"]{opacity:0;visibility:hidden;transform:translateX(-6px) scale(.85);transition:opacity 180ms ease,transform 180ms ease,visibility 0s 180ms}`
+    + `@media(prefers-reduced-motion:reduce){#${id}-delta,#${id}-delta[data-hidden="true"]{transition:none;transform:none}}`
+    + `html[data-theme="light"] #${id},html[data-theme="light"] #${id} *{color:#000!important}`;
 }
 
 function mergeUsageCacheEntry(previous, events, request) {

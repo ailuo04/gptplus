@@ -118,13 +118,13 @@ test('开发模式跳过自动更新', async () => {
   assert.equal(controller.getState().checkIntervalMinutes, 45);
 });
 
-test('发现更新后只记录版本，用户确认后才下载并安装', async () => {
+test('发现更新后不自动下载，确认一次后静默安装并重新打开', async () => {
   const updater = createUpdater();
   const logs = [];
-  let installed = false;
+  const installs = [];
   let downloadCalls = 0;
   updater.downloadUpdate = async () => { downloadCalls += 1; };
-  updater.quitAndInstall = () => { installed = true; };
+  updater.quitAndInstall = (...args) => { installs.push(args); };
   const controller = setupAutoUpdater({
     app: { isPackaged: true, getVersion: () => '0.1.0' },
     autoUpdater: updater,
@@ -147,7 +147,7 @@ test('发现更新后只记录版本，用户确认后才下载并安装', async
   assert.equal(downloadCalls, 1);
   updater.emit('update-downloaded');
   await new Promise((resolve) => setTimeout(resolve, 300));
-  assert.equal(installed, true);
+  assert.deepEqual(installs, [[true, true]], '必须静默安装并在完成后启动应用');
   assert.ok(logs.some((entry) => entry.msg.includes('等待用户选择')));
 });
 
@@ -422,4 +422,58 @@ test('下载完成后安装目录不可写时不重启安装', async () => {
   assert.equal(installed, false);
   assert.equal(controller.getState().status, 'error');
   assert.ok(logs.some((entry) => entry.msg.includes('重启安装已阻止')));
+});
+
+
+test('继续安装已下载更新时也静默安装并重新检查目录权限', async () => {
+  const updater = createUpdater();
+  const installs = [];
+  let checks = 0;
+  const app = { isPackaged: true, getVersion: () => '0.1.0' };
+  updater.quitAndInstall = (...args) => { installs.push(args); };
+  const controller = setupAutoUpdater({
+    app, autoUpdater: updater,
+    installAccessCheck: async () => { checks += 1; return { ok: true }; },
+  });
+  updater.emit('update-downloaded');
+  await Promise.all([controller.downloadUpdate(), controller.downloadUpdate()]);
+  assert.equal(checks, 1, '连续点击只触发一次安装');
+  assert.deepEqual(installs, [[true, true]]);
+  assert.equal(app.isQuitting, true);
+  controller.stopAutomaticChecks();
+
+  const blockedUpdater = createUpdater();
+  const blockedApp = { isPackaged: true, getVersion: () => '0.1.0' };
+  blockedUpdater.quitAndInstall = (...args) => { installs.push(args); };
+  const blocked = setupAutoUpdater({
+    app: blockedApp, autoUpdater: blockedUpdater,
+    installAccessCheck: async () => ({ ok: false, message: '安装目录不可写' }),
+  });
+  blockedUpdater.emit('update-downloaded');
+  const state = await blocked.downloadUpdate();
+  assert.equal(state.status, 'error');
+  assert.equal(state.error, '安装目录不可写');
+  assert.notEqual(blockedApp.isQuitting, true);
+  assert.equal(installs.length, 1, '权限不通过不能启动安装器');
+  blocked.stopAutomaticChecks();
+});
+
+
+test('安装器启动失败后清除退出标记，已下载更新可以重试', async () => {
+  const updater = createUpdater();
+  const app = { isPackaged: true, getVersion: () => '0.1.0' };
+  let attempts = 0;
+  updater.quitAndInstall = () => {
+    attempts += 1;
+    if (attempts === 1) updater.emit('error', new Error('installer launch failed'));
+  };
+  const controller = setupAutoUpdater({ app, autoUpdater: updater, installAccessCheck: async () => ({ ok: true }) });
+  updater.emit('update-downloaded');
+  const failed = await controller.downloadUpdate();
+  assert.equal(failed.status, 'error');
+  assert.equal(app.isQuitting, false, '启动失败不能让主窗口关闭后直接退出');
+  updater.emit('update-downloaded');
+  await controller.downloadUpdate();
+  assert.equal(attempts, 2);
+  controller.stopAutomaticChecks();
 });

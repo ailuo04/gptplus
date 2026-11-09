@@ -375,6 +375,7 @@ function setupAutoUpdater(options = {}) {
   let checking = false;
   let downloading = false;
   let installAfterDownload = false;
+  let installing = false;
   let rollbackTarget = null;
   let initialCheckTimer = null;
   let intervalTimer = null;
@@ -509,25 +510,43 @@ function setupAutoUpdater(options = {}) {
     }
   });
 
+  // 所有已下载更新共用同一路径：复查权限、避免重复启动、静默安装后打开。
+  const installDownloadedUpdate = async () => {
+    if (installing || state.status !== 'downloaded') return { ...state };
+    installing = true;
+    const access = await ensureInstallWritable();
+    if (!access.ok) {
+      installing = false;
+      publish({ status: 'error', error: access.message });
+      log('error', `重启安装已阻止: ${access.message}`);
+      return { ...state };
+    }
+    if (state.status !== 'downloaded') {
+      installing = false;
+      return { ...state };
+    }
+    app.isQuitting = true;
+    try {
+      autoUpdater.quitAndInstall(true, true);
+    } catch (error) {
+      autoUpdater.emit('error', error);
+    }
+    return { ...state };
+  };
+
   autoUpdater.on('update-downloaded', () => {
     downloading = false;
     publish({ status: 'downloaded', percent: 100, error: null });
     log('info', '更新已下载完成');
     if (!installAfterDownload) return;
     installAfterDownload = false;
-    // 下载完成后再次确认，避免安装器删掉旧目录却写不回新版本。
-    void ensureInstallWritable().then((access) => {
-      if (!access.ok) {
-        publish({ status: 'error', error: access.message });
-        log('error', `重启安装已阻止: ${access.message}`);
-        return;
-      }
-      app.isQuitting = true;
-      setTimeout(() => autoUpdater.quitAndInstall(false, true), 250);
-    });
+    // 留出一帧让界面显示下载完成，随后无需再次点击即可安装。
+    setTimeout(() => { void installDownloadedUpdate(); }, 250);
   });
 
   autoUpdater.on('error', (err) => {
+    if (installing) app.isQuitting = false;
+    installing = false;
     checking = false;
     downloading = false;
     installAfterDownload = false;
@@ -642,11 +661,7 @@ function setupAutoUpdater(options = {}) {
     /** 用户明确点击更新后才下载，并在下载完成后重启安装。 */
     async downloadUpdate() {
       if (downloading) return { ...state };
-      if (state.status === 'downloaded') {
-        app.isQuitting = true;
-        autoUpdater.quitAndInstall(false, true);
-        return { ...state };
-      }
+      if (state.status === 'downloaded') return installDownloadedUpdate();
       if (state.status !== 'available') return { ...state };
       return beginDownload();
     },
