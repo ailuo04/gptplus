@@ -52,7 +52,7 @@ const { performance } = require('node:perf_hooks');
 const { ensureApiVersion } = require('../base-url.js');
 
 const DONE_FRAME = 'data: [DONE]\n\n';
-const MAX_BODY_BYTES = 32 * 1024 * 1024; // codex 的 instructions + 历史可能很大
+const MAX_BODY_BYTES = 128 * 1024 * 1024; // codex 的 instructions + 历史可能很大
 const MAX_RELIABLE_GENERATION_SPEED = 600;
 
 // ---------------------------------------------------------------------------
@@ -1162,7 +1162,7 @@ function readJsonBody(req, limit = MAX_BODY_BYTES) {
       size += chunk.length;
       if (size > limit) {
         fail(Object.assign(new Error('请求体过大'), { statusCode: 413 }));
-        req.destroy();
+        req.pause();
         return;
       }
       chunks.push(chunk);
