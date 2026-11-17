@@ -432,6 +432,7 @@ let relaunchBusy = false;
 let themeSaveBusy = false;
 let networkSaveBusy = false;
 let startupSaveBusy = false;
+let startupConflictChecking = false;
 let networkFocusMode = null;
 let observedWriteAt = 0;
 let updatePromptedVersion = null;
@@ -1208,6 +1209,152 @@ async function saveStartupPreference(enabled, nextTarget) {
     startupSaveBusy = false;
     renderChrome();
   }
+  if (state.startup?.enabled && state.startup.target === 'both' && current.target !== 'both') {
+    void checkStartupConflict();
+  }
+}
+
+/**
+ * gpt++ 负责拉起 ChatGPT 时，如果 ChatGPT 自带的开机启动也开着，两边会抢跑：
+ * ChatGPT 自己先起来就不带调试端口，插件注入不进去。发现冲突时让用户二选一。
+ * @param {{retries?: number}} [options] 其他弹窗占用时的剩余等待次数
+ */
+async function checkStartupConflict({ retries = 0 } = {}) {
+  const startup = state.startup;
+  if (!api || typeof api.getChatGptOwnStartup !== 'function'
+    || !startup?.enabled || startup.target !== 'both') return false;
+  if (isModalOpen()) {
+    if (retries > 0) window.setTimeout(() => void checkStartupConflict({ retries: retries - 1 }), 2000);
+    return false;
+  }
+  if (startupConflictChecking) return false;
+  startupConflictChecking = true;
+  let own = null;
+  try {
+    own = await api.getChatGptOwnStartup();
+  } catch {
+    return false;
+  } finally {
+    startupConflictChecking = false;
+  }
+  if (!own || own.enabled !== true || isModalOpen()) return false;
+  openStartupConflictModal(own);
+  return true;
+}
+
+function openStartupConflictModal(own = {}) {
+  let busy = false;
+  const choices = [];
+  const setBusy = (next) => {
+    busy = next;
+    for (const node of choices) node.disabled = next || node.dataset.locked === '1' ? true : null;
+  };
+  const choose = async (choice) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      if (choice === 'gptplus') {
+        await api.disableChatGptOwnStartup();
+        toast('已关闭 ChatGPT 自带的开机启动，开机后由 gpt++ 拉起并注入插件', 'ok');
+        logLocal('info', '开机自启动：已关闭 ChatGPT 自带的开机启动，由 gpt++ 拉起 ChatGPT');
+      } else {
+        const next = await api.setStartup({ enabled: true, target: 'gptplus' });
+        state.startup = {
+          supported: next?.supported !== false,
+          enabled: next ? !!next.enabled : true,
+          target: next?.target === 'both' ? 'both' : 'gptplus',
+        };
+        renderChrome();
+        toast('已改为仅 gpt++ 开机自启动，ChatGPT 由它自己启动', 'ok');
+        logLocal('warn', '开机自启动：ChatGPT 由它自己启动，开机后插件不会自动注入');
+      }
+      closeModal();
+    } catch (err) {
+      toastError(err, '处理开机自启动冲突失败');
+      setBusy(false);
+    }
+  };
+  const choiceCard = ({ choice, iconName, title, badge, lines, locked }) => {
+    const node = el('button', {
+      class: `startup-conflict-choice${choice === 'gptplus' ? ' is-recommended' : ''}`,
+      type: 'button',
+      disabled: locked ? true : null,
+      data: { startupConflictChoice: choice, locked: locked ? '1' : '0' },
+      attrs: choice === 'gptplus' && !locked ? { 'data-autofocus': '' } : {},
+      on: { click: () => void choose(choice) },
+    }, [
+      el('span', { class: 'startup-conflict-choice-mark' }, [icon(iconName, 15)]),
+      el('span', { class: 'startup-conflict-choice-text' }, [
+        el('span', { class: 'startup-conflict-choice-title' }, [
+          el('span', { text: title }),
+          badge ? el('span', { class: 'startup-conflict-choice-badge', text: badge }) : null,
+        ]),
+        ...lines.map((text) => el('span', { class: 'startup-conflict-choice-line', text })),
+      ]),
+    ]);
+    choices.push(node);
+    return node;
+  };
+  const modal = el('section', {
+    class: 'modal startup-conflict-modal',
+    attrs: { role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'startup-conflict-title' },
+  }, [
+    el('header', { class: 'modal-head' }, [
+      el('div', { class: 'grow' }, [
+        el('h2', { text: '开机自启动冲突', attrs: { id: 'startup-conflict-title' } }),
+        el('div', { class: 'modal-sub', text: 'ChatGPT 自带的开机启动也处于开启状态' }),
+      ]),
+      el('button', {
+        class: 'btn btn-icon',
+        type: 'button',
+        title: '关闭',
+        attrs: { 'aria-label': '关闭' },
+        on: { click: closeModal },
+      }, [icon('x', 15)]),
+    ]),
+    el('div', { class: 'modal-body' }, [
+      el('div', { class: 'note note-warn' }, [
+        icon('alert', 14),
+        el('div', {
+          class: 'grow',
+          text: '开机时 gpt++ 和 ChatGPT 会同时启动 ChatGPT。ChatGPT 自己先启动时不带调试端口，'
+            + '用量信息栏、语音输入等插件无法注入；gpt++ 只能把刚打开的 ChatGPT 关掉再重开一次。请选择由谁负责启动：',
+        }),
+      ]),
+      el('div', { class: 'startup-conflict-choices' }, [
+        choiceCard({
+          choice: 'gptplus',
+          iconName: 'plug',
+          title: '由 gpt++ 拉起 ChatGPT',
+          badge: '推荐',
+          lines: own.locked
+            ? ['ChatGPT 的开机启动由系统策略强制开启，无法在这里关闭。']
+            : [
+                '关闭 ChatGPT 自带的开机启动，开机后由 gpt++ 启动 ChatGPT 并正确注入插件。',
+                '之后可在任务管理器的“启动应用”里重新开启 ChatGPT。',
+              ],
+          locked: own.locked === true,
+        }),
+        choiceCard({
+          choice: 'chatgpt',
+          iconName: 'power',
+          title: '由 ChatGPT 自己启动',
+          lines: [
+            'gpt++ 改为“仅 gpt++”开机自启动，不再拉起 ChatGPT。',
+            '风险：开机后的 ChatGPT 不带插件，需要在 gpt++ 里点“重启 ChatGPT”才会注入。',
+          ],
+        }),
+      ]),
+    ]),
+    el('div', { class: 'modal-foot' }, [
+      el('span', { class: 'hint', text: '暂不处理则保持现状，冲突时 gpt++ 会自动重启 ChatGPT' }),
+      el('span', { class: 'right' }),
+      el('button', { class: 'btn btn-ghost', type: 'button', on: { click: closeModal } }, [
+        el('span', { text: '暂不处理' }),
+      ]),
+    ]),
+  ]);
+  openModal(modal);
 }
 
 /** 侧栏里的全局客户端重启动作：所有页面共用同一份确认状态。 */
@@ -2038,6 +2185,8 @@ async function boot() {
   syncUsageAutoRefresh();
   logLocal('info', '界面已就绪：gpt++ 渲染层 v1');
   document.documentElement.dataset.ready = '1';
+  // 已有的冲突配置也要提示一次；更新弹窗占用时稍后再试。
+  void checkStartupConflict({ retries: 30 });
   api.notifyReady?.(document.documentElement.dataset.theme);
 
   // 模型、设置和历史日志不再挡住首屏；加载完成后只刷新真正受影响的区域。

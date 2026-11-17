@@ -2436,6 +2436,52 @@ html.is-theme-switching .logs {
 .modal.model-delete-modal { width: min(430px, 100%); }
 .modal.provider-delete-modal { width: min(430px, 100%); }
 .modal.usage-clear-modal { width: min(440px, 100%); }
+.modal.startup-conflict-modal { width: min(500px, 100%); }
+.startup-conflict-choices { display: grid; gap: var(--sp-2); }
+.startup-conflict-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--glass-inset);
+  color: var(--fg-dim);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: color var(--dur-2) var(--ease-out), background var(--dur-2) var(--ease-out), border-color var(--dur-2) var(--ease-out), transform var(--dur-2) var(--ease-out);
+}
+.startup-conflict-choice:hover:not([disabled]) { background: var(--bg-hover); border-color: var(--accent-line); transform: translateY(-1px); }
+.startup-conflict-choice.is-recommended { border-color: var(--ok-line); background: var(--ok-soft); }
+.startup-conflict-choice.is-recommended:hover:not([disabled]) { border-color: var(--ok); background: var(--ok-soft); }
+.startup-conflict-choice:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.startup-conflict-choice[disabled] { opacity: 0.55; cursor: default; }
+.startup-conflict-choice-mark {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--glass-inset);
+  color: var(--fg-dim);
+}
+.startup-conflict-choice.is-recommended .startup-conflict-choice-mark { border-color: var(--ok-line); color: var(--ok); }
+.startup-conflict-choice-text { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.startup-conflict-choice-title { display: flex; align-items: center; gap: 7px; color: var(--fg); font-size: 13px; font-weight: 600; }
+.startup-conflict-choice-badge {
+  padding: 1px 7px;
+  border: 1px solid var(--ok-line);
+  border-radius: 999px;
+  color: var(--ok);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+.startup-conflict-choice-line { font-size: var(--fs-meta); line-height: 1.55; color: var(--fg-dim); }
 .modal.model-test-modal { width: min(580px, 100%); }
 .modal.provider-transfer-modal { width: min(700px, 100%); }
 .modal.peer-settings-modal { width: min(820px, 100%); max-height: min(90vh, 820px); }

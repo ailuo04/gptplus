@@ -212,6 +212,8 @@ test('开机自启动开关常驻左侧底部并调用系统登录项 API', () =
   assert.match(cssSrc, /\.sidebar-startup-toggle\s*\{[^}]*width:\s*40px;/s, '同排开关应保持紧凑的固定宽度');
   assert.match(preloadSrc, /getStartup:.*gptplus:startup:get/, 'preload 必须暴露读取启动状态 API');
   assert.match(preloadSrc, /setStartup:.*gptplus:startup:set/, 'preload 必须暴露设置启动状态 API');
+  assert.match(preloadSrc, /getChatGptOwnStartup:.*gptplus:startup:chatgpt:get/, 'preload 必须暴露读取 ChatGPT 自带启动状态 API');
+  assert.match(preloadSrc, /disableChatGptOwnStartup:.*gptplus:startup:chatgpt:disable/, 'preload 必须暴露关闭 ChatGPT 自带启动 API');
   assert.match(cssSrc, /\.sidebar-startup\s*\{/, '开机自启动控件必须有独立样式');
   assert.match(cssSrc, /\.sidebar-startup-toggle\.is-enabled/, '开机自启动必须有开启态样式');
   assert.match(cssSrc, /\.sidebar-startup-option\.is-selected/, '启动目标必须有选中态样式');
@@ -2317,6 +2319,73 @@ test('开机自启动目标支持双向切换，关闭再开启时保留所选�
     click(option('both'));
     await flush();
     assert.equal(calls.length, count, '重复点击当前目标不应再次保存');
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('开机自启动冲突：ChatGPT 自带启动开启时弹窗让用户二选一', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    installFakeDom();
+    const nodes = new Map([...read(HTML).matchAll(/\bid="([^"]+)"/g)]
+      .map((match) => [match[1], new FakeNode('div')]));
+    document.getElementById = (id) => nodes.get(id) || null;
+    let saved = { supported: true, enabled: true, target: 'both' };
+    let ownEnabled = true;
+    const calls = [];
+    window.gptplus = {
+      ...makeApi(fixtureState(), calls),
+      getStartup: async () => ({ ...saved }),
+      setStartup: async (patch) => {
+        calls.push(['setStartup', { ...patch }]);
+        saved = { ...saved, ...patch };
+        return { ...saved };
+      },
+      getChatGptOwnStartup: async () => ({ supported: true, enabled: ownEnabled, locked: false }),
+      disableChatGptOwnStartup: async () => {
+        calls.push(['disableChatGptOwnStartup']);
+        ownEnabled = false;
+        return { supported: true, enabled: false, locked: false };
+      },
+    };
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    await flush();
+    const modalRoot = nodes.get('modal-root');
+    const sidebar = nodes.get('sidebar-actions');
+    const openChoices = () => modalRoot.find('modal-backdrop')
+      .filter((node) => !node.classList.contains('is-closing'))
+      .flatMap((node) => node.find('startup-conflict-choice'));
+    const choice = (name) => openChoices().find((node) => node.dataset.startupConflictChoice === name);
+    const option = (target) => sidebar.find('sidebar-startup-option')
+      .find((node) => node.dataset.startupTarget === target);
+
+    assert.equal(openChoices().length, 2, '启动时已有冲突必须弹出二选一提示');
+    assert.equal(modalRoot.find('note-warn').length > 0, true, '弹窗必须说明风险');
+
+    click(choice('chatgpt'));
+    await flush();
+    assert.deepEqual(calls.at(-1), ['setStartup', { enabled: true, target: 'gptplus' }]);
+    assert.deepEqual(appMod.state.startup, { supported: true, enabled: true, target: 'gptplus' });
+    assert.equal(openChoices().length, 0, '选择后弹窗必须关闭');
+
+    click(option('both'));
+    await flush();
+    assert.equal(openChoices().length, 2, '重新选择由 gpt++ 拉起 ChatGPT 时必须再次提示');
+    click(choice('gptplus'));
+    await flush();
+    assert.deepEqual(calls.at(-1), ['disableChatGptOwnStartup']);
+    assert.equal(appMod.state.startup.target, 'both', '由 gpt++ 拉起时保留启动目标');
+    assert.equal(openChoices().length, 0);
+
+    click(option('gptplus'));
+    await flush();
+    click(option('both'));
+    await flush();
+    assert.equal(openChoices().length, 0, 'ChatGPT 自带启动已关闭时不再提示');
   } finally {
     delete globalThis.document;
     delete globalThis.window;

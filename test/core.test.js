@@ -2713,6 +2713,48 @@ test('ipc: 开机自启动读取与切换委托给系统登录项设置', async 
   );
 });
 
+test('ipc: ChatGPT 自带开机启动的读取与关闭使用配置里的客户端路径', async (t) => {
+  const { registerIpc } = require(path.join(CORE, 'ipc.js'));
+  const dir = tmpDir('ipc-startup-chatgpt');
+  cleanup(t, dir);
+  const store = createStore({ configPath: path.join(dir, 'config.json') });
+  store.update((draft) => { draft.chatgpt.executablePath = 'D:\\Apps\\ChatGPT.exe'; });
+  const channels = new Map();
+  const calls = [];
+  const logs = [];
+  let enabled = true;
+  let readError = null;
+  const chatgptTask = {
+    read: async (options) => {
+      calls.push(['read', options.preferredPath]);
+      if (readError) throw readError;
+      return { supported: true, enabled, locked: false };
+    },
+    disable: async (options) => {
+      calls.push(['disable', options.preferredPath]);
+      enabled = false;
+      return { supported: true, enabled, locked: false };
+    },
+  };
+  const ctx = {
+    paths: {}, store, catalog: {}, codex: {}, providerClient: {},
+    models: () => [], status: () => ({}),
+    gateway: { getState: () => ({ running: false, port: 18120, url: '', host: '127.0.0.1' }) },
+    log: (entry) => logs.push(entry), onLogEvent: () => () => {}, emitStatus: () => {},
+  };
+  registerIpc({
+    ipcMain: { handle: (ch, fn) => channels.set(ch, fn) }, shell: {}, dialog: {}, ctx,
+    startup: { get: () => ({ supported: true, enabled: true, target: 'both' }), set: () => ({}), chatgptTask },
+  });
+
+  assert.deepEqual(await channels.get('gptplus:startup:chatgpt:get')({}), { supported: true, enabled: true, locked: false });
+  assert.deepEqual(await channels.get('gptplus:startup:chatgpt:disable')({}), { supported: true, enabled: false, locked: false });
+  assert.deepEqual(calls, [['read', 'D:\\Apps\\ChatGPT.exe'], ['disable', 'D:\\Apps\\ChatGPT.exe']]);
+  assert.match(logs.at(-1).msg, /已关闭 ChatGPT 自带的开机启动/);
+  readError = new Error('reg unavailable');
+  assert.deepEqual(await channels.get('gptplus:startup:chatgpt:get')({}), { supported: false, enabled: false, locked: false });
+});
+
 test('ipc: 批量排序会过滤未知和重复项，补齐缺失模型并触发状态更新', async () => {
   const { registerIpc } = require(path.join(CORE, 'ipc.js'));
   const dir = tmpDir('ipc-model-reorder');

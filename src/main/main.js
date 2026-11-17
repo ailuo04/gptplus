@@ -247,24 +247,49 @@ async function launchChatGptAtLogin(commandLine = process.argv) {
     let result;
     if (pagePluginsEnabled) {
       const imageName = preferredPath ? path.win32.basename(preferredPath) : undefined;
-      const existingPids = await listChatGptPids(imageName ? { imageName } : {});
-      if (existingPids.length > 0) {
+      const processQuery = imageName ? { imageName } : {};
+      // ChatGPT 自带的开机启动任务可能抢先拉起不带调试端口的实例，并通过单实例机制
+      // 吞掉这里的带端口启动。所以必须确认 CDP 真的可连；不可连就重启客户端再试。
+      const maxAttempts = 3;
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        const existingPids = await listChatGptPids(processQuery);
+        let runningCdpPort = null;
+        if (existingPids.length > 0) {
+          try {
+            runningCdpPort = await findChatGptDebugPort(processQuery);
+          } catch (error) {
+            ctx?.log?.({ level: 'warn', msg: '无法读取 ChatGPT 调试端口: ' + error.message });
+          }
+        }
+        loginChatGptCdpPort = runningCdpPort || await findAvailablePort(9229);
+        const launchOptions = {
+          preferredPath,
+          cdpPort: loginChatGptCdpPort,
+          wrapperDir: path.join(ctx.paths.APP_DIR, 'cdp'),
+        };
         try {
-          loginChatGptCdpPort = await findChatGptDebugPort(imageName ? { imageName } : {});
+          result = existingPids.length > 0 && !runningCdpPort
+            ? await relaunchChatGpt(launchOptions)
+            : await launchChatGptAndVerify(launchOptions);
         } catch (error) {
-          ctx?.log?.({ level: 'warn', msg: '无法读取 ChatGPT 调试端口: ' + error.message });
+          result = { ok: false, error: error.message };
+        }
+        if (result.ok) {
+          try {
+            await waitForTarget(loginChatGptCdpPort, { timeoutMs: 15000 });
+            break;
+          } catch (error) {
+            result = { ok: false, error: 'ChatGPT 调试端口未就绪: ' + error.message };
+          }
+        }
+        if (attempt < maxAttempts) {
+          ctx?.log?.({
+            level: 'warn',
+            msg: `开机启动 ChatGPT 第 ${attempt} 次未就绪（${result.error}），正在重试`,
+          });
         }
       }
-      const runningCdpPort = loginChatGptCdpPort;
-      if (!runningCdpPort) loginChatGptCdpPort = await findAvailablePort(9229);
-      const launchOptions = {
-        preferredPath,
-        cdpPort: loginChatGptCdpPort,
-        wrapperDir: path.join(ctx.paths.APP_DIR, 'cdp'),
-      };
-      result = existingPids.length > 0 && !runningCdpPort
-        ? await relaunchChatGpt(launchOptions)
-        : await launchChatGptAndVerify(launchOptions);
+      if (!result.ok) loginChatGptCdpPort = null;
     } else {
       result = await launchChatGptAndVerify({ preferredPath });
     }

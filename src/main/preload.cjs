@@ -56,6 +56,8 @@ contextBridge.exposeInMainWorld('gptplus', {
   setTheme: (patch) => invoke('gptplus:theme:set', patch),
   getStartup: () => invoke('gptplus:startup:get'),
   setStartup: (patch) => invoke('gptplus:startup:set', patch),
+  getChatGptOwnStartup: () => invoke('gptplus:startup:chatgpt:get'),
+  disableChatGptOwnStartup: () => invoke('gptplus:startup:chatgpt:disable'),
   setNetwork: (patch) => invoke('gptplus:network:set', patch),
   listProviders: () => invoke('gptplus:provider:list'),
   saveProvider: (input) => invoke('gptplus:provider:save', input),

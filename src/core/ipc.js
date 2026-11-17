@@ -10,6 +10,7 @@ const { validateImageConfig } = require('./image-generation.js');
 const { slugForProvider } = require('./model-utils.js');
 const { resolveChatGptExe } = require('./chatgpt-install.js');
 const { relaunchChatGpt } = require('./chatgpt-launch.js');
+const { readChatGptStartupTask, disableChatGptStartupTask } = require('./chatgpt-startup-task.js');
 const { installChatGptBalanceOnPort } = require('./chatgpt-balance.js');
 const { launchChatGptWithUsageStatusline } = require('./chatgpt-statusline.js');
 
@@ -347,6 +348,27 @@ function registerIpc(deps) {
       : { supported: true, enabled: raw, target: target === 'both' ? 'both' : 'gptplus' };
     ctx.log({ level: 'info', msg: next.enabled ? '已开启开机自启动' : '已关闭开机自启动' });
     return next;
+  });
+
+  // ChatGPT 自带的开机启动会和“gpt++ 拉起 ChatGPT”抢跑，界面据此提示用户二选一。
+  const chatgptStartupTask = startup?.chatgptTask || {
+    read: readChatGptStartupTask,
+    disable: disableChatGptStartupTask,
+  };
+  const chatgptStartupOptions = () => ({
+    preferredPath: store.get()?.chatgpt?.executablePath || null,
+  });
+  handle('gptplus:startup:chatgpt:get', async () => {
+    try {
+      return await chatgptStartupTask.read(chatgptStartupOptions());
+    } catch {
+      return { supported: false, enabled: false, locked: false };
+    }
+  });
+  handle('gptplus:startup:chatgpt:disable', async () => {
+    const result = await chatgptStartupTask.disable(chatgptStartupOptions());
+    ctx.log({ level: 'info', msg: '已关闭 ChatGPT 自带的开机启动，改由 gpt++ 拉起 ChatGPT' });
+    return result;
   });
 
   // ---- 网络与代理 ----

@@ -57,8 +57,14 @@ function setup(options = {}) {
     },
     findAvailablePort: async (port) => port,
     findChatGptDebugPort: async () => options.runningCdpPort || null,
-    listChatGptPids: async () => options.runningPids || [],
-    waitForTarget: async (port) => { calls.push({ type: 'wait-cdp', port }); },
+    listChatGptPids: async () => (options.pidsAfterLaunch && calls.some((call) => call.type === 'launch')
+      ? options.pidsAfterLaunch
+      : options.runningPids || []),
+    waitForTarget: async (port) => {
+      calls.push({ type: 'wait-cdp', port });
+      const waits = calls.filter((call) => call.type === 'wait-cdp').length;
+      if (waits <= (options.cdpFailures || 0)) throw new Error('connect ECONNREFUSED');
+    },
     launchChatGptAndVerify: async (launchOptions) => {
       calls.push({ type: 'launch', preferredPath: launchOptions.preferredPath, ...('cdpPort' in launchOptions ? { cdpPort: launchOptions.cdpPort } : {}), ...('wrapperDir' in launchOptions ? { wrapperDir: launchOptions.wrapperDir } : {}) });
       if (options.launchError) throw new Error(options.launchError);
@@ -99,12 +105,33 @@ test('Windows login marker launches ChatGPT even though wasOpenedAtLogin is fals
   assert.deepEqual(calls, [{ type: 'launch', preferredPath: null }]);
 });
 
-test('cold login starts ChatGPT with CDP and does not wait for plugin injection', async () => {
+test('cold login starts ChatGPT with CDP and confirms the debug port is reachable', async () => {
   const { api, calls } = setup({ activePlugins: ['usage-statusline'] });
   await api.launch();
-  assert.deepEqual(calls, [{
-    type: 'launch', preferredPath: null, cdpPort: 9229, wrapperDir: 'C:\\gptplus\\cdp',
-  }]);
+  assert.deepEqual(calls, [
+    { type: 'launch', preferredPath: null, cdpPort: 9229, wrapperDir: 'C:\\gptplus\\cdp' },
+    { type: 'wait-cdp', port: 9229 },
+  ]);
+});
+
+test('login restarts ChatGPT when its own startup task wins the race without CDP', async () => {
+  const { api, calls, logs } = setup({
+    activePlugins: ['usage-statusline'], pidsAfterLaunch: [777], cdpFailures: 1,
+  });
+  await api.launch();
+  assert.deepEqual(calls.map((call) => call.type), ['launch', 'wait-cdp', 'relaunch', 'wait-cdp']);
+  assert.match(logs.at(-1).msg, /已按开机自启动设置启动 ChatGPT/);
+});
+
+test('login gives up after bounded CDP retries and reports the failure', async () => {
+  const { api, calls, logs } = setup({
+    activePlugins: ['voice-input'], pidsAfterLaunch: [777], cdpFailures: 99,
+  });
+  await api.launch();
+  assert.deepEqual(calls.map((call) => call.type), [
+    'launch', 'wait-cdp', 'relaunch', 'wait-cdp', 'relaunch', 'wait-cdp',
+  ]);
+  assert.match(logs.at(-1).msg, /开机自启动 ChatGPT 失败: ChatGPT 调试端口未就绪/);
 });
 
 test('voice-only login starts ChatGPT with CDP for later background injection', async () => {
@@ -112,6 +139,7 @@ test('voice-only login starts ChatGPT with CDP for later background injection', 
   await api.launch();
   assert.deepEqual(calls, [
     { type: 'launch', preferredPath: null, cdpPort: 9229, wrapperDir: 'C:\\gptplus\\cdp' },
+    { type: 'wait-cdp', port: 9229 },
   ]);
 });
 
@@ -120,15 +148,17 @@ test('login reuses the CDP port of an already running ChatGPT', async () => {
   await api.launch();
   assert.deepEqual(calls, [
     { type: 'launch', preferredPath: null, cdpPort: 9230, wrapperDir: 'C:\\gptplus\\cdp' },
+    { type: 'wait-cdp', port: 9230 },
   ]);
 });
 
 test('login restarts an already running ChatGPT only when it has no CDP port', async () => {
   const { api, calls } = setup({ activePlugins: ['voice-input'], runningPids: [123] });
   await api.launch();
-  assert.deepEqual(calls, [{
-    type: 'relaunch', preferredPath: null, cdpPort: 9229, wrapperDir: 'C:\\gptplus\\cdp',
-  }]);
+  assert.deepEqual(calls, [
+    { type: 'relaunch', preferredPath: null, cdpPort: 9229, wrapperDir: 'C:\\gptplus\\cdp' },
+    { type: 'wait-cdp', port: 9229 },
+  ]);
 });
 
 test('quota configuration does not delay the ChatGPT launch for bridge injection', async () => {
@@ -143,6 +173,7 @@ test('balance bridge injection is deferred until after ChatGPT starts', async ()
   await api.launch();
   assert.deepEqual(calls, [
     { type: 'launch', preferredPath: null, cdpPort: 9229, wrapperDir: String.raw`C:\gptplus\cdp` },
+    { type: 'wait-cdp', port: 9229 },
   ]);
 });
 
