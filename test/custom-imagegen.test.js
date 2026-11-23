@@ -309,8 +309,8 @@ test('installed skill helper actually uses local authenticated route, saves outp
   assert.equal(calls, 1);
 });
 
-function ipcFixture(t) {
-  const f = skillFixture(t);
+function ipcFixture(t, original) {
+  const f = skillFixture(t, original);
   const { registerIpc } = require('../src/core/ipc.js');
   const channels = new Map();
   const ctx = { store: f.store, plugins: f.plugins, imageGeneration: imageService(f), imagegenSkill: f.runtime, log() {}, onLogEvent: () => () => {},
@@ -343,6 +343,51 @@ test('image IPC validates before enable and synchronizes enable, preference, uni
   assert.equal(f.runtime.status().enabled, false);
   assert.equal(f.plugins.get('custom-imagegen').installed, false);
   assert.equal(f.plugins.config('custom-imagegen').apiKey, 'sk-private-image-key');
+});
+
+test('image IPC saves after Codex inserts a TUI table before the skill closing marker', async (t) => {
+  for (const [name, eol] of [['LF', '\n'], ['CRLF', '\r\n']]) {
+    await t.test(name, async (t) => {
+      const f = ipcFixture(t, ['# user config', 'model = "keep"', ''].join(eol));
+      configure(f);
+      await f.call('enabled:set', { id: 'custom-imagegen', enabled: true });
+      const end = '# <<< gpt++ custom image skill <<<' + eol;
+      const tui = ['', '[tui]', 'screen_reader_detection_done = true', ''].join(eol);
+      const clean = fs.readFileSync(f.codexConfigPath, 'utf8');
+      const inserted = clean.replace(end, tui + end) + eol + '[other]' + eol + 'value = 1' + eol;
+      fs.writeFileSync(f.codexConfigPath, inserted);
+      const repaired = clean.replace(end, end + tui) + eol + '[other]' + eol + 'value = 1' + eol;
+      assert.equal(f.runtime.status().enabled, true);
+      assert.equal(fs.readFileSync(f.codexConfigPath, 'utf8'), inserted, 'status stays read-only');
+
+      const result = await f.call('config:set', { id: 'custom-imagegen', config: {
+        baseUrl: 'https://images.example/v1', apiKey: '', model: 'updated-model', preferDefault: true,
+      } });
+      assert.equal(result.imageStatus.error, '');
+      assert.equal(f.plugins.config('custom-imagegen').model, 'updated-model');
+      assert.equal(f.plugins.config('custom-imagegen').apiKey, 'sk-private-image-key');
+      assert.equal(fs.readFileSync(f.codexConfigPath, 'utf8'), repaired);
+      assert.equal(fs.readFileSync(f.backups.at(-1), 'utf8'), inserted);
+      assert.equal(f.runtime.sync({ enabled: true }).changed, false);
+    });
+  }
+});
+
+test('skill repair still rejects changes to the owned settings', (t) => {
+  const f = skillFixture(t);
+  f.runtime.sync({ enabled: true });
+  const clean = fs.readFileSync(f.codexConfigPath, 'utf8');
+  const end = '# <<< gpt++ custom image skill <<<' + '\r\n';
+  const tui = '\r\n[tui]\r\nscreen_reader_detection_done = true\r\n';
+  const cases = [
+    clean.replace('enabled = true', 'enabled = false').replace(end, tui + end),
+    clean.replace(end, 'unknown_key = true\r\n' + tui + end),
+  ];
+  for (const original of cases) {
+    fs.writeFileSync(f.codexConfigPath, original);
+    assert.throws(() => f.runtime.sync({ enabled: true }), /校验失败/);
+    assert.equal(fs.readFileSync(f.codexConfigPath, 'utf8'), original);
+  }
 });
 
 test('image IPC rolls skill/config changes back when secure state persistence fails', async (t) => {

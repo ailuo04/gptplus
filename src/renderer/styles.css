@@ -3521,8 +3521,8 @@ html.is-theme-switching .logs {
 .voice-config-section .hint { margin: 0; }
 .voice-config-section .field { gap: 7px; }
 .voice-hotkey-row { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
-.voice-hotkey-capture { min-height: 34px; padding-inline: 12px; border-color: var(--accent-line); background: var(--accent-soft); color: var(--accent-hi); }
-.voice-hotkey-capture:hover:not([disabled]) { border-color: var(--accent-line); background: var(--accent-soft); color: var(--accent-hi); }
+.voice-hotkey-capture { min-height: 34px; padding-inline: 12px; }
+.voice-hotkey-reset { border-color: var(--line-strong); }
 .voice-config-body .select-picker-menu { z-index: 40; }
 .plugin-config-options { display: flex; flex-direction: column; gap: 8px; }
 .plugin-config-option { display: flex; align-items: flex-start; gap: 10px; padding: 10px 11px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--bg-inset); cursor: pointer; }

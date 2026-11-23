@@ -406,7 +406,7 @@ function openVoiceConfig(ctx, plugin) {
   const rawSpaceHoldMs = Number(current.spaceHoldMs);
   const spaceHoldSeconds = Number.isFinite(rawSpaceHoldMs) ? Math.min(5, Math.max(0.3, rawSpaceHoldMs / 1000)) : 1;
   const hotkeyCapture = ctx.el('button', {
-    class: 'btn btn-ghost btn-sm mono voice-hotkey-capture',
+    class: 'btn btn-primary btn-sm mono voice-hotkey-capture',
     type: 'button',
     attrs: { 'aria-label': '语音输入快捷键' },
     text: `${voiceHotkeyLabel(selectedHotkey)}（按住）`,
@@ -439,7 +439,7 @@ function openVoiceConfig(ctx, plugin) {
     hotkeyCapture.textContent = `${voiceHotkeyLabel(selectedHotkey)}（按住）`;
   });
   const resetHotkey = ctx.el('button', {
-    class: 'btn btn-ghost btn-sm',
+    class: 'btn btn-ghost btn-sm voice-hotkey-reset',
     type: 'button',
     text: '恢复 Alt',
     on: { click: () => {

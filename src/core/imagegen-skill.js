@@ -23,6 +23,22 @@ function atomicWrite(file, text) {
   try { fs.writeFileSync(temporary, text, { flag: 'wx' }); fs.renameSync(temporary, file); }
   finally { fs.rmSync(temporary, { force: true }); }
 }
+function managedBodyEnd(lines, start, end, checksum) {
+  const hash = crypto.createHash('sha256');
+  for (let i = start; i < end; i += 1) {
+    hash.update(lines[i]);
+    if (hash.copy().digest('hex') !== checksum) continue;
+    const boundary = i + 1;
+    if (boundary === end) return end;
+    // A TOML editor can insert its own table before the trailing comment marker.
+    // Only recover an intact body followed by an independent, non-skill table.
+    const first = lines.slice(boundary, end).map((line) => line.trim()).find((line) => line && !line.startsWith('#'));
+    const table = first?.match(/^\[\s*([\w-]+)(?:\s*\.\s*[\w-]+)*\s*\]\s*(?:#.*)?$/);
+    if (table && table[1] !== 'skills') return boundary;
+    break;
+  }
+  throw new Error('生图技能配置校验失败，配置块已被修改，未覆盖');
+}
 function managedSection(text) {
   const lines = toml.splitKeepEol(text);
   const starts = [], ends = [];
@@ -30,19 +46,21 @@ function managedSection(text) {
     if (line.startsWith(BEGIN)) starts.push(i);
     if (line.trimEnd() === END) ends.push(i);
   });
-  if (!starts.length && !ends.length) return { text, state: null, start: -1, lines };
+  if (!starts.length && !ends.length) return { text, state: null };
   const start = starts[0], end = ends[0];
   const match = lines[start]?.trimEnd().match(/^# >>> gpt\+\+ custom image skill sha256=([a-f0-9]{64}) >>>$/);
   if (starts.length !== 1 || ends.length !== 1 || end <= start || !match) throw new Error('生图技能配置标记已被修改，未覆盖');
-  const body = lines.slice(start + 1, end).join('');
-  if (digest(body) !== match[1]) throw new Error('生图技能配置校验失败，配置块已被修改，未覆盖');
+  const bodyEnd = managedBodyEnd(lines, start + 1, end, match[1]);
   let state;
   try { state = JSON.parse(lines[start + 1].trimEnd().slice('# state: '.length)); }
   catch { throw new Error('生图技能状态无效，未覆盖'); }
   if (typeof state.enabled !== 'boolean' || typeof state.preferDefault !== 'boolean' || typeof state.builtinSkillDisabled !== 'boolean') {
     throw new Error('生图技能状态无效，未覆盖');
   }
-  return { state, start, end, lines, text: lines.slice(0, start).concat(lines.slice(end + 1)).join('') };
+  const before = lines.slice(0, start).join('');
+  const after = lines.slice(bodyEnd, end).concat(lines.slice(end + 1)).join('');
+  const eol = lines[start].match(/(?:\r\n|\n|\r)$/)[0];
+  return { state, before, after, eol, text: before + after };
 }
 function checkSkillTables(text) {
   const lines = toml.splitKeepEol(text);
@@ -117,13 +135,13 @@ function createImagegenSkill({ codexHome, configPath, appConfigPath, backup } = 
     if (enabled) verifyAssets();
     const state = { enabled: enabled === true, preferDefault: enabled && preferDefault !== false,
       builtinSkillDisabled: enabled && preferDefault !== false && fs.existsSync(builtinPath) };
-    const eol = (original || '').includes('\r\n') ? '\r\n' : '\n';
+    const eol = section.eol || ((original || '').includes('\r\n') ? '\r\n' : '\n');
     const lines = [`# state: ${JSON.stringify(state)}`, '[[skills.config]]', `path = ${toml.tomlString(skillPath)}`, `enabled = ${state.enabled}`];
     if (state.builtinSkillDisabled) lines.push('[[skills.config]]', `path = ${toml.tomlString(builtinPath)}`, 'enabled = false');
     const body = lines.join(eol) + eol;
     const block = `${BEGIN} sha256=${digest(body)} >>>${eol}${body}${END}${eol}`;
     const next = section.state
-      ? section.lines.slice(0, section.start).join('') + block + section.lines.slice(section.end + 1).join('')
+      ? section.before + block + section.after
       : section.text + (section.text && !/[\r\n]$/.test(section.text) ? eol : '') + block;
     const changes = [];
     if (enabled) for (const [name, content] of desiredAssets()) {
@@ -148,7 +166,11 @@ function createImagegenSkill({ codexHome, configPath, appConfigPath, backup } = 
       }
     }
     try {
-      for (const change of changes) { atomicWrite(change.file, change.next); applied.push(change); }
+      for (const change of changes) {
+        if (read(change.file) !== change.previous) throw new Error('生图配置或技能文件已被外部修改，未覆盖');
+        atomicWrite(change.file, change.next);
+        applied.push(change);
+      }
     } catch (err) {
       try { rollback(); } catch (rollbackError) { throw new Error('生图技能写入和回退失败：' + rollbackError.message); }
       throw err;
