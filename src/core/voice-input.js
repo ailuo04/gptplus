@@ -14,8 +14,10 @@ const {
 const { findChatGptDebugPort } = require('./chatgpt-launch.js');
 const { stripEndpoint } = require('./base-url.js');
 const { createSystemProxyFetch } = require('./system-proxy.js');
-const { localSpeechStatus, prepareSpeechModel, transcribeLocal } = require('./local-speech.js');
+const { localSpeechStatus, prepareSpeechModel, startSpeechStream, transcribeLocal } = require('./local-speech.js');
+const { createSegmentComposer, joinClauses, needsSpace } = require('./speech-segmenter.js');
 const { normalizeVoiceSpaceHoldMs } = require('./plugin-manager.js');
+const { createLoopbackCapture, loopbackAvailable } = require('./voice-loopback.js');
 
 const DEFAULT_INJECT_TIMEOUT_MS = 30000;
 const SCRIPT_READY_WAIT_MS = 15000;
@@ -23,6 +25,8 @@ const PROBE_READY_WAIT_MS = 2000;
 const RETRY_INTERVAL_MS = 400;
 const VOICE_POLL_MS = 350;
 const VOICE_HIDDEN_POLL_MS = 1800;
+/** 录音/实时转写期间的高频轮询，直接把采集块交给主进程 */
+const STREAM_POLL_MS = 140;
 const COMMAND_TIMEOUT_MS = 5000;
 const ERROR_LOG_INTERVAL_MS = 60000;
 const TRANSCRIBE_TIMEOUT_MS = 90000;
@@ -38,20 +42,31 @@ function sleep(ms) {
  * 页面内运行时。这个函数会被 toString() 后注入 ChatGPT 页面，必须完全自包含。
  * @param {'local'|'system'|'provider'} engine
  * @param {number} readyWaitMs
+ * @param {boolean} localReady
+ * @param {string} language
  * @param {number} spaceHoldMs
+ * @param {boolean} streaming
+ * @param {boolean} loopback
  */
-function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs) {
+function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs, streaming, loopback) {
   'use strict';
   var READY_WAIT_MS = Math.max(500, Number(readyWaitMs) || 15000);
   var ENGINE = engine === 'provider' ? 'provider' : engine === 'system' ? 'system' : 'local';
   var LOCAL_READY = localReady === true;
+  var STREAMING = streaming === true && ENGINE === 'local';
+  var LOOPBACK = loopback === true && STREAMING;
   var ID = 'gptplus-voice-input';
   var WRAP_ID = 'gptplus-voice-input-wrap';
   var PANEL_ID = 'gptplus-voice-panel';
+  var CAPTION_ID = 'gptplus-voice-caption';
   var STYLE_ID = 'gptplus-voice-input-style';
   var EXT_ATTR = 'data-gptplus-voice-input';
-  var RUNTIME_KEY = 'gptplus-voice-input-v13';
+  var RUNTIME_KEY = 'gptplus-voice-input-v15';
   var MAX_RECORD_MS = 120000;
+  var MAX_STREAM_MS = 600000;
+  var PCM_CHUNK = 2048;
+  var PCM_RATE = 16000;
+  var OUTBOX_LIMIT = 240;
   var PTT_HOLD_MS = Math.min(5000, Math.max(300, Math.round((Number(spaceHoldMs) || 1000) / 100) * 100));
   var PTT_HOLD_LABEL = String(PTT_HOLD_MS / 1000).replace(/\.0$/, '');
   var state = {
@@ -62,9 +77,21 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     timerLabel: null,
     actionButton: null,
     waveform: null,
+    caption: null,
+    captionText: null,
+    captionTail: null,
     status: 'idle',
     recorder: null,
     stream: null,
+    session: null,
+    streamId: '',
+    recordMode: '',
+    outbox: [],
+    pcmCarry: new Float32Array(0),
+    processor: null,
+    mute: null,
+    loopbackWait: 0,
+    loopbackLevel: 0,
     chunks: [],
     audioContext: null,
     analyser: null,
@@ -113,14 +140,16 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     var zh = isZh();
     return {
       idle: zh
-        ? (ENGINE === 'local' ? '语音输入（本地识别，长按空格或输入框鼠标左键 ' + PTT_HOLD_LABEL + ' 秒）' : ENGINE === 'provider' ? '语音输入（提供商转写，长按空格或输入框鼠标左键 ' + PTT_HOLD_LABEL + ' 秒）' : '语音输入（Windows 系统听写）')
-        : (ENGINE === 'system' ? 'Voice input (Windows dictation)' : 'Voice input (hold Space or left mouse in composer for ' + PTT_HOLD_LABEL + 's)'),
+        ? (ENGINE === 'local' ? (LOOPBACK ? '语音输入（本地识别，长按空格或输入框鼠标左键 ' + PTT_HOLD_LABEL + ' 秒口述；单击转写系统声音）' : '语音输入（本地识别，长按空格或输入框鼠标左键 ' + PTT_HOLD_LABEL + ' 秒）') : ENGINE === 'provider' ? '语音输入（提供商转写，长按空格或输入框鼠标左键 ' + PTT_HOLD_LABEL + ' 秒）' : '语音输入（Windows 系统听写）')
+        : (ENGINE === 'system' ? 'Voice input (Windows dictation)' : LOOPBACK ? 'Voice input (hold Space or left mouse in composer for ' + PTT_HOLD_LABEL + 's to dictate; click to transcribe system audio)' : 'Voice input (hold Space or left mouse in composer for ' + PTT_HOLD_LABEL + 's)'),
       requesting: zh ? '请允许使用麦克风…' : 'Allow microphone access…',
+      loopbackRequesting: zh ? '正在连接系统音频…' : 'Connecting to system audio…',
       preparing: zh ? '正在准备本地识别' : 'Preparing local speech',
       downloading: zh ? '正在下载识别模型' : 'Downloading speech model',
       loading: zh ? '正在加载识别模型' : 'Loading speech model',
       recording: zh ? '停止并识别' : 'Stop and transcribe',
       transcribing: zh ? '正在识别…' : 'Transcribing…',
+      finishing: zh ? '正在完成转写…' : 'Finishing transcript…',
       retry: zh ? '重试' : 'Retry',
       cancel: zh ? '取消' : 'Cancel',
       empty: zh ? '未识别到语音' : 'No speech detected',
@@ -288,8 +317,8 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     if (state.status === 'preparing') return state.prepareText || labels.preparing;
     if (state.status === 'downloading') return state.prepareText || labels.downloading;
     if (state.status === 'loading') return state.prepareText || labels.loading;
-    if (state.status === 'requesting') return labels.requesting;
-    if (state.status === 'transcribing') return labels.transcribing;
+    if (state.status === 'requesting') return state.session && state.session.loopback ? labels.loopbackRequesting : labels.requesting;
+    if (state.status === 'transcribing') return state.session && !state.session.active ? labels.finishing : labels.transcribing;
     if (state.status === 'error') return state.lastError || labels.error;
     if (state.status === 'feedback') return state.lastError || labels.empty;
     return '';
@@ -331,6 +360,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
       }
     }
     if (state.status === 'recording') updateRecordingLabel();
+    renderCaption();
   }
 
   function setStatus(next) {
@@ -471,6 +501,324 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     return true;
   }
 
+  function pcmToBase64(samples) {
+    var bytes = new Uint8Array(samples.length * 2);
+    var view = new DataView(bytes.buffer);
+    for (var i = 0; i < samples.length; i += 1) {
+      var sample = samples[i];
+      if (sample > 1) sample = 1;
+      else if (sample < -1) sample = -1;
+      view.setInt16(i * 2, Math.round(sample * (sample < 0 ? 32768 : 32767)), true);
+    }
+    return bytesToBase64(bytes);
+  }
+
+  function queueItem(type, payload) {
+    var item = { type: type };
+    if (payload) for (var key in payload) item[key] = payload[key];
+    state.outbox.push(item);
+    while (state.outbox.length > OUTBOX_LIMIT) state.outbox.shift();
+  }
+
+  function pushPcm(samples) {
+    if (!state.session || !samples || !samples.length) return;
+    queueItem('pcm', { id: state.session.id, data: pcmToBase64(samples) });
+  }
+
+  function feedPcm(input) {
+    if (!state.session || !input || !input.length) return;
+    var carry = state.pcmCarry;
+    var total = carry.length + input.length;
+    var merged = new Float32Array(total);
+    merged.set(carry, 0);
+    merged.set(input, carry.length);
+    var offset = 0;
+    while (total - offset >= PCM_CHUNK) {
+      pushPcm(merged.subarray(offset, offset + PCM_CHUNK));
+      offset += PCM_CHUNK;
+    }
+    state.pcmCarry = offset < total ? merged.slice(offset) : new Float32Array(0);
+  }
+
+  function onAudioProcess(event) {
+    if (!state.session || state.status !== 'recording') return;
+    try { feedPcm(event.inputBuffer.getChannelData(0)); } catch (e) {}
+  }
+
+  function renderCaption() {
+    if (!state.caption) return;
+    var session = state.session;
+    var stable = session ? session.captionStable || '' : '';
+    var tail = session ? session.captionTail || '' : '';
+    var show = !!(stable || tail) && (state.status === 'recording' || state.status === 'transcribing');
+    if (state.wrap) state.wrap.dataset.caption = show ? 'true' : 'false';
+    state.captionText.textContent = show ? stable : '';
+    state.captionTail.textContent = show ? tail : '';
+    if (show) state.caption.scrollTop = state.caption.scrollHeight;
+  }
+
+  function clearCaption() {
+    if (state.wrap) state.wrap.dataset.caption = 'false';
+    if (state.captionText) state.captionText.textContent = '';
+    if (state.captionTail) state.captionTail.textContent = '';
+  }
+
+  /** 边录边写：只在稳定分句后追加，永不回改已写入的文字。 */
+  function appendStreamText(value) {
+    var session = state.session;
+    if (!session || !value) return true;
+    var editor = editorNode();
+    if (!editor) return false;
+    if (document.activeElement !== editor) {
+      focusEditor();
+      session.focused = true;
+    }
+    if (editor.tagName === 'TEXTAREA') {
+      var start = editor.selectionStart == null ? editor.value.length : editor.selectionStart;
+      var end = editor.selectionEnd == null ? start : editor.selectionEnd;
+      if (!session.anchor) session.anchor = { kind: 'textarea', start: start };
+      editor.setRangeText(value, start, end, 'end');
+      editor.dispatchEvent(new Event('input', { bubbles: true }));
+      session.insertedText += value;
+      state.savedSelection = { start: editor.selectionStart, end: editor.selectionEnd };
+      state.savedRange = null;
+      return true;
+    }
+    var selection = window.getSelection();
+    if (!selection || !selection.rangeCount) return false;
+    if (!session.anchor) session.anchor = { kind: 'range', range: selection.getRangeAt(0).cloneRange() };
+    var ok = false;
+    try { ok = document.execCommand('insertText', false, value); } catch (e) { ok = false; }
+    if (!ok) {
+      try {
+        var range = selection.getRangeAt(0);
+        range.deleteContents();
+        var node = document.createTextNode(value);
+        range.insertNode(node);
+        range.setStartAfter(node);
+        range.collapse(true);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+      } catch (e) {
+        return false;
+      }
+    }
+    session.insertedText += value;
+    if (selection.rangeCount) state.savedRange = selection.getRangeAt(0).cloneRange();
+    return true;
+  }
+
+  /** 取消时只回滚本会话写入的内容，绝不动用户原有文字。 */
+  function rollbackSession(session) {
+    if (!session || !session.insertedText) return true;
+    var editor = editorNode();
+    if (!editor) return false;
+    var anchor = session.anchor;
+    if (editor.tagName === 'TEXTAREA') {
+      if (!anchor || anchor.kind !== 'textarea') return false;
+      var start = Math.max(0, Math.min(editor.value.length, anchor.start));
+      var end = start + session.insertedText.length;
+      if (editor.value.slice(start, end) !== session.insertedText) return false;
+      editor.setRangeText('', start, end, 'end');
+      editor.dispatchEvent(new Event('input', { bubbles: true }));
+      state.savedSelection = { start: start, end: start };
+      return true;
+    }
+    if (!anchor || anchor.kind !== 'range' || !anchor.range) return false;
+    if (!editor.contains(anchor.range.startContainer)) return false;
+    var selection = window.getSelection();
+    if (!selection || !selection.rangeCount) return false;
+    var caret = selection.getRangeAt(0);
+    if (!editor.contains(caret.endContainer)) return false;
+    var range = document.createRange();
+    range.setStart(anchor.range.startContainer, anchor.range.startOffset);
+    range.setEnd(caret.endContainer, caret.endOffset);
+    var content = String(range.toString()).replace(/\s+/g, '');
+    var expected = session.insertedText.replace(/\s+/g, '');
+    if (!content || content.slice(-Math.min(24, expected.length)) !== expected.slice(-Math.min(24, expected.length))) return false;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    var ok = false;
+    try { ok = document.execCommand('delete'); } catch (e) { ok = false; }
+    if (ok) {
+      state.savedRange = null;
+      state.savedSelection = null;
+    }
+    return ok;
+  }
+
+  function teardownStreamCapture() {
+    clearTimeout(state.loopbackWait);
+    state.loopbackWait = 0;
+    state.loopbackLevel = 0;
+    if (state.processor) {
+      try { state.processor.onaudioprocess = null; } catch (e) {}
+      try { state.processor.disconnect(); } catch (e) {}
+      state.processor = null;
+    }
+    if (state.mute) {
+      try { state.mute.disconnect(); } catch (e) {}
+      state.mute = null;
+    }
+    stopStream(state.stream);
+    state.stream = null;
+    state.pcmCarry = new Float32Array(0);
+    closeAudioContext();
+  }
+
+  function stopStreamRecording(send) {
+    var session = state.session;
+    if (!session) return;
+    clearStatusTimer();
+    session.active = false;
+    if (send === true) {
+      // 不足一块的尾部补零送出，避免最后一个音节被截断
+      if (state.pcmCarry.length) {
+        var tail = new Float32Array(PCM_CHUNK);
+        tail.set(state.pcmCarry.subarray(0, Math.min(PCM_CHUNK, state.pcmCarry.length)), 0);
+        pushPcm(tail);
+      }
+      queueItem('end', { id: session.id });
+      setStatus('transcribing');
+      teardownStreamCapture();
+      return;
+    }
+    queueItem('cancel', { id: session.id });
+    state.outbox = state.outbox.filter(function (item) { return !item || item.id !== session.id || item.type === 'cancel'; });
+    teardownStreamCapture();
+    rollbackSession(session);
+    state.session = null;
+    state.streamId = '';
+    state.recordMode = '';
+    clearCaption();
+    setStatus('idle');
+  }
+
+  function captureConstraints(mode) {
+    // 连续模式常用于外放听力素材，关闭回声消除否则会把要转写的声音当成回声压掉
+    if (mode === 'listen') {
+      return { audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true, channelCount: 1 } };
+    }
+    return { audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } };
+  }
+
+  /** 进入实时录音态：波形、计时与 10 分钟上限。麦克风与回环采集共用。 */
+  function enterStreamRecording() {
+    state.discard = false;
+    setStatus('recording');
+    startWaveform();
+    clearStatusTimer();
+    state.timer = setInterval(updateRecordingLabel, 500);
+    updateRecordingLabel();
+    setTimeout(function () {
+      if (!state.disposed && state.status === 'recording' && state.recordMode === 'stream') stopRecording(true);
+    }, MAX_STREAM_MS);
+  }
+
+  /**
+   * 单击「转写系统声音」：不在页面采麦克风，交给主进程的隐藏采集窗口做系统音频回环。
+   * 页面只发 loopback-start，等主进程 loopbackReady 后进入录音态；分句/字幕仍走原有流事件。
+   */
+  function startLoopbackRecording() {
+    captureSelection();
+    state.outbox = [];
+    state.pcmCarry = new Float32Array(0);
+    state.loopbackLevel = 0;
+    state.streamId = String(Date.now()) + '-' + String(++state.requestId);
+    state.session = {
+      id: state.streamId,
+      active: true,
+      focused: false,
+      anchor: null,
+      insertedText: '',
+      captionStable: '',
+      captionTail: '',
+      loopback: true,
+    };
+    state.recordMode = 'stream';
+    state.startedAt = Date.now();
+    state.discard = false;
+    queueItem('loopback-start', { id: state.session.id });
+    setStatus('requesting');
+    clearTimeout(state.loopbackWait);
+    state.loopbackWait = setTimeout(function () {
+      state.loopbackWait = 0;
+      if (!state.disposed && state.session && state.session.loopback && state.status === 'requesting') {
+        cancelActive();
+        fail(isZh() ? '系统音频采集超时，请重试' : 'System audio capture timed out; try again');
+      }
+    }, 12000);
+  }
+
+  async function startStreamRecording(mode) {
+    captureSelection();
+    setStatus('requesting');
+    var media = null;
+    try {
+      media = await navigator.mediaDevices.getUserMedia(captureConstraints(mode));
+      if (state.disposed || state.status === 'idle') {
+        stopStream(media);
+        return;
+      }
+      state.stream = media;
+      if (typeof AudioContext !== 'function') {
+        var unsupported = new Error('AudioContext unavailable');
+        unsupported.streamUnsupported = true;
+        throw unsupported;
+      }
+      var context = new AudioContext({ sampleRate: PCM_RATE, latencyHint: 'interactive' });
+      if (Math.round(context.sampleRate) !== PCM_RATE) {
+        try { context.close(); } catch (e) {}
+        var mismatch = new Error('16 kHz capture unavailable');
+        mismatch.streamUnsupported = true;
+        throw mismatch;
+      }
+      var analyser = context.createAnalyser();
+      analyser.fftSize = 256;
+      var source = context.createMediaStreamSource(media);
+      source.connect(analyser);
+      var processor = context.createScriptProcessor(PCM_CHUNK, 1, 1);
+      var mute = context.createGain();
+      mute.gain.value = 0;
+      source.connect(processor);
+      processor.connect(mute);
+      mute.connect(context.destination);
+      processor.onaudioprocess = onAudioProcess;
+      state.audioContext = context;
+      state.analyser = analyser;
+      state.levelSamples = new Float32Array(analyser.fftSize);
+      state.processor = processor;
+      state.mute = mute;
+      state.pcmCarry = new Float32Array(0);
+      state.outbox = [];
+      state.streamId = String(Date.now()) + '-' + String(++state.requestId);
+      state.session = {
+        id: state.streamId,
+        active: true,
+        focused: false,
+        anchor: null,
+        insertedText: '',
+        captionStable: '',
+        captionTail: '',
+      };
+      state.recordMode = 'stream';
+      state.startedAt = Date.now();
+      enterStreamRecording();
+    } catch (error) {
+      stopStream(media);
+      if (state.stream === media) state.stream = null;
+      teardownStreamCapture();
+      state.session = null;
+      state.streamId = '';
+      if (error && error.streamUnsupported === true) throw error;
+      var denied = error && error.name === 'NotAllowedError';
+      throw new Error(denied
+        ? (isZh() ? '麦克风权限被拒绝' : 'Microphone permission denied')
+        : (isZh() ? '无法开始录音: ' : 'Could not start recording: ') + ((error && error.message) || error));
+    }
+  }
+
   function encodeWave(samples) {
     var bytes = new Uint8Array(44 + samples.length * 2);
     var view = new DataView(bytes.buffer);
@@ -578,6 +926,10 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
   }
 
   function stopRecording(send) {
+    if (state.recordMode === 'stream') {
+      stopStreamRecording(send === true);
+      return;
+    }
     if (!state.recorder) return;
     state.discard = send !== true;
     clearStatusTimer();
@@ -596,7 +948,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
   }
 
   function startWaveform() {
-    if (!state.waveform || !state.analyser || !state.levelSamples) return;
+    if (!state.waveform) return;
     var bars = [];
     var lines = state.waveform.querySelectorAll('line');
     for (var i = lines.length - 1; i >= 0; i -= 1) bars.push({ element: lines[i], level: 0 });
@@ -605,13 +957,18 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
       if (now - previous >= 50) {
         previous = now;
         var next = 0;
-        try {
-          state.analyser.getFloatTimeDomainData(state.levelSamples);
-          var sum = 0;
-          for (var i = 0; i < state.levelSamples.length; i += 1) sum += state.levelSamples[i] * state.levelSamples[i];
-          next = Math.sqrt(sum / state.levelSamples.length);
-        } catch (e) {
-          next = 0;
+        if (state.analyser && state.levelSamples) {
+          try {
+            state.analyser.getFloatTimeDomainData(state.levelSamples);
+            var sum = 0;
+            for (var i = 0; i < state.levelSamples.length; i += 1) sum += state.levelSamples[i] * state.levelSamples[i];
+            next = Math.sqrt(sum / state.levelSamples.length);
+          } catch (e) {
+            next = 0;
+          }
+        } else {
+          // 回环采集没有页面侧 analyser，用主进程回传的电平驱动波形
+          next = state.loopbackLevel || 0;
         }
         for (var j = 0; j < bars.length; j += 1) {
           var bar = bars[j];
@@ -628,22 +985,46 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     state.waveformFrame = requestAnimationFrame(draw);
   }
 
-  async function startRecording() {
-    if (state.disposed || state.recorder || state.status === 'recording' || state.status === 'transcribing') return;
+  async function startRecording(mode) {
+    var captureMode = mode === 'click' ? 'listen' : 'dictate';
+    if (state.disposed || state.recorder || state.session || state.status === 'recording' || state.status === 'transcribing') return;
     if (!bridgeReady()) {
       fail(isZh() ? 'gpt++ 未连接，请先启动 gpt++' : 'gpt++ is not connected');
       return;
     }
-    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function' || typeof MediaRecorder !== 'function') {
+    if (STREAMING && LOOPBACK && captureMode === 'listen') {
+      startLoopbackRecording();
+      return;
+    }
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
       fail(isZh() ? '当前页面不支持录音' : 'Recording is not supported here');
       return;
     }
+    if (STREAMING) {
+      try {
+        await startStreamRecording(captureMode);
+        return;
+      } catch (error) {
+        if (!error || error.streamUnsupported !== true) {
+          fail((error && error.message) || (isZh() ? '语音输入失败' : 'Voice input failed'));
+          return;
+        }
+        // 采集不到 16 kHz 时退回整段识别，功能不中断，只是不再实时出字
+        showToast(isZh() ? '当前系统不支持实时采集，已改为整段识别' : 'Real-time capture unavailable; using batch transcription', 'info');
+      }
+    }
+    if (typeof MediaRecorder !== 'function') {
+      fail(isZh() ? '当前页面不支持录音' : 'Recording is not supported here');
+      return;
+    }
+    await startBatchRecording(captureMode);
+  }
+
+  async function startBatchRecording(mode) {
     captureSelection();
     setStatus('requesting');
     try {
-      var stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
+      var stream = await navigator.mediaDevices.getUserMedia(captureConstraints(mode));
       if (state.disposed || state.status === 'idle') {
         stopStream(stream);
         return;
@@ -742,6 +1123,17 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     state.discard = true;
     clearTimeout(state.transcribeTimer);
     clearStatusTimer();
+    if (state.session) {
+      var session = state.session;
+      queueItem('cancel', { id: session.id });
+      state.outbox = state.outbox.filter(function (item) { return !item || item.id !== session.id || item.type === 'cancel'; });
+      teardownStreamCapture();
+      rollbackSession(session);
+      state.session = null;
+      state.streamId = '';
+      state.recordMode = '';
+      clearCaption();
+    }
     if (state.recorder) {
       try { state.recorder.stop(); } catch (e) {}
       state.recorder = null;
@@ -922,7 +1314,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
       requestPreparation();
       return;
     }
-    void startRecording();
+    void startRecording('hold');
   }
 
   function endPushToTalk() {
@@ -1081,7 +1473,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
       requestPreparation();
       return;
     }
-    void startRecording();
+    void startRecording('click');
   }
 
   function buildButton() {
@@ -1148,6 +1540,20 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     panel.appendChild(action);
     wrap.appendChild(panel);
 
+    var caption = document.createElement('span');
+    caption.id = CAPTION_ID;
+    caption.setAttribute(EXT_ATTR, 'true');
+    caption.setAttribute('role', 'status');
+    caption.setAttribute('aria-live', 'polite');
+    var captionText = document.createElement('span');
+    captionText.className = 'gptplus-voice-caption-stable';
+    var captionTail = document.createElement('span');
+    captionTail.className = 'gptplus-voice-caption-tail';
+    caption.appendChild(captionText);
+    caption.appendChild(captionTail);
+    wrap.appendChild(caption);
+    wrap.dataset.caption = 'false';
+
     state.wrap = wrap;
     state.button = button;
     state.panel = panel;
@@ -1155,6 +1561,9 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     state.timerLabel = timerLabel;
     state.actionButton = action;
     state.waveform = waveform;
+    state.caption = caption;
+    state.captionText = captionText;
+    state.captionTail = captionTail;
     render();
     return wrap;
   }
@@ -1226,6 +1635,9 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
         + '.gptplus-voice-body{display:flex;align-items:center;gap:8px;flex:1;min-width:0;overflow:hidden}'
         + '#gptplus-voice-wave{display:none;flex:1;min-width:36px;height:24px;color:color-mix(in srgb,var(--color-token-text-primary,#1a1c1f) 70%,transparent)}'
         + '.gptplus-voice-message{display:none;align-items:center;flex:1;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:12px;line-height:1.2;color:color-mix(in srgb,var(--color-token-text-primary,#1a1c1f) 68%,transparent)}'
+        + '#gptplus-voice-caption{display:none;position:absolute;right:0;bottom:calc(100% + 60px);box-sizing:border-box;width:min(460px,52vw);max-height:min(200px,32vh);overflow:auto;padding:8px 10px;border:1px solid color-mix(in srgb,var(--color-token-text-primary,#1a1c1f) 14%,transparent);border-radius:12px;background:var(--color-token-main-surface-primary,#fff);color:var(--color-token-text-primary,#1a1c1f);font:13px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif;box-shadow:0 12px 32px rgba(0,0,0,.14),0 2px 6px rgba(0,0,0,.06);pointer-events:none;white-space:pre-wrap;word-break:break-word;scrollbar-width:thin}'
+        + '#gptplus-voice-input-wrap[data-caption="true"] #gptplus-voice-caption{display:block;animation:gptplus-voice-pop .14s ease-out}'
+        + '.gptplus-voice-caption-tail{opacity:.6}'
         + '.gptplus-voice-timer{display:none;flex:0 0 auto;font-size:11px;font-variant-numeric:tabular-nums;color:color-mix(in srgb,var(--color-token-text-primary,#1a1c1f) 55%,transparent)}'
         + '#gptplus-voice-panel[data-phase="error"] .gptplus-voice-message{color:#ef4444}'
         + '#gptplus-voice-panel[data-phase="feedback"] .gptplus-voice-message{color:color-mix(in srgb,var(--color-token-text-primary,#1a1c1f) 55%,transparent)}'
@@ -1242,6 +1654,9 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     state.timerLabel = null;
     state.actionButton = null;
     state.waveform = null;
+    state.caption = null;
+    state.captionText = null;
+    state.captionTail = null;
     state.observer = new MutationObserver(function (records) {
       var relevant = false;
       for (var i = 0; i < records.length; i += 1) {
@@ -1340,6 +1755,10 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
           spaceActive: !!(state.spaceHold && state.spaceHold.active),
           pttActive: state.pttActive,
           lastSpace: state.lastSpace,
+          streaming: STREAMING,
+          loopback: !!(state.session && state.session.loopback),
+          recordMode: state.recordMode,
+          sessionId: state.session ? state.session.id : '',
         };
       },
       touch: function () {
@@ -1349,6 +1768,13 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
         var pending = state.pending;
         state.pending = null;
         return pending;
+      },
+      /** 实时音频块与生命周期指令，按入队顺序交给主进程。 */
+      takeOutbox: function () {
+        if (!state.outbox.length) return null;
+        var items = state.outbox;
+        state.outbox = [];
+        return items;
       },
       takeRequest: function () {
         var request = state.request;
@@ -1374,7 +1800,69 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
         state.request = null;
         state.prepareText = '';
         setStatus('idle');
-        void startRecording();
+        void startRecording(state.pttActive ? 'hold' : 'click');
+        return true;
+      },
+      /** 稳定分句：直接追加到输入框，永不回改。 */
+      streamAppend: function (id, value) {
+        var session = state.session;
+        if (state.disposed || !session || String(id) !== session.id) return false;
+        if (value == null || value === '') return true;
+        var inserted = appendStreamText(String(value));
+        if (!inserted) session.insertFailed = true;
+        return inserted;
+      },
+      /** 实时字幕：稳定部分与未定稿部分分开着色。 */
+      streamCaption: function (id, stable, tail) {
+        var session = state.session;
+        if (state.disposed || !session || String(id) !== session.id) return false;
+        session.captionStable = String(stable == null ? '' : stable);
+        session.captionTail = String(tail == null ? '' : tail);
+        renderCaption();
+        return true;
+      },
+      /** 回环采集就绪：从「连接系统音频」进入录音态。 */
+      loopbackReady: function (id) {
+        var session = state.session;
+        if (state.disposed || !session || !session.loopback || String(id) !== session.id) return false;
+        clearTimeout(state.loopbackWait);
+        state.loopbackWait = 0;
+        if (state.status === 'requesting') enterStreamRecording();
+        return true;
+      },
+      /** 回环采集的波形电平（页面侧没有 analyser）。 */
+      streamLevel: function (id, value) {
+        var session = state.session;
+        if (state.disposed || !session || String(id) !== session.id) return false;
+        state.loopbackLevel = Math.max(0, Math.min(1, Number(value) || 0));
+        return true;
+      },
+      streamDone: function (id, result) {
+        if (state.disposed) return false;
+        var session = state.session;
+        if (!session || String(id) !== session.id) return false;
+        clearTimeout(state.loopbackWait);
+        state.loopbackWait = 0;
+        state.session = null;
+        state.streamId = '';
+        state.recordMode = '';
+        state.outbox = [];
+        clearCaption();
+        if (result && result.ok === true) {
+          if (!session.insertedText) {
+            if (session.insertFailed || session.captionStable) {
+              fail(isZh() ? '转写结果插入失败' : 'Could not insert transcript');
+            } else {
+              emptyResult();
+            }
+            return true;
+          }
+          setStatus('idle');
+          if (result.notice) showToast(result.notice, 'ok');
+          return true;
+        }
+        rollbackSession(session);
+        fail((result && result.error) || (isZh() ? '识别失败' : 'Transcription failed'));
         return true;
       },
       complete: function (id, result) {
@@ -1409,8 +1897,21 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
       clearInterval(state.syncInterval);
       clearTimeout(state.toastTimer);
       clearTimeout(state.transcribeTimer);
+      clearTimeout(state.loopbackWait);
+      state.loopbackWait = 0;
       try { state.recorder && state.recorder.stop(); } catch (e) {}
       state.recorder = null;
+      if (state.processor) {
+        try { state.processor.onaudioprocess = null; } catch (e) {}
+        try { state.processor.disconnect(); } catch (e) {}
+        state.processor = null;
+      }
+      if (state.mute) {
+        try { state.mute.disconnect(); } catch (e) {}
+        state.mute = null;
+      }
+      state.session = null;
+      state.outbox = [];
       stopStream(state.stream);
       state.stream = null;
       closeAudioContext();
@@ -1467,11 +1968,13 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
   });
 }
 
-function buildVoiceInputScript({ readyWaitMs, engine, localReady, language, spaceHoldMs } = {}) {
+function buildVoiceInputScript({ readyWaitMs, engine, localReady, language, spaceHoldMs, streaming, loopback } = {}) {
   var wait = Math.max(500, Number(readyWaitMs) || SCRIPT_READY_WAIT_MS);
   var mode = engine === 'provider' ? 'provider' : engine === 'system' ? 'system' : 'local';
   var hold = normalizeVoiceSpaceHoldMs(spaceHoldMs);
-  return '(' + voicePageRuntime.toString() + ')(' + JSON.stringify(mode) + ', ' + wait + ', ' + JSON.stringify(localReady === true) + ', ' + JSON.stringify(String(language || '')) + ', ' + hold + ')';
+  var live = streaming === true && mode === 'local';
+  var systemAudio = loopback === true && live;
+  return '(' + voicePageRuntime.toString() + ')(' + JSON.stringify(mode) + ', ' + wait + ', ' + JSON.stringify(localReady === true) + ', ' + JSON.stringify(String(language || '')) + ', ' + hold + ', ' + (live ? 'true' : 'false') + ', ' + (systemAudio ? 'true' : 'false') + ')';
 }
 
 function voiceConfig(ctx) {
@@ -1486,10 +1989,12 @@ function voiceConfig(ctx) {
   };
 }
 
-function buildScriptSources(config, localReady) {
+function buildScriptSources(config, localReady, loopback) {
+  var streaming = config.engine === 'local';
+  var systemAudio = loopback === true && streaming;
   return {
-    add: buildVoiceInputScript({ readyWaitMs: SCRIPT_READY_WAIT_MS, engine: config.engine, localReady: localReady, language: config.language, spaceHoldMs: config.spaceHoldMs }),
-    probe: buildVoiceInputScript({ readyWaitMs: PROBE_READY_WAIT_MS, engine: config.engine, localReady: localReady, language: config.language, spaceHoldMs: config.spaceHoldMs }),
+    add: buildVoiceInputScript({ readyWaitMs: SCRIPT_READY_WAIT_MS, engine: config.engine, localReady: localReady, language: config.language, spaceHoldMs: config.spaceHoldMs, streaming: streaming, loopback: systemAudio }),
+    probe: buildVoiceInputScript({ readyWaitMs: PROBE_READY_WAIT_MS, engine: config.engine, localReady: localReady, language: config.language, spaceHoldMs: config.spaceHoldMs, streaming: streaming, loopback: systemAudio }),
   };
 }
 
@@ -1504,11 +2009,11 @@ async function ensurePageScript(page, scripts, prepared) {
   return evaluate(page, scripts.probe, { timeoutMs: PROBE_READY_WAIT_MS + 5000 });
 }
 
-async function injectVoiceInput({ cdpPort, target = null, timeoutMs = DEFAULT_INJECT_TIMEOUT_MS, pause = sleep, engine, localReady = false, language = '', spaceHoldMs } = {}) {
+async function injectVoiceInput({ cdpPort, target = null, timeoutMs = DEFAULT_INJECT_TIMEOUT_MS, pause = sleep, engine, localReady = false, language = '', spaceHoldMs, loopback = false } = {}) {
   var port = Number(cdpPort);
   if (!Number.isInteger(port) || port <= 0) throw new Error('ChatGPT 调试端口无效');
   var config = { engine: engine === 'provider' ? 'provider' : engine === 'system' ? 'system' : 'local', language: language, spaceHoldMs: spaceHoldMs };
-  var scripts = buildScriptSources(config, localReady === true);
+  var scripts = buildScriptSources(config, localReady === true, loopback === true);
   var prepared = new Set();
   var deadline = Date.now() + Math.max(1000, Number(timeoutMs) || DEFAULT_INJECT_TIMEOUT_MS);
   var lastError = null;
@@ -1693,38 +2198,209 @@ function stopVoiceInputBridge() {
 }
 
 function takeVoiceEventExpression() {
-  return "(() => { const voice = globalThis.__gptplusVoice; if (!voice) return { missing: true }; voice.touch?.(); const pending = voice.takePending?.(); if (pending) return { type: 'audio', pending }; const request = voice.takeRequest?.(); if (request) return { type: 'request', request }; const context = voice.context?.(); return { type: 'idle', context: context || null }; })()";
+  return "(() => { const voice = globalThis.__gptplusVoice; if (!voice) return { missing: true }; voice.touch?.(); const items = voice.takeOutbox?.(); if (items && items.length) return { type: 'stream', items }; const pending = voice.takePending?.(); if (pending) return { type: 'audio', pending }; const request = voice.takeRequest?.(); if (request) return { type: 'request', request }; const context = voice.context?.(); return { type: 'idle', context: context || null }; })()";
 }
 
-function startVoiceInputBridge({ cdpPort, ctx, log, visibleIntervalMs = VOICE_POLL_MS, hiddenIntervalMs = VOICE_HIDDEN_POLL_MS } = {}) {
+function startVoiceInputBridge({ cdpPort, ctx, log, visibleIntervalMs = VOICE_POLL_MS, hiddenIntervalMs = VOICE_HIDDEN_POLL_MS, startStreamImpl = startSpeechStream, loopbackImpl = createLoopbackCapture, loopbackEnabled = false, cdpImpl = null } = {}) {
   var port = Number(cdpPort);
   if (!Number.isInteger(port) || port <= 0) throw new Error('ChatGPT 调试端口无效');
   stopVoiceInputBridge();
+  var cdp = cdpImpl || { listTargets: listTargets, pickMainTarget: pickMainTarget, evaluate: evaluate };
   var config = voiceConfig(ctx);
   var localReady = config.engine === 'local' ? localSpeechStatus().ready : false;
-  var scripts = buildScriptSources(config, localReady);
+  var scripts = buildScriptSources(config, localReady, loopbackEnabled === true && config.engine === 'local');
   var prepared = new Set();
   var stopped = false;
   var target = null;
   var lastErrorAt = 0;
   var busy = false;
+  var live = null;
+  var pageOps = [];
+
+  /** 页面操作按顺序合并到一次 CDP 调用，避免录音期间堆积往返。 */
+  function pushOp(method, id, args) {
+    pageOps.push({ method: method, id: id, args: Array.isArray(args) ? args : [] });
+    if (pageOps.length > 200) pageOps.shift();
+  }
+
+  async function flushOps(page) {
+    if (!page || !pageOps.length) return;
+    var ops = pageOps;
+    pageOps = [];
+    var body = ops.map(function (op) {
+      var args = op.args.map(function (value) { return JSON.stringify(value); }).join(',');
+      return 'v.' + op.method + '(' + JSON.stringify(String(op.id)) + (args ? ',' + args : '') + ');';
+    }).join('');
+    var expression = '(() => { const v = globalThis.__gptplusVoice; if (!v) return 0; ' + body + ' return 1; })()';
+    try {
+      await cdp.evaluate(page, expression, { timeoutMs: COMMAND_TIMEOUT_MS });
+    } catch (error) {
+      // 页面重载或注入失效时丢弃这一批，新的录音会话会重新建立
+    }
+  }
+
+  function stopSessionLoopback(session) {
+    var capture = session.loopback;
+    if (!capture) return;
+    session.loopback = null;
+    try { capture.stop(); } catch (error) { /* ignore */ }
+  }
+
+  /** 回环采集的 PCM 直接进流式会话，不再经过页面 outbox。 */
+  function startSessionLoopback(session) {
+    if (typeof loopbackImpl !== 'function') {
+      finishLive(session, { ok: false, error: '系统音频回环不可用' });
+      return;
+    }
+    try {
+      session.loopback = loopbackImpl({
+        onStarted: function () {
+          if (!session.done) pushOp('loopbackReady', session.id, []);
+        },
+        onPcm: function (buffer) {
+          if (session.done || session.pendingEnd) return;
+          if (session.stream) session.stream.push(buffer);
+          else if (session.buffer.length < 400) session.buffer.push(buffer);
+        },
+        onLevel: function (value) {
+          if (!session.done) pushOp('streamLevel', session.id, [value]);
+        },
+        onError: function (error) {
+          finishLive(session, { ok: false, error: error || '系统音频采集失败' });
+        },
+      });
+    } catch (error) {
+      finishLive(session, { ok: false, error: (error && error.message) || '系统音频采集失败' });
+    }
+  }
+
+  function cancelLive(id) {
+    var session = live;
+    if (!session || (id && session.id !== id)) return;
+    live = null;
+    session.done = true;
+    stopSessionLoopback(session);
+    try { session.stream?.cancel(); } catch (error) { /* ignore */ }
+  }
+
+  function finishLive(session, payload) {
+    if (session.done) return;
+    session.done = true;
+    if (live === session) live = null;
+    stopSessionLoopback(session);
+    pushOp('streamDone', session.id, [payload]);
+  }
+
+  function updateCaption(session, partialText) {
+    var stable = session.composer.committed();
+    var pending = joinClauses(session.composer.preview(), partialText || '');
+    var tail = pending && needsSpace(stable, pending) ? ' ' + pending : pending;
+    pushOp('streamCaption', session.id, [stable, tail]);
+  }
+
+  function handleLiveEvent(session, event) {
+    if (!event || session.done) return;
+    if (event.kind === 'partial') {
+      updateCaption(session, event.text || '');
+      return;
+    }
+    if (event.kind === 'segment') {
+      var emitted = session.composer.push({ text: event.text, pauseMs: event.pauseMs, durationMs: event.durationMs, softCut: event.softCut });
+      emitted.forEach(function (item) { pushOp('streamAppend', session.id, [item.append]); });
+      updateCaption(session, '');
+      return;
+    }
+    if (event.kind === 'done') {
+      session.composer.flush().forEach(function (item) { pushOp('streamAppend', session.id, [item.append]); });
+      finishLive(session, { ok: true });
+      return;
+    }
+    if (event.kind === 'error') {
+      finishLive(session, { ok: false, error: event.error || '本地识别失败' });
+    }
+  }
+
+  function ensureLive(id) {
+    if (live && live.id === id) return live;
+    if (live) cancelLive(live.id);
+    var session = {
+      id: id,
+      stream: null,
+      ready: null,
+      buffer: [],
+      pendingEnd: false,
+      done: false,
+      composer: createSegmentComposer({ language: config.language }),
+    };
+    live = session;
+    session.ready = Promise.resolve()
+      .then(function () {
+        return startStreamImpl({ language: config.language, onEvent: function (event) { handleLiveEvent(session, event); } });
+      })
+      .then(function (stream) {
+        if (session.done) {
+          try { stream.cancel(); } catch (error) { /* ignore */ }
+          return stream;
+        }
+        session.stream = stream;
+        var pending = session.buffer;
+        session.buffer = [];
+        for (var i = 0; i < pending.length; i += 1) stream.push(pending[i]);
+        if (session.pendingEnd) stream.end();
+        return stream;
+      })
+      .catch(function (error) {
+        finishLive(session, { ok: false, error: (error && error.message) || '本地识别启动失败' });
+      });
+    return session;
+  }
+
+  function handleStreamItems(items) {
+    for (var i = 0; i < items.length; i += 1) {
+      var item = items[i] || {};
+      var id = String(item.id || '');
+      if (!id) continue;
+      if (item.type === 'cancel') {
+        cancelLive(id);
+        continue;
+      }
+      var session = ensureLive(id);
+      if (session.done) continue;
+      if (item.type === 'loopback-start') {
+        if (!session.loopback) startSessionLoopback(session);
+      } else if (item.type === 'pcm') {
+        var buffer;
+        try { buffer = Buffer.from(String(item.data || ''), 'base64'); } catch (error) { buffer = null; }
+        if (!buffer || !buffer.length) continue;
+        if (session.stream) session.stream.push(buffer);
+        else if (session.buffer.length < 400) session.buffer.push(buffer);
+      } else if (item.type === 'end') {
+        session.pendingEnd = true;
+        stopSessionLoopback(session);
+        if (session.stream) session.stream.end();
+      }
+    }
+  }
 
   async function run() {
     while (!stopped) {
       var delay = visibleIntervalMs;
       try {
-        if (!target) target = pickMainTarget(await listTargets(port));
+        if (!target) target = cdp.pickMainTarget(await cdp.listTargets(port));
         if (!target) {
           delay = 2000;
         } else {
-          var event = await evaluate(target, takeVoiceEventExpression(), { timeoutMs: COMMAND_TIMEOUT_MS });
+          var event = await cdp.evaluate(target, takeVoiceEventExpression(), { timeoutMs: COMMAND_TIMEOUT_MS });
           if (event && event.missing === true) {
+            cancelLive();
             var installed = await ensurePageScript(target, scripts, prepared);
             if (installed?.installed !== true) {
               target = null;
               prepared.clear();
             }
             delay = 600;
+          } else if (event && event.type === 'stream' && Array.isArray(event.items)) {
+            handleStreamItems(event.items);
           } else if (event && event.type === 'audio' && event.pending && !busy) {
             busy = true;
             var pending = event.pending;
@@ -1732,9 +2408,9 @@ function startVoiceInputBridge({ cdpPort, ctx, log, visibleIntervalMs = VOICE_PO
               var transcript = pending.engine === 'local'
                 ? await transcribeLocal({ audio: Buffer.from(String(pending.data || ''), 'base64'), language: config.language })
                 : await transcribeVoice({ ctx: ctx, config: voiceConfig(ctx), pending: pending });
-              await evaluate(target, 'globalThis.__gptplusVoice?.complete?.(' + JSON.stringify(String(pending.id)) + ', ' + JSON.stringify({ ok: true, text: String(transcript || '') }) + ')', { timeoutMs: COMMAND_TIMEOUT_MS });
+              await cdp.evaluate(target, 'globalThis.__gptplusVoice?.complete?.(' + JSON.stringify(String(pending.id)) + ', ' + JSON.stringify({ ok: true, text: String(transcript || '') }) + ')', { timeoutMs: COMMAND_TIMEOUT_MS });
             } catch (error) {
-              await evaluate(target, 'globalThis.__gptplusVoice?.complete?.(' + JSON.stringify(String(pending.id)) + ', ' + JSON.stringify({ ok: false, error: error.message }) + ')', { timeoutMs: COMMAND_TIMEOUT_MS }).catch(function () {});
+              await cdp.evaluate(target, 'globalThis.__gptplusVoice?.complete?.(' + JSON.stringify(String(pending.id)) + ', ' + JSON.stringify({ ok: false, error: error.message }) + ')', { timeoutMs: COMMAND_TIMEOUT_MS }).catch(function () {});
             } finally {
               busy = false;
             }
@@ -1744,7 +2420,7 @@ function startVoiceInputBridge({ cdpPort, ctx, log, visibleIntervalMs = VOICE_PO
             try {
               if (request.type === 'system-dictation') {
                 await pressWindowsVoiceTyping();
-                await evaluate(target, 'globalThis.__gptplusVoice?.complete?.(' + JSON.stringify(String(request.id)) + ', ' + JSON.stringify({ ok: true }) + ')', { timeoutMs: COMMAND_TIMEOUT_MS });
+                await cdp.evaluate(target, 'globalThis.__gptplusVoice?.complete?.(' + JSON.stringify(String(request.id)) + ', ' + JSON.stringify({ ok: true }) + ')', { timeoutMs: COMMAND_TIMEOUT_MS });
               } else if (request.type === 'prepare-local') {
                 var lastProgressAt = 0;
                 var lastProgressPercent = -1;
@@ -1754,20 +2430,23 @@ function startVoiceInputBridge({ cdpPort, ctx, log, visibleIntervalMs = VOICE_PO
                   lastProgressAt = now;
                   lastProgressPercent = progress.percent;
                   var payload = JSON.stringify({ phase: progress.phase, percent: progress.percent });
-                  void evaluate(target, 'globalThis.__gptplusVoice?.prepareProgress?.(' + JSON.stringify(String(request.id)) + ', ' + payload + ')', { timeoutMs: COMMAND_TIMEOUT_MS }).catch(function () {});
+                  void cdp.evaluate(target, 'globalThis.__gptplusVoice?.prepareProgress?.(' + JSON.stringify(String(request.id)) + ', ' + payload + ')', { timeoutMs: COMMAND_TIMEOUT_MS }).catch(function () {});
                 });
-                await evaluate(target, 'globalThis.__gptplusVoice?.prepared?.(' + JSON.stringify(String(request.id)) + ')', { timeoutMs: COMMAND_TIMEOUT_MS });
+                await cdp.evaluate(target, 'globalThis.__gptplusVoice?.prepared?.(' + JSON.stringify(String(request.id)) + ')', { timeoutMs: COMMAND_TIMEOUT_MS });
               } else {
                 throw new Error('未知的语音输入请求');
               }
             } catch (error) {
-              await evaluate(target, 'globalThis.__gptplusVoice?.complete?.(' + JSON.stringify(String(request.id)) + ', ' + JSON.stringify({ ok: false, error: error.message }) + ')', { timeoutMs: COMMAND_TIMEOUT_MS }).catch(function () {});
+              await cdp.evaluate(target, 'globalThis.__gptplusVoice?.complete?.(' + JSON.stringify(String(request.id)) + ', ' + JSON.stringify({ ok: false, error: error.message }) + ')', { timeoutMs: COMMAND_TIMEOUT_MS }).catch(function () {});
             } finally {
               busy = false;
             }
           } else if (event && event.context && event.context.hidden === true) {
             delay = hiddenIntervalMs;
           }
+          if (!stopped) await flushOps(target);
+          var recording = (event && event.context && event.context.status === 'recording') || (live && !live.done);
+          if (recording) delay = Math.min(delay, STREAM_POLL_MS);
         }
       } catch (error) {
         target = null;
@@ -1782,9 +2461,10 @@ function startVoiceInputBridge({ cdpPort, ctx, log, visibleIntervalMs = VOICE_PO
       if (stopped) break;
       await sleep(delay);
     }
+    cancelLive();
   }
 
-  var bridge = { stop: function () { stopped = true; }, cdpPort: port };
+  var bridge = { stop: function () { stopped = true; cancelLive(); }, cdpPort: port };
   activeBridge = bridge;
   void run();
   return bridge;
@@ -1795,8 +2475,9 @@ async function startVoiceInputOnPort({ ctx, cdpPort, target = null, timeoutMs = 
   stopVoiceInputBridge();
   var config = voiceConfig(ctx);
   var localReady = config.engine === 'local' ? localSpeechStatus().ready : false;
-  await injectVoiceInput({ cdpPort: cdpPort, target: target, timeoutMs: timeoutMs, engine: config.engine, localReady: localReady, language: config.language, spaceHoldMs: config.spaceHoldMs });
-  var bridge = startVoiceInputBridge({ cdpPort: cdpPort, ctx: ctx, log: ctx?.log });
+  var loopback = config.engine === 'local' && loopbackAvailable();
+  await injectVoiceInput({ cdpPort: cdpPort, target: target, timeoutMs: timeoutMs, engine: config.engine, localReady: localReady, language: config.language, spaceHoldMs: config.spaceHoldMs, loopback: loopback });
+  var bridge = startVoiceInputBridge({ cdpPort: cdpPort, ctx: ctx, log: ctx?.log, loopbackEnabled: loopback });
   return { ok: true, cdpPort: cdpPort, bridge: !!bridge };
 }
 

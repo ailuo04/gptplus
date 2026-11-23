@@ -3,15 +3,18 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   buildVoiceInputScript,
+  startVoiceInputBridge,
+  stopVoiceInputBridge,
   transcribeVoice,
   voiceConfig,
 } = require('../src/core/voice-input.js');
 
 test('voice input: 注入脚本包含内联录音条、波形与本地 WAV 编码', () => {
-  const script = buildVoiceInputScript({ readyWaitMs: 1234, engine: 'local', localReady: true, language: 'zh', spaceHoldMs: 1800 });
+  const script = buildVoiceInputScript({ readyWaitMs: 1234, engine: 'local', localReady: true, language: 'zh', spaceHoldMs: 1800, streaming: true });
   assert.match(script, /gptplus-voice-input/);
   assert.match(script, /gptplus-voice-panel/);
   assert.match(script, /gptplus-voice-wave/);
+  assert.match(script, /gptplus-voice-caption/);
   assert.match(script, /__gptplusVoice/);
   assert.match(script, /data-composer-surface-variant/);
   assert.match(script, /div\.ms-2\.flex\.items-center/);
@@ -21,21 +24,40 @@ test('voice input: 注入脚本包含内联录音条、波形与本地 WAV 编�
   assert.match(script, /"local"/);
   assert.match(script, /PTT_HOLD_MS = Math\.min/);
   assert.match(script, /PTT_HOLD_LABEL/);
-  assert.match(script, /, 1800\)$/);
+  assert.match(script, /, 1800, true, false\)$/);
   assert.match(script, /onSpaceDown/);
   assert.match(script, /insertSpaceForHold/);
   assert.match(script, /pageHasFocus/);
   assert.match(script, /position:absolute/);
   assert.match(script, /--color-token-main-surface-primary/);
+  assert.match(script, /takeOutbox/);
+  assert.match(script, /streamAppend/);
+  assert.match(script, /pcmToBase64/);
+  assert.match(script, /createScriptProcessor/);
   assert.match(script, /true/);
   assert.doesNotThrow(() => new Function('return ' + script));
 });
 
-test('voice input: provider 脚本仍保留 webm 上传路径', () => {
-  const script = buildVoiceInputScript({ readyWaitMs: 1234, engine: 'provider' });
+test('voice input: provider 脚本仍保留 webm 上传路径且不启用实时流', () => {
+  const script = buildVoiceInputScript({ readyWaitMs: 1234, engine: 'provider', streaming: true });
   assert.match(script, /audio\/webm/);
   assert.match(script, /"provider"/);
+  assert.match(script, /, 1000, false, false\)$/);
   assert.doesNotThrow(() => new Function('return ' + script));
+});
+
+test('voice input: 回环开关只随本地流式引擎注入，且运行时自包含', () => {
+  const script = buildVoiceInputScript({ engine: 'local', streaming: true, loopback: true, spaceHoldMs: 1000 });
+  assert.match(script, /, 1000, true, true\)$/);
+  assert.match(script, /loopback-start/);
+  assert.match(script, /loopbackReady/);
+  assert.match(script, /streamLevel/);
+  assert.match(script, /gptplus-voice-input-v15/);
+  assert.doesNotThrow(() => new Function('return ' + script));
+  const provider = buildVoiceInputScript({ engine: 'provider', streaming: true, loopback: true });
+  assert.match(provider, /, 1000, false, false\)$/);
+  const batch = buildVoiceInputScript({ engine: 'local', streaming: false, loopback: true });
+  assert.match(batch, /, 1000, false, false\)$/);
 });
 
 test('voice input: 插件配置会兜底到本地识别并规范化字段', () => {
@@ -364,10 +386,285 @@ test('voice input: 鼠标长按候选期间切换离开 ChatGPT 会取消触发'
   runtime.dispose();
 });
 
-async function createVoiceRuntime({ focused = true, hidden = false, contentEditable = false, selected = false } = {}) {
+test('voice input: 本地引擎边录边把稳定分句写入输入框', async () => {
+  const runtime = await createVoiceRuntime({ engine: 'local' });
+  runtime.editor.value = '用户原文';
+  runtime.editor.selectionStart = runtime.editor.selectionEnd = 4;
+  runtime.click(runtime.findById('gptplus-voice-input'));
+  await runtime.flush();
+  const context = runtime.api.context();
+  assert.equal(context.recordMode, 'stream');
+  assert.equal(context.status, 'recording');
+  const id = context.sessionId;
+  assert.ok(id, '录音会话应当有 id');
+
+  assert.equal(runtime.api.streamCaption(id, '', '今天我们'), true);
+  assert.equal(runtime.findById('gptplus-voice-caption').children[1].textContent, '今天我们');
+
+  assert.equal(runtime.api.streamAppend(id, '今天天气不错。'), true);
+  assert.equal(runtime.editor.value, '用户原文今天天气不错。');
+  runtime.api.streamAppend(id, '我们去公园。');
+  assert.equal(runtime.editor.value, '用户原文今天天气不错。我们去公园。');
+
+  runtime.api.streamDone(id, { ok: true });
+  assert.equal(runtime.api.context().status, 'idle');
+  assert.equal(runtime.findById('gptplus-voice-caption').children[0].textContent, '');
+  runtime.dispose();
+});
+
+test('voice input: 取消实时转写只回滚本次插入的文字', async () => {
+  const runtime = await createVoiceRuntime({ engine: 'local' });
+  runtime.editor.value = '保持原文';
+  runtime.editor.selectionStart = runtime.editor.selectionEnd = 4;
+  runtime.click(runtime.findById('gptplus-voice-input'));
+  await runtime.flush();
+  const id = runtime.api.context().sessionId;
+  runtime.api.streamAppend(id, '临时文字。');
+  assert.equal(runtime.editor.value, '保持原文临时文字。');
+  runtime.key('keydown', 'Escape');
+  assert.equal(runtime.editor.value, '保持原文');
+  assert.equal(runtime.api.context().status, 'idle');
+  assert.equal(runtime.api.context().sessionId, '');
+  runtime.dispose();
+});
+
+test('voice input: 过期会话的流式事件不会写入输入框', async () => {
+  const runtime = await createVoiceRuntime({ engine: 'local' });
+  runtime.click(runtime.findById('gptplus-voice-input'));
+  await runtime.flush();
+  const id = runtime.api.context().sessionId;
+  runtime.api.streamDone(id, { ok: true });
+  assert.equal(runtime.api.streamAppend(id, '迟到文字'), false);
+  assert.equal(runtime.api.streamCaption(id, '迟到', ''), false);
+  assert.equal(runtime.editor.value, '');
+  runtime.dispose();
+});
+
+test('voice input: 回环模式单击不采麦克风，就绪后进入录音并复用流式写入', async () => {
+  const runtime = await createVoiceRuntime({ engine: 'local', loopback: true });
+  runtime.editor.value = '原文';
+  runtime.editor.selectionStart = runtime.editor.selectionEnd = 2;
+  runtime.click(runtime.findById('gptplus-voice-input'));
+  await runtime.flush();
+  assert.equal(runtime.micCalls.length, 0, '回环模式不应请求麦克风');
+  const context = runtime.api.context();
+  assert.equal(context.status, 'requesting');
+  assert.equal(context.recordMode, 'stream');
+  assert.equal(context.loopback, true);
+  const items = runtime.outbox();
+  assert.equal(items.length, 1);
+  assert.equal(items[0].type, 'loopback-start');
+  const id = items[0].id;
+  assert.equal(id, context.sessionId);
+
+  assert.equal(runtime.api.loopbackReady('别的会话'), false);
+  assert.equal(runtime.api.loopbackReady(id), true);
+  assert.equal(runtime.api.context().status, 'recording');
+  assert.equal(runtime.api.streamLevel(id, 0.4), true);
+  assert.equal(runtime.api.streamCaption(id, '', '今天天气'), true);
+  assert.equal(runtime.api.streamAppend(id, '今天天气不错。'), true);
+  assert.equal(runtime.editor.value, '原文今天天气不错。');
+
+  runtime.click(runtime.findById('gptplus-voice-input'));
+  const end = runtime.outbox();
+  assert.equal(end.length, 1);
+  assert.equal(end[0].type, 'end');
+  assert.equal(end[0].id, id);
+  assert.equal(runtime.api.context().status, 'transcribing');
+  runtime.api.streamDone(id, { ok: true });
+  assert.equal(runtime.api.context().status, 'idle');
+  assert.equal(runtime.api.context().loopback, false);
+  runtime.dispose();
+});
+
+test('voice input: 回环模式长按空格仍走麦克风采集', async () => {
+  const runtime = await createVoiceRuntime({ engine: 'local', loopback: true });
+  runtime.key('keydown', ' ');
+  runtime.fireHoldTimer();
+  await runtime.flush();
+  assert.equal(runtime.micCalls.length, 1);
+  assert.equal(runtime.api.context().loopback, false);
+  assert.equal(runtime.api.context().status, 'recording');
+  runtime.key('keyup', ' ');
+  runtime.dispose();
+});
+
+test('voice input: 回环模式 Esc 只回滚本次插入并发送取消', async () => {
+  const runtime = await createVoiceRuntime({ engine: 'local', loopback: true });
+  runtime.editor.value = '保持原文';
+  runtime.editor.selectionStart = runtime.editor.selectionEnd = 4;
+  runtime.click(runtime.findById('gptplus-voice-input'));
+  await runtime.flush();
+  const id = runtime.api.context().sessionId;
+  runtime.api.loopbackReady(id);
+  runtime.api.streamAppend(id, '临时文字。');
+  assert.equal(runtime.editor.value, '保持原文临时文字。');
+  runtime.key('keydown', 'Escape');
+  assert.equal(runtime.editor.value, '保持原文');
+  assert.equal(runtime.api.context().status, 'idle');
+  const items = runtime.outbox();
+  assert.equal(items.length, 1);
+  assert.equal(items[0].type, 'cancel');
+  assert.equal(items[0].id, id);
+  runtime.dispose();
+});
+
+test('voice input: 回环连接超时会取消会话并报错', async () => {
+  const runtime = await createVoiceRuntime({ engine: 'local', loopback: true });
+  runtime.click(runtime.findById('gptplus-voice-input'));
+  await runtime.flush();
+  const id = runtime.api.context().sessionId;
+  runtime.fireTimer(12000);
+  assert.equal(runtime.api.context().status, 'error');
+  assert.equal(runtime.api.context().sessionId, '');
+  const items = runtime.outbox();
+  assert.equal(items.length, 1);
+  assert.equal(items[0].type, 'cancel');
+  assert.equal(items[0].id, id);
+  assert.equal(runtime.api.loopbackReady(id), false);
+  runtime.dispose();
+});
+
+test('voice input: 回环采集失败经 streamDone 回滚并展示错误', async () => {
+  const runtime = await createVoiceRuntime({ engine: 'local', loopback: true });
+  runtime.editor.value = '原文';
+  runtime.editor.selectionStart = runtime.editor.selectionEnd = 2;
+  runtime.click(runtime.findById('gptplus-voice-input'));
+  await runtime.flush();
+  const id = runtime.api.context().sessionId;
+  runtime.api.loopbackReady(id);
+  runtime.api.streamAppend(id, '半句');
+  runtime.api.streamDone(id, { ok: false, error: '系统音频采集失败' });
+  assert.equal(runtime.editor.value, '原文');
+  assert.equal(runtime.api.context().status, 'error');
+  runtime.dispose();
+});
+
+async function waitUntil(check, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() > deadline) throw new Error('等待条件超时');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+function createFakeBridgeEnv() {
+  const evaluations = [];
+  const inbox = [];
+  const target = { id: 'page-1' };
+  const cdpImpl = {
+    listTargets: async () => [target],
+    pickMainTarget: (targets) => targets[0] || null,
+    evaluate: async (page, expression) => {
+      evaluations.push(expression);
+      if (expression.includes('takeOutbox')) return inbox.shift() || { type: 'idle', context: { status: 'idle', hidden: false } };
+      return 1;
+    },
+  };
+  const pushed = [];
+  const state = { ended: 0, cancelled: 0, emit: null };
+  const startStreamImpl = async ({ onEvent }) => {
+    state.emit = onEvent;
+    return {
+      push: (buffer) => pushed.push(buffer),
+      end: () => { state.ended += 1; },
+      cancel: () => { state.cancelled += 1; },
+    };
+  };
+  const captures = [];
+  const loopbackImpl = (handlers) => {
+    const capture = { handlers, stopped: 0, stop() { this.stopped += 1; } };
+    captures.push(capture);
+    return capture;
+  };
+  const ctx = { plugins: { config: () => ({ engine: 'local', language: 'zh' }) } };
+  return { evaluations, inbox, cdpImpl, pushed, state, startStreamImpl, captures, loopbackImpl, ctx };
+}
+
+test('voice input: 桥接把回环采集接入流式会话并转发分句/收尾', async () => {
+  const env = createFakeBridgeEnv();
+  const bridge = startVoiceInputBridge({
+    cdpPort: 9222, ctx: env.ctx, cdpImpl: env.cdpImpl,
+    startStreamImpl: env.startStreamImpl, loopbackImpl: env.loopbackImpl, loopbackEnabled: true,
+    visibleIntervalMs: 5, hiddenIntervalMs: 5,
+  });
+  try {
+    env.inbox.push({ type: 'stream', items: [{ type: 'loopback-start', id: 's1' }] });
+    await waitUntil(() => env.captures.length === 1);
+    const capture = env.captures[0];
+
+    capture.handlers.onStarted();
+    await waitUntil(() => env.evaluations.some((expression) => expression.includes('loopbackReady("s1")')));
+
+    capture.handlers.onPcm(Buffer.from([1, 2, 3, 4]));
+    capture.handlers.onLevel(0.3);
+    await waitUntil(() => env.pushed.length === 1);
+    assert.deepEqual(env.pushed[0], Buffer.from([1, 2, 3, 4]));
+    await waitUntil(() => env.evaluations.some((expression) => expression.includes('streamLevel("s1",0.3)')));
+
+    env.state.emit({ kind: 'segment', text: '你好', pauseMs: 0, durationMs: 600 });
+    env.state.emit({ kind: 'segment', text: '世界', pauseMs: 900, durationMs: 500 });
+    await waitUntil(() => env.evaluations.some((expression) => expression.includes('streamAppend("s1","你好。")')));
+
+    env.inbox.push({ type: 'stream', items: [{ type: 'end', id: 's1' }] });
+    await waitUntil(() => env.state.ended === 1);
+    assert.equal(capture.stopped, 1, '收尾时应停止回环采集');
+    capture.handlers.onPcm(Buffer.from([9, 9]));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(env.pushed.length, 1, '收尾后不再接收音频');
+
+    env.state.emit({ kind: 'done', text: '你好。世界' });
+    await waitUntil(() => env.evaluations.some((expression) => expression.includes('streamAppend("s1","世界。")')));
+    await waitUntil(() => env.evaluations.some((expression) => expression.includes('streamDone("s1",{"ok":true})')));
+  } finally {
+    bridge.stop();
+    stopVoiceInputBridge();
+  }
+});
+
+test('voice input: 桥接取消回环会话时停止采集并取消识别流', async () => {
+  const env = createFakeBridgeEnv();
+  const bridge = startVoiceInputBridge({
+    cdpPort: 9222, ctx: env.ctx, cdpImpl: env.cdpImpl,
+    startStreamImpl: env.startStreamImpl, loopbackImpl: env.loopbackImpl, loopbackEnabled: true,
+    visibleIntervalMs: 5, hiddenIntervalMs: 5,
+  });
+  try {
+    env.inbox.push({ type: 'stream', items: [{ type: 'loopback-start', id: 's2' }] });
+    await waitUntil(() => env.captures.length === 1 && env.state.emit);
+    env.inbox.push({ type: 'stream', items: [{ type: 'cancel', id: 's2' }] });
+    await waitUntil(() => env.captures[0].stopped === 1);
+    assert.equal(env.state.cancelled, 1);
+  } finally {
+    bridge.stop();
+    stopVoiceInputBridge();
+  }
+});
+
+test('voice input: 回环采集失败时桥接回传错误并停止采集', async () => {
+  const env = createFakeBridgeEnv();
+  const bridge = startVoiceInputBridge({
+    cdpPort: 9222, ctx: env.ctx, cdpImpl: env.cdpImpl,
+    startStreamImpl: env.startStreamImpl, loopbackImpl: env.loopbackImpl, loopbackEnabled: true,
+    visibleIntervalMs: 5, hiddenIntervalMs: 5,
+  });
+  try {
+    env.inbox.push({ type: 'stream', items: [{ type: 'loopback-start', id: 's3' }] });
+    await waitUntil(() => env.captures.length === 1);
+    env.captures[0].handlers.onError('没有采集到系统音频轨道');
+    await waitUntil(() => env.evaluations.some((expression) => expression.includes('streamDone("s3",{"ok":false,"error":"没有采集到系统音频轨道"})')));
+    assert.equal(env.captures[0].stopped, 1);
+  } finally {
+    bridge.stop();
+    stopVoiceInputBridge();
+  }
+});
+
+async function createVoiceRuntime({ focused = true, hidden = false, contentEditable = false, selected = false, engine = 'provider', loopback = false } = {}) {
   const vm = require('node:vm');
   const nodes = [];
   const timers = [];
+  const micCalls = [];
   let isFocused = focused;
   let isHidden = hidden;
   class Node {
@@ -451,7 +748,22 @@ async function createVoiceRuntime({ focused = true, hidden = false, contentEdita
     removeEventListener() {},
   };
   const sandbox = {
-    document, window, navigator: { language: 'zh-CN' },
+    document, window, navigator: {
+      language: 'zh-CN',
+      mediaDevices: { getUserMedia: async (constraints) => { micCalls.push(constraints); return { getTracks: () => [] }; } },
+    },
+    AudioContext: class {
+      constructor() {
+        this.sampleRate = 16000;
+        this.state = 'running';
+        this.destination = {};
+      }
+      createAnalyser() { return { fftSize: 256, getFloatTimeDomainData() {} }; }
+      createMediaStreamSource() { return { connect() {} }; }
+      createScriptProcessor() { return { connect() {}, disconnect() {}, onaudioprocess: null }; }
+      createGain() { return { gain: { value: 1 }, connect() {}, disconnect() {} }; }
+      close() { this.state = 'closed'; return Promise.resolve(); }
+    },
     getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
     MutationObserver: class { observe() {} disconnect() {} },
     setTimeout: (callback, delay) => { const timer = { callback, delay, cleared: false }; timers.push(timer); return timers.length; },
@@ -461,11 +773,20 @@ async function createVoiceRuntime({ focused = true, hidden = false, contentEdita
     Event: class { constructor(type, options) { this.type = type; Object.assign(this, options); } },
     InputEvent: class { constructor(type, options) { this.type = type; Object.assign(this, options); } },
   };
-  const script = buildVoiceInputScript({ engine: 'provider', readyWaitMs: 500, spaceHoldMs: 1000 });
+  const script = buildVoiceInputScript({ engine, readyWaitMs: 500, spaceHoldMs: 1000, streaming: engine === 'local', localReady: engine === 'local', loopback });
   await vm.runInNewContext(script, sandbox);
   return {
     editor,
     api: sandbox.__gptplusVoice,
+    micCalls,
+    outbox() { return sandbox.__gptplusVoice.takeOutbox() || []; },
+    findById(id) { return nodes.find(node => node.id === id && node.isConnected) || null; },
+    click(node) {
+      for (const listener of node.listeners.click || []) listener({ preventDefault() {}, stopPropagation() {} });
+    },
+    async flush() {
+      for (let i = 0; i < 8; i += 1) await Promise.resolve();
+    },
     pointer(type, extras = {}) {
       const event = { type, target: editor, button: 0, pointerType: 'mouse', pointerId: 1,
         clientX: 0, clientY: 0, ctrlKey: false, metaKey: false, altKey: false,
@@ -485,6 +806,7 @@ async function createVoiceRuntime({ focused = true, hidden = false, contentEdita
     setFocus(value) { isFocused = value; },
     setHidden(value) { isHidden = value; },
     fireHoldTimer() { const timer = timers.findLast(item => item.delay === 1000 && !item.cleared); if (timer) timer.callback(); },
+    fireTimer(delay) { const timer = timers.findLast(item => item.delay === delay && !item.cleared); if (timer) { timer.cleared = true; timer.callback(); } },
     dispose() { sandbox.__gptplusVoiceDispose?.(); },
     window,
     document,

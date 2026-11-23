@@ -230,11 +230,58 @@ function prepareSpeechModel(listener) {
 
 let workerState = null;
 
+/** 流式识别：页面每 128 ms 推一块 16 kHz PCM16，最多允许 4 块在途，避免解码积压。 */
+const STREAM_INFLIGHT_LIMIT = 4;
+const STREAM_QUEUE_LIMIT = 80;
+const STREAM_END_TIMEOUT_MS = 30000;
+
+function emitStream(state, payload) {
+  const session = state && state.stream;
+  if (!session || session.closed) return;
+  try { session.onEvent?.(payload); } catch { /* 页面桥接失败不能影响识别 */ }
+}
+
+function closeStream(state, payload) {
+  const session = state && state.stream;
+  if (!session) return;
+  state.stream = null;
+  session.closed = true;
+  clearTimeout(session.endTimer);
+  session.queue.length = 0;
+  try { session.onEvent?.(payload); } catch { /* ignore */ }
+  scheduleIdleStop();
+}
+
+function pumpStream(state, session) {
+  while (!session.closed && session.inflight < STREAM_INFLIGHT_LIMIT && session.queue.length) {
+    const item = session.queue.shift();
+    try {
+      state.child.send({ type: 'stream-audio', id: session.id, seq: item.seq, pcm: item.pcm });
+      session.inflight += 1;
+    } catch (error) {
+      closeStream(state, { kind: 'error', error: (error && error.message) || '音频发送失败' });
+      return;
+    }
+  }
+  if (session.ending && !session.closed && !session.queue.length && session.inflight === 0) finishStream(state, session);
+}
+
+function finishStream(state, session) {
+  if (session.closed || session.endSent) return;
+  session.endSent = true;
+  try {
+    state.child.send({ type: 'stream-end', id: session.id });
+  } catch (error) {
+    closeStream(state, { kind: 'error', error: (error && error.message) || '结束识别失败' });
+  }
+}
+
 function stopWorker(reason) {
   if (!workerState) return;
   const state = workerState;
   workerState = null;
   clearTimeout(state.idleTimer);
+  closeStream(state, { kind: 'error', error: reason || '本地识别已停止' });
   if (state.pending) {
     clearTimeout(state.pending.timer);
     state.pending.reject(new Error(reason || '本地识别已停止'));
@@ -254,7 +301,7 @@ function ensureWorker() {
     vad: resolved.files.vad,
     threads: Math.max(1, Math.min(4, os.cpus().length)),
   });
-  const state = { child: null, ready: false, starting: null, pending: null, stderr: '', idleTimer: 0 };
+  const state = { child: null, ready: false, starting: null, pending: null, stream: null, stderr: '', idleTimer: 0 };
   workerState = state;
   state.starting = new Promise((resolve, reject) => {
     let settled = false;
@@ -305,21 +352,60 @@ function ensureWorker() {
         clearTimeout(pending.timer);
         if (message.type === 'result') pending.resolve(message.text || '');
         else pending.reject(new Error(message.error || '本地识别失败'));
+        return;
+      }
+      if (message.type === 'stream-open' || message.type === 'partial' || message.type === 'segment'
+        || message.type === 'stream-done' || message.type === 'stream-error' || message.type === 'ack' || message.type === 'stream-closed') {
+        const session = state.stream;
+        if (!session || String(message.id || '') !== session.id) return;
+        if (message.type === 'ack') {
+          session.inflight = Math.max(0, session.inflight - 1);
+          pumpStream(state, session);
+          return;
+        }
+        if (message.type === 'stream-open') {
+          session.opened = true;
+          return;
+        }
+        if (message.type === 'partial') {
+          if (message.text) emitStream(state, { kind: 'partial', text: message.text });
+          return;
+        }
+        if (message.type === 'segment') {
+          emitStream(state, {
+            kind: 'segment',
+            text: message.text,
+            pauseMs: Number(message.pauseMs) || 0,
+            durationMs: Number(message.durationMs) || 0,
+            softCut: message.softCut === true,
+            startMs: Number(message.startMs) || 0,
+            endMs: Number(message.endMs) || 0,
+          });
+          return;
+        }
+        if (message.type === 'stream-error') {
+          closeStream(state, { kind: 'error', error: message.error || '本地识别失败' });
+          return;
+        }
+        if (message.type === 'stream-done') {
+          closeStream(state, { kind: 'done', text: message.text || '' });
+        }
       }
     });
     state.child.on('error', (error) => finish(error));
     state.child.on('exit', (code) => {
+      const detail = state.stderr.trim();
       if (state.pending) {
         const pending = state.pending;
         state.pending = null;
         clearTimeout(pending.timer);
-        const detail = state.stderr.trim();
         pending.reject(new Error(detail || `本地识别进程退出（代码 ${code}）`));
       }
       if (!state.ready) {
-        finish(new Error(state.stderr.trim() || `本地识别进程退出（代码 ${code}）`));
+        finish(new Error(detail || `本地识别进程退出（代码 ${code}）`));
       }
       if (workerState === state) workerState = null;
+      closeStream(state, { kind: 'error', error: detail || `本地识别进程退出（代码 ${code}）` });
     });
   });
   return state.starting;
@@ -328,8 +414,74 @@ function ensureWorker() {
 function scheduleIdleStop() {
   if (!workerState) return;
   clearTimeout(workerState.idleTimer);
+  if (workerState.stream) return;
   workerState.idleTimer = setTimeout(() => stopWorker('本地识别进程空闲超时'), IDLE_TIMEOUT_MS);
   if (typeof workerState.idleTimer.unref === 'function') workerState.idleTimer.unref();
+}
+
+let streamId = 0;
+
+/**
+ * 开启一次流式识别。返回的控制器由调用方按实时节奏推入 16 kHz 单声道 PCM16。
+ * 事件：partial（未定稿预览）、segment（一个停顿分句）、done、error。
+ * @param {{ language?: string, onEvent?: (event: object) => void }} options
+ */
+async function startSpeechStream({ language, onEvent } = {}) {
+  await prepareSpeechModel();
+  const state = await ensureWorker();
+  if (state.stream) closeStream(state, { kind: 'error', error: '上一次识别尚未结束' });
+  const id = String(++streamId);
+  const session = {
+    id,
+    onEvent,
+    queue: [],
+    inflight: 0,
+    seq: 0,
+    opened: false,
+    ending: false,
+    endSent: false,
+    closed: false,
+    endTimer: 0,
+    dropped: 0,
+  };
+  state.stream = session;
+  clearTimeout(state.idleTimer);
+  try {
+    state.child.send({ type: 'stream-start', id, language: normalizeLanguage(language) });
+  } catch (error) {
+    state.stream = null;
+    throw new Error('无法开始本地识别: ' + ((error && error.message) || error));
+  }
+  return {
+    id,
+    /** @param {Buffer} buffer 16 kHz 单声道 PCM16 小端数据 */
+    push(buffer) {
+      if (session.closed || !Buffer.isBuffer(buffer) || !buffer.length) return;
+      session.queue.push({ seq: ++session.seq, pcm: buffer.toString('base64') });
+      if (session.queue.length > STREAM_QUEUE_LIMIT) {
+        session.queue.shift();
+        session.dropped += 1;
+      }
+      pumpStream(state, session);
+    },
+    end() {
+      if (session.closed || session.ending) return;
+      session.ending = true;
+      session.endTimer = setTimeout(() => {
+        closeStream(state, { kind: 'error', error: '本地识别收尾超时' });
+      }, STREAM_END_TIMEOUT_MS);
+      if (typeof session.endTimer.unref === 'function') session.endTimer.unref();
+      pumpStream(state, session);
+    },
+    cancel() {
+      if (session.closed) return;
+      try { state.child.send({ type: 'stream-cancel', id }); } catch { /* ignore */ }
+      closeStream(state, { kind: 'cancelled' });
+    },
+    get dropped() {
+      return session.dropped;
+    },
+  };
 }
 
 let transcriptionQueue = Promise.resolve();
@@ -386,6 +538,7 @@ module.exports = {
   normalizeLanguage,
   prepareSpeechModel,
   resolveSpeechModel,
+  startSpeechStream,
   stopLocalSpeech,
   transcribeLocal,
 };

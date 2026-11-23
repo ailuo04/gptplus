@@ -1,7 +1,7 @@
 {
   "name": "gptplus",
   "productName": "gpt++",
-  "version": "1.7.11",
+  "version": "1.7.12",
   "description": "为 ChatGPT 桌面客户端管理自定义模型提供商：本地网关 + 模型目录注入",
   "main": "src/main/main.js",
   "private": true,
@@ -59,7 +59,8 @@
     "asarUnpack": [
       "node_modules/sherpa-onnx-node/**",
       "node_modules/sherpa-onnx-*/**",
-      "src/core/local-speech-worker.js"
+      "src/core/local-speech-worker.js",
+      "src/core/speech-segmenter.js"
     ],
     "files": [
       "src/**/*",
