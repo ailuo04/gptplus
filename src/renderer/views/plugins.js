@@ -1,5 +1,7 @@
 // 插件市场：管理随 gpt++ 发布的插件状态与插件自己的轻量配置。
 
+import { createSelectPicker } from '../app.js';
+
 const viewState = {
   busy: new Set(),
 };
@@ -348,49 +350,63 @@ function voiceHotkeyLabel(hotkey) {
 function openVoiceConfig(ctx, plugin) {
   const current = plugin?.config || {};
   const providers = (ctx.state.providers || []).filter((provider) => provider && provider.enabled !== false);
-  const selectedProvider = String(current.providerId || '');
-  const providerOptions = providers.map((provider) => ctx.el('option', {
+  let selectedProvider = String(current.providerId || '');
+  const providerOptions = providers.map((provider) => ({
     value: provider.id,
-    text: provider.name || provider.id,
-    selected: provider.id === selectedProvider,
+    label: provider.name || provider.id,
   }));
   if (!providerOptions.length) {
-    providerOptions.push(ctx.el('option', { value: '', text: '没有可用的提供商', selected: true }));
+    providerOptions.push({ value: '', label: '没有可用的提供商' });
   } else if (selectedProvider && !providers.some((provider) => provider.id === selectedProvider)) {
-    providerOptions.push(ctx.el('option', { value: selectedProvider, text: selectedProvider + '（未找到）', selected: true }));
+    providerOptions.push({ value: selectedProvider, label: selectedProvider + '（未找到）' });
+  } else if (!selectedProvider) {
+    selectedProvider = String(providers[0].id || '');
   }
 
-  const engine = current.engine === 'provider' ? 'provider' : current.engine === 'system' ? 'system' : 'local';
-  const engineSelect = ctx.el('select', {
-    class: 'select',
-    value: engine,
-  }, [
-    ctx.el('option', { value: 'local', text: '本地识别（SenseVoice，离线）', selected: engine === 'local' }),
-    ctx.el('option', { value: 'provider', text: '提供商音频转写', selected: engine === 'provider' }),
-    ctx.el('option', { value: 'system', text: 'Windows 系统听写（会弹出 Win+H 浮层）', selected: engine === 'system' }),
-  ]);
-  const providerSelect = ctx.el('select', { class: 'select' }, providerOptions);
+  let selectedEngine = current.engine === 'provider' ? 'provider' : current.engine === 'system' ? 'system' : 'local';
+  const enginePicker = createSelectPicker(ctx, {
+    className: 'voice-engine-picker',
+    value: selectedEngine,
+    ariaLabel: '输入方式',
+    options: [
+      { value: 'local', label: '本地识别（SenseVoice，离线）' },
+      { value: 'provider', label: '提供商音频转写' },
+      { value: 'system', label: 'Windows 系统听写（会弹出 Win+H 浮层）' },
+    ],
+    onChange: (value) => { selectedEngine = value; syncDisabled(); },
+  });
+  let selectedLanguage = VOICE_LANGUAGES.some(([value]) => value === (current.language || '')) ? (current.language || '') : '';
+  const providerPicker = createSelectPicker(ctx, {
+    className: 'voice-provider-picker',
+    value: selectedProvider,
+    disabled: providers.length === 0,
+    ariaLabel: '提供商',
+    options: providerOptions,
+    onChange: (value) => { selectedProvider = value; },
+  });
+  const languagePicker = createSelectPicker(ctx, {
+    className: 'voice-language-picker',
+    value: selectedLanguage,
+    ariaLabel: '识别语言',
+    options: VOICE_LANGUAGES.map(([value, label]) => ({ value, label })),
+    onChange: (value) => { selectedLanguage = value; },
+  });
+  const enginePickerButton = enginePicker.children[1];
+  const providerPickerButton = providerPicker.children[1];
+  const languagePickerButton = languagePicker.children[1];
   const modelInput = ctx.el('input', {
     class: 'input',
     type: 'text',
     value: String(current.model || 'whisper-1'),
     placeholder: 'whisper-1',
   });
-  const languageSelect = ctx.el('select', {
-    class: 'select',
-    value: VOICE_LANGUAGES.some(([value]) => value === (current.language || '')) ? (current.language || '') : '',
-  }, VOICE_LANGUAGES.map(([value, label]) => ctx.el('option', {
-    value,
-    text: label,
-    selected: value === (current.language || ''),
-  })));
   let selectedHotkey = current.hotkey && typeof current.hotkey === 'object'
     ? { code: current.hotkey.code, ctrl: current.hotkey.ctrl === true, shift: current.hotkey.shift === true, alt: current.hotkey.alt === true }
     : { code: 'Alt', ctrl: false, shift: false, alt: false };
   const rawSpaceHoldMs = Number(current.spaceHoldMs);
   const spaceHoldSeconds = Number.isFinite(rawSpaceHoldMs) ? Math.min(5, Math.max(0.3, rawSpaceHoldMs / 1000)) : 1;
   const hotkeyCapture = ctx.el('button', {
-    class: 'btn btn-ghost btn-sm mono',
+    class: 'btn btn-ghost btn-sm mono voice-hotkey-capture',
     type: 'button',
     attrs: { 'aria-label': '语音输入快捷键' },
     text: `${voiceHotkeyLabel(selectedHotkey)}（按住）`,
@@ -432,9 +448,9 @@ function openVoiceConfig(ctx, plugin) {
       hotkeyCapture.textContent = 'Alt（按住）';
     } },
   });
-  const hotkeyField = ctx.el('div', { class: 'field' }, [
+  const hotkeyField = ctx.el('div', { class: 'field voice-hotkey-field' }, [
     ctx.el('span', { class: 'label', text: '录音快捷键' }),
-    ctx.el('div', { class: 'plugin-config-options' }, [hotkeyCapture, resetHotkey]),
+    ctx.el('div', { class: 'voice-hotkey-row' }, [hotkeyCapture, resetHotkey]),
     ctx.el('span', { class: 'hint', text: '在 ChatGPT 输入框聚焦时，按住快捷键开始录音，松开结束；默认 Alt，也可自定义快捷键。' }),
   ]);
   const spaceHoldInput = ctx.el('input', {
@@ -444,9 +460,13 @@ function openVoiceConfig(ctx, plugin) {
     attrs: { min: '0.3', max: '5', step: '0.1', 'aria-label': '快捷键长按时长（秒）' },
   });
 
+  const engineField = ctx.el('label', { class: 'field' }, [
+    ctx.el('span', { class: 'label', text: '识别引擎' }),
+    enginePicker,
+  ]);
   const providerField = ctx.el('label', { class: 'field' }, [
     ctx.el('span', { class: 'label', text: '提供商' }),
-    providerSelect,
+    providerPicker,
     ctx.el('span', { class: 'hint', text: 'API Key 沿用提供商配置，不会另存；该提供商需要支持 POST /audio/transcriptions。' }),
   ]);
   const modelField = ctx.el('label', { class: 'field' }, [
@@ -456,7 +476,7 @@ function openVoiceConfig(ctx, plugin) {
   ]);
   const languageField = ctx.el('label', { class: 'field' }, [
     ctx.el('span', { class: 'label', text: '识别语言' }),
-    languageSelect,
+    languagePicker,
     ctx.el('span', { class: 'hint', text: '自动检测适合中英混说；指定语言通常更准。' }),
   ]);
   const spaceHoldField = ctx.el('label', { class: 'field' }, [
@@ -464,16 +484,16 @@ function openVoiceConfig(ctx, plugin) {
     spaceHoldInput,
     ctx.el('span', { class: 'hint', text: '范围 0.3-5 秒，默认 1 秒。按住快捷键或鼠标达到该时长后开始录音；松开对应按键或鼠标结束录音。' }),
   ]);
-  const providerFields = ctx.el('div', { class: 'plugin-config-options' }, [providerField, modelField]);
+  const providerFields = ctx.el('div', { class: 'plugin-config-options voice-provider-fields' }, [providerField, modelField]);
   const localHint = ctx.el('span', { class: 'hint', text: '首次使用会自动下载约 231 MB 的 SenseVoice 模型；如果已安装 DeepSeek Harness，会直接复用它的模型缓存。录音和识别都在本机完成。默认按住 Alt 启动语音，松开结束录音；也可自定义快捷键或在未选中文字处按住鼠标左键。' });
   const systemHint = ctx.el('span', { class: 'hint', text: '系统听写会调用 Win+H 并弹出 Windows 语音浮层，不建议日常使用。' });
   const syncDisabled = () => {
-    const provider = engineSelect.value === 'provider';
-    const local = engineSelect.value === 'local';
-    const system = engineSelect.value === 'system';
-    providerSelect.disabled = !provider;
+    const provider = selectedEngine === 'provider';
+    const local = selectedEngine === 'local';
+    const system = selectedEngine === 'system';
+    providerPickerButton.disabled = !provider || providers.length === 0;
     modelInput.disabled = !provider;
-    languageSelect.disabled = system;
+    languagePickerButton.disabled = system;
     spaceHoldInput.disabled = system;
     hotkeyCapture.disabled = system;
     resetHotkey.disabled = system;
@@ -482,7 +502,22 @@ function openVoiceConfig(ctx, plugin) {
     localHint.style.display = local ? '' : 'none';
     systemHint.style.display = system ? '' : 'none';
   };
-  engineSelect.addEventListener('change', syncDisabled);
+  const recognitionSection = ctx.el('section', { class: 'voice-config-section', attrs: { 'aria-label': '输入方式' } }, [
+    ctx.el('h3', { class: 'voice-config-section-title', text: '输入方式' }),
+    engineField,
+    localHint,
+    systemHint,
+  ]);
+  const recordingSection = ctx.el('section', { class: 'voice-config-section', attrs: { 'aria-label': '录音触发' } }, [
+    ctx.el('h3', { class: 'voice-config-section-title', text: '录音触发' }),
+    hotkeyField,
+    spaceHoldField,
+  ]);
+  const languageSection = ctx.el('section', { class: 'voice-config-section', attrs: { 'aria-label': '识别设置' } }, [
+    ctx.el('h3', { class: 'voice-config-section-title', text: '识别设置' }),
+    providerFields,
+    languageField,
+  ]);
   syncDisabled();
 
   const modal = ctx.openModal(
@@ -493,18 +528,11 @@ function openVoiceConfig(ctx, plugin) {
       ctx.el('header', { class: 'modal-head' }, [
         ctx.el('div', { class: 'modal-title', text: '配置语音输入' }),
       ]),
-      ctx.el('div', { class: 'modal-body plugin-config-body' }, [
-        ctx.el('p', { class: 'setting-desc', text: '麦克风按钮会注入到 ChatGPT 输入框的模型选择器与发送键之间。默认使用本机 SenseVoice 离线识别；输入框聚焦时长按 Alt 启动语音，松开结束录音；快捷键和触发时长均可自定义，鼠标长按与麦克风按钮仍保留。也可以改用提供商音频转写，或保留 Windows 系统听写。' }),
-        ctx.el('label', { class: 'field' }, [
-          ctx.el('span', { class: 'label', text: '输入方式' }),
-          engineSelect,
-          localHint,
-          systemHint,
-        ]),
-        hotkeyField,
-        spaceHoldField,
-        providerFields,
-        languageField,
+      ctx.el('div', { class: 'modal-body plugin-config-body voice-config-body' }, [
+        ctx.el('p', { class: 'setting-desc', text: '默认使用本机 SenseVoice 离线识别；按住 Alt 开始录音，松开结束。快捷键、识别来源和触发时长都可调整，麦克风按钮与鼠标长按入口仍可使用。' }),
+        recognitionSection,
+        recordingSection,
+        languageSection,
       ]),
       ctx.el('div', { class: 'modal-foot' }, [
         ctx.el('button', {
@@ -517,8 +545,8 @@ function openVoiceConfig(ctx, plugin) {
           type: 'button',
           on: {
             click: () => {
-              const engine = engineSelect.value === 'provider' ? 'provider' : engineSelect.value === 'system' ? 'system' : 'local';
-              if (engine === 'provider' && !providerSelect.value) {
+              const engine = selectedEngine;
+              if (engine === 'provider' && !selectedProvider) {
                 ctx.toast('请先选择支持音频转写的提供商', 'warn');
                 return;
               }
@@ -529,9 +557,9 @@ function openVoiceConfig(ctx, plugin) {
               }
               const config = {
                 engine,
-                providerId: engine === 'provider' ? String(providerSelect.value || '') : String(current.providerId || ''),
+                providerId: engine === 'provider' ? String(selectedProvider || '') : String(current.providerId || ''),
                 model: String(modelInput.value || 'whisper-1').trim() || 'whisper-1',
-                language: String(languageSelect.value || ''),
+                language: String(selectedLanguage || ''),
                 spaceHoldMs: Math.round(spaceHoldSeconds * 1000),
                 hotkey: { ...selectedHotkey },
               };

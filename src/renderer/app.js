@@ -140,7 +140,7 @@ function createSelectPicker(ctx, config = {}) {
   })) : [];
   const pickerId = `select-picker-${++pickerSequence}`;
   const selectedValue = String(config.value ?? '');
-  const selectedIndex = Math.max(0, options.findIndex((option) => option.value === selectedValue));
+  let selectedIndex = Math.max(0, options.findIndex((option) => option.value === selectedValue));
   let activeIndex = selectedIndex;
   let open = false;
 
@@ -215,6 +215,15 @@ function createSelectPicker(ctx, config = {}) {
     const option = options[index];
     if (!option) return;
     close();
+    selectedIndex = index;
+    activeIndex = index;
+    updateValue(index);
+    for (const [optionIndex, optionNode] of Array.from(menu.children).entries()) {
+      const selected = optionIndex === selectedIndex;
+      optionNode.setAttribute('aria-selected', selected ? 'true' : 'false');
+      const check = optionNode.children[1];
+      check?.classList.toggle('is-selected', selected);
+    }
     button.focus();
     config.onChange?.(option.value);
   }

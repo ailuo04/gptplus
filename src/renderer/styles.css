@@ -3513,6 +3513,17 @@ html.is-theme-switching .logs {
 .plugin-card-actions { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; justify-content: flex-end; }
 .plugin-config-modal { width: min(520px, calc(100vw - 48px)); }
 .plugin-config-body { display: flex; flex-direction: column; gap: var(--sp-3); }
+.voice-config-body { gap: var(--sp-4); }
+.voice-config-body > * + * { margin-top: 0; }
+.voice-config-section { display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; padding-top: var(--sp-3); border-top: 1px solid var(--glass-line); }
+.voice-config-section:first-of-type { padding-top: 0; border-top: 0; }
+.voice-config-section-title { margin: 0; color: var(--fg-dim); font-size: var(--fs-meta); font-weight: 700; letter-spacing: .02em; }
+.voice-config-section .hint { margin: 0; }
+.voice-config-section .field { gap: 7px; }
+.voice-hotkey-row { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+.voice-hotkey-capture { min-height: 34px; padding-inline: 12px; border-color: var(--accent-line); background: var(--accent-soft); color: var(--accent-hi); }
+.voice-hotkey-capture:hover:not([disabled]) { border-color: var(--accent-line); background: var(--accent-soft); color: var(--accent-hi); }
+.voice-config-body .select-picker-menu { z-index: 40; }
 .plugin-config-options { display: flex; flex-direction: column; gap: 8px; }
 .plugin-config-option { display: flex; align-items: flex-start; gap: 10px; padding: 10px 11px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--bg-inset); cursor: pointer; }
 .plugin-config-option:hover { border-color: var(--accent-line); background: var(--bg-hover); }
