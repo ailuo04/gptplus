@@ -14,6 +14,8 @@ const DEFAULT_BALANCE_CONFIG = Object.freeze({ enabled: false, providers: Object
 const DEFAULT_VOICE_SPACE_HOLD_MS = 1000;
 const MIN_VOICE_SPACE_HOLD_MS = 300;
 const MAX_VOICE_SPACE_HOLD_MS = 5000;
+const DEFAULT_VOICE_HOTKEY = Object.freeze({ code: 'Alt', ctrl: false, shift: false, alt: false });
+const VOICE_HOTKEY_CODE_RE = /^(?:Key[A-Z]|Digit[0-9]|F(?:[1-9]|1[0-2])|Space|Alt|Minus|Equal|BracketLeft|BracketRight|Backslash|Semicolon|Quote|Backquote|Comma|Period|Slash)$/;
 
 const DEFAULT_VOICE_CONFIG = Object.freeze({
   engine: 'local',
@@ -21,6 +23,7 @@ const DEFAULT_VOICE_CONFIG = Object.freeze({
   model: 'whisper-1',
   language: '',
   spaceHoldMs: DEFAULT_VOICE_SPACE_HOLD_MS,
+  hotkey: DEFAULT_VOICE_HOTKEY,
 });
 
 const DEFAULT_IMAGE_CONFIG = Object.freeze({ baseUrl: '', apiKey: '', model: '', preferDefault: true, resolution: '1K', aspectRatio: '1:1', quality: 'auto', background: 'auto' });
@@ -88,7 +91,7 @@ const BUILTIN_PLUGIN_DEFINITIONS = Object.freeze([
     category: '效率',
     icon: 'mic',
     description: '在 ChatGPT 输入框的发送键旁加入麦克风按钮，把语音转成文字。',
-    detail: '默认在本机用 SenseVoice 离线识别，不弹出系统语音浮层；在输入框内长按空格或未选中文字处按住鼠标左键 1 秒即可开始录音，边说话边按停顿分句、补标点并写入输入框，未定稿的半句显示为浅色字幕，松开自动收尾；Windows 上单击麦克风转写系统声音（播放听力素材、视频等，最长 10 分钟，不占用麦克风），其他系统单击仍为麦克风连续转写；长按时长可调整。也可以改用支持 /audio/transcriptions 的 OpenAI 兼容提供商（整段转写）。',
+    detail: '默认在本机用 SenseVoice 离线识别，不弹出系统语音浮层；在 ChatGPT 输入框聚焦时按住 Alt 开始实时录音，按住期间持续录音，松开结束；也可在设置里自定义快捷键；边说话边预览并按停顿分句、补标点，鼠标长按和麦克风按钮仍可使用。Windows 上单击麦克风转写系统声音（最长 10 分钟），其他系统单击仍为麦克风连续转写。也可以改用支持 /audio/transcriptions 的 OpenAI 兼容提供商（整段转写）。',
     builtIn: true,
     defaultInstalled: true,
     defaultEnabled: true,
@@ -132,6 +135,18 @@ function normalizeVoiceSpaceHoldMs(value) {
   return Math.min(MAX_VOICE_SPACE_HOLD_MS, Math.max(MIN_VOICE_SPACE_HOLD_MS, rounded));
 }
 
+function normalizeVoiceHotkey(value) {
+  const source = isPlainObject(value) ? value : {};
+  const code = String(source.code || '');
+  const ctrl = source.ctrl === true;
+  const shift = source.shift === true;
+  const alt = source.alt === true;
+  if (!VOICE_HOTKEY_CODE_RE.test(code) || (code !== 'Space' && code !== 'Alt' && !ctrl && !shift && !alt)) {
+    return { ...DEFAULT_VOICE_HOTKEY };
+  }
+  return { code, ctrl, shift, alt };
+}
+
 function normalizeVoiceConfig(raw) {
   const source = isPlainObject(raw) ? raw : {};
   const language = String(source.language || '').trim().toLowerCase();
@@ -141,6 +156,7 @@ function normalizeVoiceConfig(raw) {
     model: String(source.model || 'whisper-1').trim().slice(0, 128) || 'whisper-1',
     language: /^[a-z]{2,3}(?:-[a-z]{2,4})?$/.test(language) ? language : '',
     spaceHoldMs: normalizeVoiceSpaceHoldMs(source.spaceHoldMs),
+    hotkey: normalizeVoiceHotkey(source.hotkey),
   };
 }
 
@@ -431,6 +447,7 @@ module.exports = {
   DEFAULT_USAGE_METRICS,
   DEFAULT_BALANCE_CONFIG,
   DEFAULT_VOICE_CONFIG,
+  DEFAULT_VOICE_HOTKEY,
   DEFAULT_VOICE_SPACE_HOLD_MS,
   MAX_VOICE_SPACE_HOLD_MS,
   MIN_VOICE_SPACE_HOLD_MS,
@@ -439,6 +456,7 @@ module.exports = {
   normalizeImageConfig,
   DEFAULT_IMAGE_CONFIG,
   normalizeVoiceConfig,
+  normalizeVoiceHotkey,
   normalizeVoiceSpaceHoldMs,
   normalizeBalanceConfig,
 };

@@ -16,7 +16,7 @@ const { stripEndpoint } = require('./base-url.js');
 const { createSystemProxyFetch } = require('./system-proxy.js');
 const { localSpeechStatus, prepareSpeechModel, startSpeechStream, transcribeLocal } = require('./local-speech.js');
 const { createSegmentComposer, joinClauses, needsSpace } = require('./speech-segmenter.js');
-const { normalizeVoiceSpaceHoldMs } = require('./plugin-manager.js');
+const { normalizeVoiceHotkey, normalizeVoiceSpaceHoldMs } = require('./plugin-manager.js');
 const { createLoopbackCapture, loopbackAvailable } = require('./voice-loopback.js');
 
 const DEFAULT_INJECT_TIMEOUT_MS = 30000;
@@ -47,8 +47,9 @@ function sleep(ms) {
  * @param {number} spaceHoldMs
  * @param {boolean} streaming
  * @param {boolean} loopback
+ * @param {{code:string, ctrl:boolean, shift:boolean, alt:boolean}} hotkey
  */
-function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs, streaming, loopback) {
+function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs, streaming, loopback, hotkey) {
   'use strict';
   var READY_WAIT_MS = Math.max(500, Number(readyWaitMs) || 15000);
   var ENGINE = engine === 'provider' ? 'provider' : engine === 'system' ? 'system' : 'local';
@@ -61,7 +62,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
   var CAPTION_ID = 'gptplus-voice-caption';
   var STYLE_ID = 'gptplus-voice-input-style';
   var EXT_ATTR = 'data-gptplus-voice-input';
-  var RUNTIME_KEY = 'gptplus-voice-input-v15';
+  var RUNTIME_KEY = 'gptplus-voice-input-v17';
   var MAX_RECORD_MS = 120000;
   var MAX_STREAM_MS = 600000;
   var PCM_CHUNK = 2048;
@@ -69,6 +70,9 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
   var OUTBOX_LIMIT = 240;
   var PTT_HOLD_MS = Math.min(5000, Math.max(300, Math.round((Number(spaceHoldMs) || 1000) / 100) * 100));
   var PTT_HOLD_LABEL = String(PTT_HOLD_MS / 1000).replace(/\.0$/, '');
+  var PTT_HOTKEY = hotkey && typeof hotkey === 'object' ? hotkey : { code: 'Alt', ctrl: false, shift: false, alt: false };
+  var PTT_HOTKEY_CODE = String(PTT_HOTKEY.code || 'Space');
+  var PTT_HOTKEY_LABEL = PTT_HOTKEY_CODE === 'Alt' ? ((PTT_HOTKEY.ctrl ? 'Ctrl+' : '') + (PTT_HOTKEY.shift ? 'Shift+' : '') + 'Alt') : (PTT_HOTKEY.ctrl ? 'Ctrl+' : '') + (PTT_HOTKEY.shift ? 'Shift+' : '') + (PTT_HOTKEY.alt ? 'Alt+' : '') + (PTT_HOTKEY_CODE === 'Space' ? 'Space' : /^[A-Z]/.test(PTT_HOTKEY_CODE) ? PTT_HOTKEY_CODE.replace(/^(?:Key|Digit)/, '') : PTT_HOTKEY_CODE);
   var state = {
     wrap: null,
     button: null,
@@ -119,6 +123,8 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     savedRange: null,
     savedSelection: null,
     spaceHold: null,
+    hotkeyHold: null,
+    pttSource: '',
     mouseHold: null,
     pttActive: false,
     lastSpace: null,
@@ -140,8 +146,8 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     var zh = isZh();
     return {
       idle: zh
-        ? (ENGINE === 'local' ? (LOOPBACK ? '语音输入（本地识别，长按空格或输入框鼠标左键 ' + PTT_HOLD_LABEL + ' 秒口述；单击转写系统声音）' : '语音输入（本地识别，长按空格或输入框鼠标左键 ' + PTT_HOLD_LABEL + ' 秒）') : ENGINE === 'provider' ? '语音输入（提供商转写，长按空格或输入框鼠标左键 ' + PTT_HOLD_LABEL + ' 秒）' : '语音输入（Windows 系统听写）')
-        : (ENGINE === 'system' ? 'Voice input (Windows dictation)' : LOOPBACK ? 'Voice input (hold Space or left mouse in composer for ' + PTT_HOLD_LABEL + 's to dictate; click to transcribe system audio)' : 'Voice input (hold Space or left mouse in composer for ' + PTT_HOLD_LABEL + 's)'),
+        ? (ENGINE === 'local' ? (LOOPBACK ? '语音输入（本地识别，长按 ' + PTT_HOTKEY_LABEL + ' 或输入框鼠标左键 ' + PTT_HOLD_LABEL + ' 秒口述；单击转写系统声音）' : '语音输入（本地识别，长按 ' + PTT_HOTKEY_LABEL + ' 或输入框鼠标左键 ' + PTT_HOLD_LABEL + ' 秒）') : ENGINE === 'provider' ? '语音输入（提供商转写，长按 ' + PTT_HOTKEY_LABEL + ' 或输入框鼠标左键 ' + PTT_HOLD_LABEL + ' 秒）' : '语音输入（Windows 系统听写）')
+        : (ENGINE === 'system' ? 'Voice input (Windows dictation)' : LOOPBACK ? 'Voice input (hold ' + PTT_HOTKEY_LABEL + ' or left mouse in composer for ' + PTT_HOLD_LABEL + 's to dictate; click to transcribe system audio)' : 'Voice input (hold ' + PTT_HOTKEY_LABEL + ' or left mouse in composer for ' + PTT_HOLD_LABEL + 's)'),
       requesting: zh ? '请允许使用麦克风…' : 'Allow microphone access…',
       loopbackRequesting: zh ? '正在连接系统音频…' : 'Connecting to system audio…',
       preparing: zh ? '正在准备本地识别' : 'Preparing local speech',
@@ -926,6 +932,10 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
   }
 
   function stopRecording(send) {
+    if (state.pttSource === 'hotkey') {
+      state.pttActive = false;
+      state.pttSource = '';
+    }
     if (state.recordMode === 'stream') {
       stopStreamRecording(send === true);
       return;
@@ -1112,7 +1122,12 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
   function cancelActive() {
     var had = state.status !== 'idle';
     state.pttActive = false;
+    state.pttSource = '';
     if (state.wrap) state.wrap.dataset.holding = 'false';
+    if (state.hotkeyHold) {
+      clearTimeout(state.hotkeyHold.timer);
+      state.hotkeyHold = null;
+    }
     if (state.spaceHold) {
       clearTimeout(state.spaceHold.timer);
       state.spaceHold = null;
@@ -1246,13 +1261,13 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     clearTimeout(hold.timer);
     hold.timer = 0;
     if (state.wrap) state.wrap.dataset.holding = 'false';
-    beginPushToTalk();
+    beginPushToTalk('mouse');
   }
 
   function onMouseDown(event) {
     if (ENGINE === 'system' || event.button !== 0 || event.pointerType !== 'mouse') return;
     if (event.ctrlKey || event.metaKey || event.altKey || !pageHasFocus()) return;
-    if (state.spaceHold || state.mouseHold || state.pttActive) return;
+    if (state.spaceHold || state.hotkeyHold || state.mouseHold || state.pttActive) return;
     if (state.status !== 'idle' && state.status !== 'error' && state.status !== 'feedback') return;
     var editor = editorNode();
     if (!editor || (event.target !== editor && !editor.contains(event.target)) || editorHasSelection(editor)) return;
@@ -1299,7 +1314,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     if (wasActive) cancelActive();
   }
 
-  function beginPushToTalk() {
+  function beginPushToTalk(source) {
     if (state.disposed || state.pttActive) return;
     if (ENGINE === 'system') return;
     if (state.status !== 'idle' && state.status !== 'error' && state.status !== 'feedback') return;
@@ -1308,6 +1323,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
       return;
     }
     state.pttActive = true;
+    state.pttSource = source || 'button';
     state.lastError = '';
     if (state.status === 'error' || state.status === 'feedback') setStatus('idle');
     if (ENGINE === 'local' && !state.localReady) {
@@ -1320,6 +1336,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
   function endPushToTalk() {
     if (!state.pttActive) return;
     state.pttActive = false;
+    state.pttSource = '';
     if (state.status === 'recording') {
       stopRecording(true);
       return;
@@ -1351,11 +1368,11 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     clearTimeout(hold.timer);
     hold.timer = 0;
     if (state.wrap) state.wrap.dataset.holding = 'false';
-    beginPushToTalk();
+    beginPushToTalk('space');
   }
 
   function onSpaceDown(event) {
-    if (ENGINE === 'system') return;
+    if (ENGINE === 'system' || PTT_HOTKEY_CODE !== 'Space' || PTT_HOTKEY.ctrl || PTT_HOTKEY.shift || PTT_HOTKEY.alt) return;
     if (event.key === ' ' || event.code === 'Space') {
       state.lastSpace = {
         at: Date.now(),
@@ -1381,8 +1398,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     }
     if (event.repeat === true) return;
     var inEditor = composerFocused();
-    if (!inEditor && !pageSpaceAllowed()) return;
-    if (inEditor && !editorSelectionCollapsed()) return;
+    if (!inEditor || !editorSelectionCollapsed()) return;
     if (state.status !== 'idle' && state.status !== 'error' && state.status !== 'feedback') return;
     var hold = { active: false, timer: 0, startedAt: Date.now(), inEditor: inEditor, selection: null, range: null };
     captureSpaceSelection(hold);
@@ -1434,6 +1450,66 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     }
     event.preventDefault();
     endPushToTalk();
+  }
+
+  function hotkeyMatches(event) {
+    if (!event || event.metaKey === true || event.isComposing === true) return false;
+    if (PTT_HOTKEY_CODE === 'Alt') {
+      return (event.code === 'AltLeft' || event.code === 'AltRight')
+        && event.ctrlKey === (PTT_HOTKEY.ctrl === true)
+        && event.shiftKey === (PTT_HOTKEY.shift === true);
+    }
+    return event.code === PTT_HOTKEY_CODE
+      && (event.ctrlKey === true) === (PTT_HOTKEY.ctrl === true)
+      && (event.shiftKey === true) === (PTT_HOTKEY.shift === true)
+      && (event.altKey === true) === (PTT_HOTKEY.alt === true);
+  }
+
+  function activateHotkeyHold(hold) {
+    if (state.disposed || state.hotkeyHold !== hold || hold.active) return;
+    if (!pageHasFocus() || !composerFocused() || !editorSelectionCollapsed()) {
+      clearTimeout(hold.timer);
+      state.hotkeyHold = null;
+      return;
+    }
+    hold.active = true;
+    clearTimeout(hold.timer);
+    hold.timer = 0;
+    beginPushToTalk('hotkey');
+  }
+
+  function onHotkeyDown(event) {
+    if (ENGINE === 'system' || (PTT_HOTKEY_CODE === 'Space' && !PTT_HOTKEY.ctrl && !PTT_HOTKEY.shift && !PTT_HOTKEY.alt) || !hotkeyMatches(event)) return false;
+    var existing = state.hotkeyHold;
+    if (existing) {
+      event.preventDefault();
+      event.stopPropagation();
+      return true;
+    }
+    if (event.repeat === true || !pageHasFocus() || !composerFocused() || !editorSelectionCollapsed()) return false;
+    if (state.spaceHold || state.mouseHold || state.pttActive) return false;
+    if (state.status !== 'idle' && state.status !== 'error' && state.status !== 'feedback') return false;
+    var hold = { code: PTT_HOTKEY_CODE === 'Alt' ? event.code : PTT_HOTKEY_CODE, active: false, timer: 0 };
+    hold.timer = setTimeout(function () { activateHotkeyHold(hold); }, PTT_HOLD_MS);
+    state.hotkeyHold = hold;
+    if (state.wrap) state.wrap.dataset.holding = 'true';
+    event.preventDefault();
+    event.stopPropagation();
+    return true;
+  }
+
+  function onHotkeyUp(event) {
+    var hold = state.hotkeyHold;
+    if (!hold || event.code !== hold.code) return false;
+    state.hotkeyHold = null;
+    clearTimeout(hold.timer);
+    if (state.wrap && !state.spaceHold && !state.mouseHold) state.wrap.dataset.holding = 'false';
+    event.preventDefault();
+    event.stopPropagation();
+    if (!hold.active) return true;
+    if (pageHasFocus()) endPushToTalk();
+    else cancelActive();
+    return true;
   }
 
   function bridgeReady() {
@@ -1695,6 +1771,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     state.lastBridgeAt = Date.now();
     state.keydown = function (event) {
       if (event.key !== ' ' && event.code !== 'Space') finishSpaceBeforeOtherKey(event);
+      if (onHotkeyDown(event)) return;
       if (event.key === 'Escape' && state.status !== 'idle') {
         event.preventDefault();
         event.stopPropagation();
@@ -1704,6 +1781,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
       onSpaceDown(event);
     };
     state.keyup = function (event) {
+      if (onHotkeyUp(event)) return;
       onSpaceUp(event);
     };
     state.blur = function (event) {
@@ -1714,6 +1792,8 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
         state.spaceHold = null;
       }
       if (state.mouseHold) cancelMouseHold(state.mouseHold);
+      if (state.hotkeyHold) { clearTimeout(state.hotkeyHold.timer); state.hotkeyHold = null; }
+      state.pttSource = '';
       if (state.pttActive) {
         state.pttActive = false;
         cancelActive();
@@ -1726,6 +1806,8 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
         state.spaceHold = null;
       }
       if (state.mouseHold) cancelMouseHold(state.mouseHold);
+      if (state.hotkeyHold) { clearTimeout(state.hotkeyHold.timer); state.hotkeyHold = null; }
+      state.pttSource = '';
       if (state.pttActive || state.status === 'recording' || state.status === 'requesting' || state.status === 'preparing' || state.status === 'downloading' || state.status === 'loading') cancelActive();
       if (state.wrap) state.wrap.dataset.holding = 'false';
     };
@@ -1921,6 +2003,8 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
         state.spaceHold = null;
       }
       if (state.mouseHold) cancelMouseHold(state.mouseHold);
+      if (state.hotkeyHold) { clearTimeout(state.hotkeyHold.timer); state.hotkeyHold = null; }
+      state.pttSource = '';
       state.pttActive = false;
       if (state.wrap) state.wrap.dataset.holding = 'false';
       if (state.keydown) document.removeEventListener('keydown', state.keydown, true);
@@ -1968,13 +2052,14 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
   });
 }
 
-function buildVoiceInputScript({ readyWaitMs, engine, localReady, language, spaceHoldMs, streaming, loopback } = {}) {
+function buildVoiceInputScript({ readyWaitMs, engine, localReady, language, spaceHoldMs, streaming, loopback, hotkey } = {}) {
   var wait = Math.max(500, Number(readyWaitMs) || SCRIPT_READY_WAIT_MS);
   var mode = engine === 'provider' ? 'provider' : engine === 'system' ? 'system' : 'local';
   var hold = normalizeVoiceSpaceHoldMs(spaceHoldMs);
   var live = streaming === true && mode === 'local';
   var systemAudio = loopback === true && live;
-  return '(' + voicePageRuntime.toString() + ')(' + JSON.stringify(mode) + ', ' + wait + ', ' + JSON.stringify(localReady === true) + ', ' + JSON.stringify(String(language || '')) + ', ' + hold + ', ' + (live ? 'true' : 'false') + ', ' + (systemAudio ? 'true' : 'false') + ')';
+  var normalizedHotkey = normalizeVoiceHotkey(hotkey);
+  return '(' + voicePageRuntime.toString() + ')(' + JSON.stringify(mode) + ', ' + wait + ', ' + JSON.stringify(localReady === true) + ', ' + JSON.stringify(String(language || '')) + ', ' + hold + ', ' + (live ? 'true' : 'false') + ', ' + (systemAudio ? 'true' : 'false') + ', ' + JSON.stringify(normalizedHotkey) + ')';
 }
 
 function voiceConfig(ctx) {
@@ -1986,6 +2071,7 @@ function voiceConfig(ctx) {
     model: String(source.model || 'whisper-1').trim().slice(0, 128) || 'whisper-1',
     language: String(source.language || '').trim().toLowerCase(),
     spaceHoldMs: normalizeVoiceSpaceHoldMs(source.spaceHoldMs),
+    hotkey: normalizeVoiceHotkey(source.hotkey),
   };
 }
 
@@ -1993,8 +2079,8 @@ function buildScriptSources(config, localReady, loopback) {
   var streaming = config.engine === 'local';
   var systemAudio = loopback === true && streaming;
   return {
-    add: buildVoiceInputScript({ readyWaitMs: SCRIPT_READY_WAIT_MS, engine: config.engine, localReady: localReady, language: config.language, spaceHoldMs: config.spaceHoldMs, streaming: streaming, loopback: systemAudio }),
-    probe: buildVoiceInputScript({ readyWaitMs: PROBE_READY_WAIT_MS, engine: config.engine, localReady: localReady, language: config.language, spaceHoldMs: config.spaceHoldMs, streaming: streaming, loopback: systemAudio }),
+    add: buildVoiceInputScript({ readyWaitMs: SCRIPT_READY_WAIT_MS, engine: config.engine, localReady: localReady, language: config.language, spaceHoldMs: config.spaceHoldMs, streaming: streaming, loopback: systemAudio, hotkey: config.hotkey }),
+    probe: buildVoiceInputScript({ readyWaitMs: PROBE_READY_WAIT_MS, engine: config.engine, localReady: localReady, language: config.language, spaceHoldMs: config.spaceHoldMs, streaming: streaming, loopback: systemAudio, hotkey: config.hotkey }),
   };
 }
 
@@ -2009,10 +2095,10 @@ async function ensurePageScript(page, scripts, prepared) {
   return evaluate(page, scripts.probe, { timeoutMs: PROBE_READY_WAIT_MS + 5000 });
 }
 
-async function injectVoiceInput({ cdpPort, target = null, timeoutMs = DEFAULT_INJECT_TIMEOUT_MS, pause = sleep, engine, localReady = false, language = '', spaceHoldMs, loopback = false } = {}) {
+async function injectVoiceInput({ cdpPort, target = null, timeoutMs = DEFAULT_INJECT_TIMEOUT_MS, pause = sleep, engine, localReady = false, language = '', spaceHoldMs, loopback = false, hotkey } = {}) {
   var port = Number(cdpPort);
   if (!Number.isInteger(port) || port <= 0) throw new Error('ChatGPT 调试端口无效');
-  var config = { engine: engine === 'provider' ? 'provider' : engine === 'system' ? 'system' : 'local', language: language, spaceHoldMs: spaceHoldMs };
+  var config = { engine: engine === 'provider' ? 'provider' : engine === 'system' ? 'system' : 'local', language: language, spaceHoldMs: spaceHoldMs, hotkey: normalizeVoiceHotkey(hotkey) };
   var scripts = buildScriptSources(config, localReady === true, loopback === true);
   var prepared = new Set();
   var deadline = Date.now() + Math.max(1000, Number(timeoutMs) || DEFAULT_INJECT_TIMEOUT_MS);
@@ -2476,7 +2562,7 @@ async function startVoiceInputOnPort({ ctx, cdpPort, target = null, timeoutMs = 
   var config = voiceConfig(ctx);
   var localReady = config.engine === 'local' ? localSpeechStatus().ready : false;
   var loopback = config.engine === 'local' && loopbackAvailable();
-  await injectVoiceInput({ cdpPort: cdpPort, target: target, timeoutMs: timeoutMs, engine: config.engine, localReady: localReady, language: config.language, spaceHoldMs: config.spaceHoldMs, loopback: loopback });
+  await injectVoiceInput({ cdpPort: cdpPort, target: target, timeoutMs: timeoutMs, engine: config.engine, localReady: localReady, language: config.language, spaceHoldMs: config.spaceHoldMs, loopback: loopback, hotkey: config.hotkey });
   var bridge = startVoiceInputBridge({ cdpPort: cdpPort, ctx: ctx, log: ctx?.log, loopbackEnabled: loopback });
   return { ok: true, cdpPort: cdpPort, bridge: !!bridge };
 }

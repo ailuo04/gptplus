@@ -24,7 +24,7 @@ test('voice input: 注入脚本包含内联录音条、波形与本地 WAV 编�
   assert.match(script, /"local"/);
   assert.match(script, /PTT_HOLD_MS = Math\.min/);
   assert.match(script, /PTT_HOLD_LABEL/);
-  assert.match(script, /, 1800, true, false\)$/);
+  assert.match(script, /, 1800, true, false, \{\"code\":\"Alt\",\"ctrl\":false,\"shift\":false,\"alt\":false\}\)$/);
   assert.match(script, /onSpaceDown/);
   assert.match(script, /insertSpaceForHold/);
   assert.match(script, /pageHasFocus/);
@@ -42,28 +42,28 @@ test('voice input: provider 脚本仍保留 webm 上传路径且不启用实时�
   const script = buildVoiceInputScript({ readyWaitMs: 1234, engine: 'provider', streaming: true });
   assert.match(script, /audio\/webm/);
   assert.match(script, /"provider"/);
-  assert.match(script, /, 1000, false, false\)$/);
+  assert.match(script, /, 1000, false, false, \{\"code\":\"Alt\",\"ctrl\":false,\"shift\":false,\"alt\":false\}\)$/);
   assert.doesNotThrow(() => new Function('return ' + script));
 });
 
 test('voice input: 回环开关只随本地流式引擎注入，且运行时自包含', () => {
   const script = buildVoiceInputScript({ engine: 'local', streaming: true, loopback: true, spaceHoldMs: 1000 });
-  assert.match(script, /, 1000, true, true\)$/);
+  assert.match(script, /, 1000, true, true, \{\"code\":\"Alt\",\"ctrl\":false,\"shift\":false,\"alt\":false\}\)$/);
   assert.match(script, /loopback-start/);
   assert.match(script, /loopbackReady/);
   assert.match(script, /streamLevel/);
-  assert.match(script, /gptplus-voice-input-v15/);
+  assert.match(script, /gptplus-voice-input-v17/);
   assert.doesNotThrow(() => new Function('return ' + script));
   const provider = buildVoiceInputScript({ engine: 'provider', streaming: true, loopback: true });
-  assert.match(provider, /, 1000, false, false\)$/);
+  assert.match(provider, /, 1000, false, false, \{\"code\":\"Alt\",\"ctrl\":false,\"shift\":false,\"alt\":false\}\)$/);
   const batch = buildVoiceInputScript({ engine: 'local', streaming: false, loopback: true });
-  assert.match(batch, /, 1000, false, false\)$/);
+  assert.match(batch, /, 1000, false, false, \{\"code\":\"Alt\",\"ctrl\":false,\"shift\":false,\"alt\":false\}\)$/);
 });
 
 test('voice input: 插件配置会兜底到本地识别并规范化字段', () => {
   const config = voiceConfig({
     plugins: {
-      config: () => ({ engine: 'provider', providerId: ' p_demo ', model: ' ', language: 'EN', spaceHoldMs: '2400' }),
+      config: () => ({ engine: 'provider', providerId: ' p_demo ', model: ' ', language: 'EN', spaceHoldMs: '2400', hotkey: { code: 'KeyV', ctrl: true, shift: true } }),
     },
   });
   assert.deepEqual(config, {
@@ -72,6 +72,7 @@ test('voice input: 插件配置会兜底到本地识别并规范化字段', () =
     model: 'whisper-1',
     language: 'en',
     spaceHoldMs: 2400,
+    hotkey: { code: 'KeyV', ctrl: true, shift: true, alt: false },
   });
   assert.deepEqual(voiceConfig({ plugins: { config: () => null } }), {
     engine: 'local',
@@ -79,7 +80,9 @@ test('voice input: 插件配置会兜底到本地识别并规范化字段', () =
     model: 'whisper-1',
     language: '',
     spaceHoldMs: 1000,
+    hotkey: { code: 'Alt', ctrl: false, shift: false, alt: false },
   });
+  assert.deepEqual(voiceConfig({ plugins: { config: () => ({ hotkey: { code: 'KeyV' } }) } }).hotkey, { code: 'Alt', ctrl: false, shift: false, alt: false });
   assert.equal(voiceConfig({ plugins: { config: () => ({ spaceHoldMs: 100 }) } }).spaceHoldMs, 300);
   assert.equal(voiceConfig({ plugins: { config: () => ({ spaceHoldMs: 9000 }) } }).spaceHoldMs, 5000);
   assert.equal(voiceConfig({ plugins: { config: () => ({ spaceHoldMs: null }) } }).spaceHoldMs, 1000);
@@ -153,8 +156,81 @@ test('voice input: 上游错误与未选择提供商都会返回可读错误', a
 });
 
 
-test('voice input: 空格短按仅在松开时插入一个空格', async () => {
+test('voice input: 自定义组合键只在输入框内按住触发并在松开时停止', async () => {
+  const runtime = await createVoiceRuntime({ hotkey: { code: 'KeyV', ctrl: true, shift: true, alt: false } });
+  const down = runtime.key('keydown', 'v', { code: 'KeyV', ctrlKey: true, shiftKey: true });
+  assert.equal(down.defaultPrevented, true);
+  runtime.fireHoldTimer();
+  assert.equal(runtime.api.context().pttActive, true);
+  const up = runtime.key('keyup', 'v', { code: 'KeyV', ctrlKey: true, shiftKey: true });
+  assert.equal(up.defaultPrevented, true);
+  assert.equal(runtime.api.context().pttActive, false);
+  assert.equal(runtime.editor.value, '');
+  runtime.dispose();
+
+  const outside = await createVoiceRuntime({ hotkey: { code: 'KeyV', ctrl: true, shift: true, alt: false } });
+  outside.document.activeElement = outside.document.body;
+  const outsideDown = outside.key('keydown', 'v', { code: 'KeyV', ctrlKey: true, shiftKey: true });
+  outside.fireHoldTimer();
+  assert.equal(outsideDown.defaultPrevented, false);
+  assert.equal(outside.api.context().pttActive, false);
+  outside.dispose();
+});
+
+test('voice input: 自定义 Ctrl+空格按住期间持续录音，松开停止', async () => {
+  const runtime = await createVoiceRuntime({ engine: 'local', hotkey: { code: 'Space', ctrl: true, shift: false, alt: false } });
+  const down = runtime.key('keydown', ' ', { ctrlKey: true, code: 'Space' });
+  assert.equal(down.defaultPrevented, true);
+  runtime.fireHoldTimer();
+  await runtime.flush();
+  assert.equal(runtime.api.context().status, 'recording');
+  assert.equal(runtime.hasTimer(3000), false, '快捷键录音不应设置 3 秒停止计时器');
+  runtime.fireTimer(3000);
+  assert.equal(runtime.api.context().status, 'recording', '按住期间录音应继续');
+  const up = runtime.key('keyup', ' ', { ctrlKey: true, code: 'Space' });
+  assert.equal(up.defaultPrevented, true);
+  assert.equal(runtime.api.context().pttActive, false);
+  assert.equal(runtime.api.context().status, 'transcribing');
+  runtime.dispose();
+});
+
+test('voice input: 默认 Alt 长按只在输入框聚焦时启动', async () => {
   const runtime = await createVoiceRuntime();
+  runtime.document.activeElement = runtime.document.body;
+  const down = runtime.key('keydown', 'Alt', { code: 'AltLeft', altKey: true });
+  runtime.fireHoldTimer();
+  assert.equal(down.defaultPrevented, false);
+  assert.equal(runtime.api.context().pttActive, false);
+  runtime.dispose();
+});
+
+test('voice input: 默认 Alt 短按不录音，长按期间持续录音并在松开时结束', async () => {
+  const hotkey = { code: 'Alt', ctrl: false, shift: false, alt: false };
+  const runtime = await createVoiceRuntime({ engine: 'local', hotkey });
+  const tapDown = runtime.key('keydown', 'Alt', { code: 'AltLeft', altKey: true });
+  assert.equal(tapDown.defaultPrevented, true);
+  runtime.key('keyup', 'Alt', { code: 'AltLeft', altKey: false });
+  assert.equal(runtime.api.context().pttActive, false);
+
+  runtime.key('keydown', 'Alt', { code: 'AltLeft', altKey: true });
+  runtime.fireHoldTimer();
+  await runtime.flush();
+  assert.equal(runtime.api.context().status, 'recording');
+  assert.equal(runtime.api.context().recordMode, 'stream');
+  assert.equal(runtime.hasTimer(3000), false, '快捷键录音不应设置 3 秒停止计时器');
+  runtime.fireTimer(3000);
+  assert.equal(runtime.api.context().status, 'recording', '按住期间录音应继续');
+  assert.equal(runtime.api.context().pttActive, true);
+  const release = runtime.key('keyup', 'Alt', { code: 'AltLeft', altKey: false });
+  assert.equal(release.defaultPrevented, true);
+  assert.equal(runtime.api.context().status, 'transcribing');
+  assert.equal(runtime.api.context().pttActive, false);
+  assert.ok(runtime.outbox().some((item) => item.type === 'end'), '松开时应结束实时识别会话');
+  runtime.dispose();
+});
+
+test('voice input: 空格短按仅在松开时插入一个空格', async () => {
+  const runtime = await createVoiceRuntime({ hotkey: { code: 'Space', ctrl: false, shift: false, alt: false } });
   runtime.editor.value = 'hello';
   runtime.editor.selectionStart = runtime.editor.selectionEnd = 5;
   const down = runtime.key('keydown', ' ');
@@ -166,7 +242,7 @@ test('voice input: 空格短按仅在松开时插入一个空格', async () => {
 });
 
 test('voice input: 长按启动录音但不写入空格，且重复键被拦截', async () => {
-  const runtime = await createVoiceRuntime();
+  const runtime = await createVoiceRuntime({ hotkey: { code: 'Space', ctrl: false, shift: false, alt: false } });
   runtime.editor.value = 'hello';
   runtime.editor.selectionStart = runtime.editor.selectionEnd = 5;
   runtime.key('keydown', ' ');
@@ -180,7 +256,7 @@ test('voice input: 长按启动录音但不写入空格，且重复键被拦截'
 });
 
 test('voice input: 空格按住期间继续打字时先插入分隔空格且不丢字符', async () => {
-  const runtime = await createVoiceRuntime();
+  const runtime = await createVoiceRuntime({ hotkey: { code: 'Space', ctrl: false, shift: false, alt: false } });
   runtime.editor.value = 'hello';
   runtime.editor.selectionStart = runtime.editor.selectionEnd = 5;
   runtime.key('keydown', ' ');
@@ -195,13 +271,13 @@ test('voice input: 空格按住期间继续打字时先插入分隔空格且不�
 });
 
 test('voice input: 页面失焦或隐藏时不启动空格长按', async () => {
-  const unfocused = await createVoiceRuntime({ focused: false });
+  const unfocused = await createVoiceRuntime({ focused: false, hotkey: { code: 'Space', ctrl: false, shift: false, alt: false } });
   const ignored = unfocused.key('keydown', ' ');
   assert.equal(ignored.defaultPrevented, false);
   assert.equal(unfocused.api.context().spaceHeld, false);
   unfocused.dispose();
 
-  const hidden = await createVoiceRuntime({ hidden: true });
+  const hidden = await createVoiceRuntime({ hidden: true, hotkey: { code: 'Space', ctrl: false, shift: false, alt: false } });
   hidden.key('keydown', ' ');
   hidden.fireHoldTimer();
   assert.equal(hidden.api.context().pttActive, false);
@@ -210,7 +286,7 @@ test('voice input: 页面失焦或隐藏时不启动空格长按', async () => {
 });
 
 test('voice input: ChatGPT 窗口失焦会取消待触发的长按', async () => {
-  const runtime = await createVoiceRuntime();
+  const runtime = await createVoiceRuntime({ hotkey: { code: 'Space', ctrl: false, shift: false, alt: false } });
   runtime.key('keydown', ' ');
   runtime.windowEvent('blur', { target: runtime.window });
   runtime.fireHoldTimer();
@@ -221,7 +297,7 @@ test('voice input: ChatGPT 窗口失焦会取消待触发的长按', async () =>
 });
 
 test('voice input: 切换离开 ChatGPT 会取消进行中的录音而不触发转写', async () => {
-  const runtime = await createVoiceRuntime();
+  const runtime = await createVoiceRuntime({ hotkey: { code: 'Space', ctrl: false, shift: false, alt: false } });
   runtime.key('keydown', ' ');
   runtime.fireHoldTimer();
   assert.equal(runtime.api.context().pttActive, true);
@@ -235,7 +311,7 @@ test('voice input: 切换离开 ChatGPT 会取消进行中的录音而不触发�
 });
 
 test('voice input: 页面已失焦时松开空格会取消录音，不会转写', async () => {
-  const runtime = await createVoiceRuntime();
+  const runtime = await createVoiceRuntime({ hotkey: { code: 'Space', ctrl: false, shift: false, alt: false } });
   runtime.key('keydown', ' ');
   runtime.fireHoldTimer();
   runtime.setFocus(false);
@@ -246,7 +322,7 @@ test('voice input: 页面已失焦时松开空格会取消录音，不会转写'
 });
 
 test('voice input: 选中文字时保留 ChatGPT 原生空格行为', async () => {
-  const runtime = await createVoiceRuntime();
+  const runtime = await createVoiceRuntime({ hotkey: { code: 'Space', ctrl: false, shift: false, alt: false } });
   runtime.editor.value = 'hello';
   runtime.editor.selectionStart = 1;
   runtime.editor.selectionEnd = 4;
@@ -257,7 +333,7 @@ test('voice input: 选中文字时保留 ChatGPT 原生空格行为', async () =
 });
 
 test('voice input: 输入框以外的短按保留原生空格行为', async () => {
-  const runtime = await createVoiceRuntime();
+  const runtime = await createVoiceRuntime({ hotkey: { code: 'Space', ctrl: false, shift: false, alt: false } });
   runtime.document.activeElement = runtime.document.body;
   const down = runtime.key('keydown', ' ');
   const up = runtime.key('keyup', ' ');
@@ -268,7 +344,7 @@ test('voice input: 输入框以外的短按保留原生空格行为', async () =
 });
 
 test('voice input: 输入焦点移开后不会把短按空格补进原输入框', async () => {
-  const runtime = await createVoiceRuntime();
+  const runtime = await createVoiceRuntime({ hotkey: { code: 'Space', ctrl: false, shift: false, alt: false } });
   runtime.key('keydown', ' ');
   runtime.document.activeElement = runtime.document.body;
   runtime.key('keyup', ' ');
@@ -278,7 +354,7 @@ test('voice input: 输入焦点移开后不会把短按空格补进原输入框'
 });
 
 test('voice input: 输入法组合期间不接管空格', async () => {
-  const runtime = await createVoiceRuntime();
+  const runtime = await createVoiceRuntime({ hotkey: { code: 'Space', ctrl: false, shift: false, alt: false } });
   const down = runtime.key('keydown', ' ', { isComposing: true });
   assert.equal(down.defaultPrevented, false);
   assert.equal(runtime.api.context().spaceHeld, false);
@@ -286,7 +362,7 @@ test('voice input: 输入法组合期间不接管空格', async () => {
 });
 
 test('voice input: 空格重复事件没有初始 keydown 时不能启动长按', async () => {
-  const runtime = await createVoiceRuntime();
+  const runtime = await createVoiceRuntime({ hotkey: { code: 'Space', ctrl: false, shift: false, alt: false } });
   const repeat = runtime.key('keydown', ' ', { repeat: true });
   assert.equal(repeat.defaultPrevented, false);
   assert.equal(runtime.api.context().spaceHeld, false);
@@ -294,7 +370,7 @@ test('voice input: 空格重复事件没有初始 keydown 时不能启动长按'
 });
 
 test('voice input: 页面变为隐藏时取消待触发长按', async () => {
-  const runtime = await createVoiceRuntime();
+  const runtime = await createVoiceRuntime({ hotkey: { code: 'Space', ctrl: false, shift: false, alt: false } });
   runtime.key('keydown', ' ');
   runtime.setHidden(true);
   runtime.documentEvent('visibilitychange');
@@ -315,11 +391,14 @@ test('voice input: 输入框内鼠标左键短按不拦截原生点击', async (
   runtime.dispose();
 });
 
-test('voice input: 输入框内鼠标左键长按启动语音，松开停止', async () => {
-  const runtime = await createVoiceRuntime();
+test('voice input: 鼠标长按录音松开停止', async () => {
+  const runtime = await createVoiceRuntime({ engine: 'local' });
   runtime.pointer('pointerdown');
   runtime.fireHoldTimer();
+  await runtime.flush();
   assert.equal(runtime.api.context().pttActive, true);
+  assert.equal(runtime.api.context().status, 'recording');
+  assert.equal(runtime.hasTimer(3000), false);
   runtime.pointer('pointerup');
   assert.equal(runtime.api.context().pttActive, false);
   runtime.dispose();
@@ -397,6 +476,7 @@ test('voice input: 本地引擎边录边把稳定分句写入输入框', async (
   assert.equal(context.status, 'recording');
   const id = context.sessionId;
   assert.ok(id, '录音会话应当有 id');
+  assert.equal(runtime.hasTimer(3000), false, '麦克风按钮手动录音不受快捷键计时器影响');
 
   assert.equal(runtime.api.streamCaption(id, '', '今天我们'), true);
   assert.equal(runtime.findById('gptplus-voice-caption').children[1].textContent, '今天我们');
@@ -478,7 +558,7 @@ test('voice input: 回环模式单击不采麦克风，就绪后进入录音并�
 });
 
 test('voice input: 回环模式长按空格仍走麦克风采集', async () => {
-  const runtime = await createVoiceRuntime({ engine: 'local', loopback: true });
+  const runtime = await createVoiceRuntime({ engine: 'local', loopback: true, hotkey: { code: 'Space', ctrl: false, shift: false, alt: false } });
   runtime.key('keydown', ' ');
   runtime.fireHoldTimer();
   await runtime.flush();
@@ -602,8 +682,8 @@ test('voice input: 桥接把回环采集接入流式会话并转发分句/收尾
     assert.deepEqual(env.pushed[0], Buffer.from([1, 2, 3, 4]));
     await waitUntil(() => env.evaluations.some((expression) => expression.includes('streamLevel("s1",0.3)')));
 
-    env.state.emit({ kind: 'segment', text: '你好', pauseMs: 0, durationMs: 600 });
-    env.state.emit({ kind: 'segment', text: '世界', pauseMs: 900, durationMs: 500 });
+    env.state.emit({ kind: 'segment', text: '你好', pauseMs: 0, durationMs: 1200 });
+    env.state.emit({ kind: 'segment', text: '世界', pauseMs: 1500, durationMs: 900 });
     await waitUntil(() => env.evaluations.some((expression) => expression.includes('streamAppend("s1","你好。")')));
 
     env.inbox.push({ type: 'stream', items: [{ type: 'end', id: 's1' }] });
@@ -660,7 +740,7 @@ test('voice input: 回环采集失败时桥接回传错误并停止采集', asyn
   }
 });
 
-async function createVoiceRuntime({ focused = true, hidden = false, contentEditable = false, selected = false, engine = 'provider', loopback = false } = {}) {
+async function createVoiceRuntime({ focused = true, hidden = false, contentEditable = false, selected = false, engine = 'provider', loopback = false, hotkey = { code: 'Alt', ctrl: false, shift: false, alt: false } } = {}) {
   const vm = require('node:vm');
   const nodes = [];
   const timers = [];
@@ -773,7 +853,7 @@ async function createVoiceRuntime({ focused = true, hidden = false, contentEdita
     Event: class { constructor(type, options) { this.type = type; Object.assign(this, options); } },
     InputEvent: class { constructor(type, options) { this.type = type; Object.assign(this, options); } },
   };
-  const script = buildVoiceInputScript({ engine, readyWaitMs: 500, spaceHoldMs: 1000, streaming: engine === 'local', localReady: engine === 'local', loopback });
+  const script = buildVoiceInputScript({ engine, readyWaitMs: 500, spaceHoldMs: 1000, streaming: engine === 'local', localReady: engine === 'local', loopback, hotkey });
   await vm.runInNewContext(script, sandbox);
   return {
     editor,
@@ -807,6 +887,7 @@ async function createVoiceRuntime({ focused = true, hidden = false, contentEdita
     setHidden(value) { isHidden = value; },
     fireHoldTimer() { const timer = timers.findLast(item => item.delay === 1000 && !item.cleared); if (timer) timer.callback(); },
     fireTimer(delay) { const timer = timers.findLast(item => item.delay === delay && !item.cleared); if (timer) { timer.cleared = true; timer.callback(); } },
+    hasTimer(delay) { return timers.some(item => item.delay === delay && !item.cleared); },
     dispose() { sandbox.__gptplusVoiceDispose?.(); },
     window,
     document,

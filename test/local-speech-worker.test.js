@@ -129,7 +129,23 @@ test('local speech worker: 流式会话按停顿输出分句并带上两端补�
   // 首段补白：前 120 ms + 后 150 ms
   assert.equal(decoded[0], Math.round(0.5 * SAMPLE_RATE) + Math.round(0.27 * SAMPLE_RATE));
   assert.equal(partials, 0, '短语音不产生预览解码');
-  assert.equal(result.text, '第1句，第2句。');
+  assert.equal(result.text, '第1句第2句。', '普通 400 ms 停顿不应被切成逗号碎句');
+});
+
+test('local speech worker: 默认在持续发声约半秒后就开始实时预览', () => {
+  const vad = new ScriptedVad([{ start: 0, end: Math.round(0.6 * SAMPLE_RATE) }], { silenceAfterSamples: 999999 });
+  let clock = 0;
+  const partials = [];
+  const session = createStreamSession({
+    vad,
+    language: 'zh',
+    now: () => { clock += 300; return clock; },
+    decode: () => '正在说话',
+    onPartial: (payload) => partials.push(payload.text),
+  });
+  feed(session, 0.6);
+  assert.ok(partials.length > 0, '约 500 ms 的连续语音也应产生预览');
+  session.cancel();
 });
 
 test('local speech worker: 连续说话时按间隔输出预览，且不重复已定稿内容', () => {

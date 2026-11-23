@@ -13,12 +13,12 @@ const TERMINAL_PUNCT = new Set(['。', '！', '？', '.', '!', '?', '…', '；'
 const SOFT_PUNCT = new Set(['，', ',', '、', '：', ':']);
 
 /** 停顿达到该时长判为句末 */
-const PERIOD_PAUSE_MS = 850;
+const PERIOD_PAUSE_MS = 1200;
 /** 停顿达到该时长判为分句 */
-const CLAUSE_PAUSE_MS = 300;
+const CLAUSE_PAUSE_MS = 650;
 /** 极短片段（字数、时长同时满足）并入下一句，避免「嗯。」这类碎句 */
-const FRAGMENT_CHARS = 2;
-const FRAGMENT_MS = 420;
+const FRAGMENT_CHARS = 4;
+const FRAGMENT_MS = 900;
 
 /** SenseVoice 可能把语言/情绪/事件标签留在文本里 */
 function stripSpeechTags(value) {

@@ -22,10 +22,11 @@ test('speech segmenter: 去掉 SenseVoice 标签与中文分词空格', () => {
 
 test('speech segmenter: 停顿时长决定分句标点', () => {
   assert.equal(pickPunctuation({ text: '今天天气不错', pauseMs: 120 }), '');
-  assert.equal(pickPunctuation({ text: '今天天气不错', pauseMs: 420 }), '，');
-  assert.equal(pickPunctuation({ text: '今天天气不错', pauseMs: 1200 }), '。');
+  assert.equal(pickPunctuation({ text: '今天天气不错', pauseMs: 420 }), '');
+  assert.equal(pickPunctuation({ text: '今天天气不错', pauseMs: 700 }), '，');
+  assert.equal(pickPunctuation({ text: '今天天气不错', pauseMs: 1500 }), '。');
   assert.equal(pickPunctuation({ text: '你吃了吗', pauseMs: 900 }), '？');
-  assert.equal(pickPunctuation({ text: '我们走吧', pauseMs: 900 }), '。');
+  assert.equal(pickPunctuation({ text: '我们走吧', pauseMs: 1300 }), '。');
   assert.equal(pickPunctuation({ text: '已经结束了。', pauseMs: 1200 }), '', '模型自带句末标点时不重复追加');
   assert.equal(pickPunctuation({ text: '没听清', pauseMs: 0, final: true }), '。');
 });
@@ -43,12 +44,12 @@ test('speech segmenter: 分句器等下一段到达后才定标点，已写文�
   assert.deepEqual(composer.push({ text: '今天天气不错', pauseMs: 0, durationMs: 1200 }), []);
   assert.equal(composer.preview(), '今天天气不错');
   const first = composer.push({ text: '我们去公园', pauseMs: 950, durationMs: 900 });
-  assert.deepEqual(first.map((item) => item.text), ['今天天气不错。']);
-  assert.deepEqual(first.map((item) => item.append), ['今天天气不错。']);
-  assert.equal(composer.committed(), '今天天气不错。');
+  assert.deepEqual(first.map((item) => item.text), ['今天天气不错，']);
+  assert.deepEqual(first.map((item) => item.append), ['今天天气不错，']);
+  assert.equal(composer.committed(), '今天天气不错，');
   const last = composer.flush();
   assert.deepEqual(last.map((item) => item.text), ['我们去公园。']);
-  assert.equal(composer.committed(), '今天天气不错。我们去公园。');
+  assert.equal(composer.committed(), '今天天气不错，我们去公园。');
 });
 
 test('speech segmenter: 极短语气词并入下一句而不是单独成句', () => {
@@ -63,8 +64,8 @@ test('speech segmenter: 极短语气词并入下一句而不是单独成句', ()
 test('speech segmenter: 批量路径按段间停顿拼句并处理英文大小写', () => {
   const text = composeTranscript([
     { text: '今天天气不错', pauseMs: 0 },
-    { text: '我们去公园', pauseMs: 950 },
-    { text: '顺便买点水果', pauseMs: 350 },
+    { text: '我们去公园', pauseMs: 1400 },
+    { text: '顺便买点水果', pauseMs: 800 },
   ]);
   assert.equal(text, '今天天气不错。我们去公园，顺便买点水果。');
 
@@ -77,9 +78,26 @@ test('speech segmenter: 批量路径按段间停顿拼句并处理英文大小�
 
   const auto = composeTranscript([
     { text: 'good morning', pauseMs: 0 },
-    { text: 'is it ready', pauseMs: 520 },
+    { text: 'is it ready', pauseMs: 800 },
   ]);
   assert.equal(auto, 'Good morning, is it ready?');
+});
+
+test('speech segmenter: 短片段和短停顿合并，减少识别时的碎句', () => {
+  const composer = createSegmentComposer({ language: 'zh' });
+  composer.push({ text: '今天天气', pauseMs: 0, durationMs: 650 });
+  assert.deepEqual(composer.push({ text: '不错我们继续', pauseMs: 500, durationMs: 900 }), []);
+  assert.equal(composer.preview(), '今天天气不错我们继续');
+  assert.deepEqual(composer.flush().map((item) => item.text), ['今天天气不错我们继续。']);
+
+  const naturalPauses = createSegmentComposer({ language: 'zh' });
+  naturalPauses.push({ text: '这是一段完整的话', pauseMs: 0, durationMs: 1400 });
+  assert.deepEqual(naturalPauses.push({ text: '然后继续', pauseMs: 950, durationMs: 900 }).map((item) => item.text), ['这是一段完整的话，']);
+  assert.deepEqual(naturalPauses.flush().map((item) => item.text), ['然后继续。']);
+
+  const sentencePause = createSegmentComposer({ language: 'zh' });
+  sentencePause.push({ text: '第一句话结束', pauseMs: 0, durationMs: 1400 });
+  assert.deepEqual(sentencePause.push({ text: '第二句话开始', pauseMs: 1500, durationMs: 900 }).map((item) => item.text), ['第一句话结束。']);
 });
 
 test('speech segmenter: 软切段去掉模型补的句尾标点，按真实停顿重新断句', () => {
@@ -110,7 +128,7 @@ test('speech segmenter: 批量与英文软切同样拼接无缝', () => {
 
   const english = composeTranscript([
     { text: 'the weather is lovely.', pauseMs: 0, softCut: true },
-    { text: 'shall we go out', pauseMs: 500 },
+    { text: 'shall we go out', pauseMs: 800 },
   ], { language: 'en' });
   assert.equal(english, 'The weather is lovely, shall we go out?');
 });

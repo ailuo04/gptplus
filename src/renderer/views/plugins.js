@@ -334,6 +334,17 @@ const VOICE_LANGUAGES = [
   ['ko', '韩语'],
 ];
 
+function voiceHotkeyLabel(hotkey) {
+  const value = hotkey && typeof hotkey === 'object' ? hotkey : {};
+  const parts = [];
+  if (value.ctrl === true) parts.push('Ctrl');
+  if (value.shift === true) parts.push('Shift');
+  if (value.alt === true) parts.push('Alt');
+  const code = String(value.code || 'Alt');
+  parts.push(code === 'Space' ? '空格' : /^(?:Key|Digit)/.test(code) ? code.slice(code.startsWith('Key') ? 3 : 5) : code);
+  return parts.join('+');
+}
+
 function openVoiceConfig(ctx, plugin) {
   const current = plugin?.config || {};
   const providers = (ctx.state.providers || []).filter((provider) => provider && provider.enabled !== false);
@@ -373,13 +384,64 @@ function openVoiceConfig(ctx, plugin) {
     text: label,
     selected: value === (current.language || ''),
   })));
+  let selectedHotkey = current.hotkey && typeof current.hotkey === 'object'
+    ? { code: current.hotkey.code, ctrl: current.hotkey.ctrl === true, shift: current.hotkey.shift === true, alt: current.hotkey.alt === true }
+    : { code: 'Alt', ctrl: false, shift: false, alt: false };
   const rawSpaceHoldMs = Number(current.spaceHoldMs);
   const spaceHoldSeconds = Number.isFinite(rawSpaceHoldMs) ? Math.min(5, Math.max(0.3, rawSpaceHoldMs / 1000)) : 1;
+  const hotkeyCapture = ctx.el('button', {
+    class: 'btn btn-ghost btn-sm mono',
+    type: 'button',
+    attrs: { 'aria-label': '语音输入快捷键' },
+    text: `${voiceHotkeyLabel(selectedHotkey)}（按住）`,
+  });
+  let capturingHotkey = false;
+  hotkeyCapture.addEventListener('click', () => {
+    capturingHotkey = true;
+    hotkeyCapture.textContent = '请按组合键…';
+    hotkeyCapture.focus();
+  });
+  hotkeyCapture.addEventListener('keydown', (event) => {
+    if (!capturingHotkey) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const code = String(event.code || '');
+    if (event.key === 'Alt' && (code === 'AltLeft' || code === 'AltRight')) {
+      selectedHotkey = { code: 'Alt', ctrl: event.ctrlKey === true, shift: event.shiftKey === true, alt: false };
+      capturingHotkey = false;
+      hotkeyCapture.textContent = `${voiceHotkeyLabel(selectedHotkey)}（按住）`;
+      return;
+    }
+    if (!/^(?:Key[A-Z]|Digit[0-9]|F(?:[1-9]|1[0-2])|Space|Minus|Equal|BracketLeft|BracketRight|Backslash|Semicolon|Quote|Backquote|Comma|Period|Slash)$/.test(code)) return;
+    const hasModifier = event.ctrlKey === true || event.shiftKey === true || event.altKey === true;
+    if (code !== 'Space' && code !== 'Alt' && !hasModifier) {
+      ctx.toast('请使用 Ctrl、Shift 或 Alt 组合键；单键会影响正常输入', 'warn');
+      return;
+    }
+    selectedHotkey = { code, ctrl: event.ctrlKey === true, shift: event.shiftKey === true, alt: event.altKey === true };
+    capturingHotkey = false;
+    hotkeyCapture.textContent = `${voiceHotkeyLabel(selectedHotkey)}（按住）`;
+  });
+  const resetHotkey = ctx.el('button', {
+    class: 'btn btn-ghost btn-sm',
+    type: 'button',
+    text: '恢复 Alt',
+    on: { click: () => {
+      selectedHotkey = { code: 'Alt', ctrl: false, shift: false, alt: false };
+      capturingHotkey = false;
+      hotkeyCapture.textContent = 'Alt（按住）';
+    } },
+  });
+  const hotkeyField = ctx.el('div', { class: 'field' }, [
+    ctx.el('span', { class: 'label', text: '录音快捷键' }),
+    ctx.el('div', { class: 'plugin-config-options' }, [hotkeyCapture, resetHotkey]),
+    ctx.el('span', { class: 'hint', text: '在 ChatGPT 输入框聚焦时，按住快捷键开始录音，松开结束；默认 Alt，也可自定义快捷键。' }),
+  ]);
   const spaceHoldInput = ctx.el('input', {
     class: 'input mono',
     type: 'number',
     value: String(spaceHoldSeconds),
-    attrs: { min: '0.3', max: '5', step: '0.1', 'aria-label': '空格长按时长（秒）' },
+    attrs: { min: '0.3', max: '5', step: '0.1', 'aria-label': '快捷键长按时长（秒）' },
   });
 
   const providerField = ctx.el('label', { class: 'field' }, [
@@ -398,12 +460,12 @@ function openVoiceConfig(ctx, plugin) {
     ctx.el('span', { class: 'hint', text: '自动检测适合中英混说；指定语言通常更准。' }),
   ]);
   const spaceHoldField = ctx.el('label', { class: 'field' }, [
-    ctx.el('span', { class: 'label', text: '长按触发时长（秒）' }),
+    ctx.el('span', { class: 'label', text: '快捷键长按触发时长（秒）' }),
     spaceHoldInput,
-    ctx.el('span', { class: 'hint', text: '范围 0.3-5 秒，默认 1 秒。输入框内按住空格，或在未选中文字处按住鼠标左键，达到该时长后开始录音；松开按键或鼠标自动转写。' }),
+    ctx.el('span', { class: 'hint', text: '范围 0.3-5 秒，默认 1 秒。按住快捷键或鼠标达到该时长后开始录音；松开对应按键或鼠标结束录音。' }),
   ]);
   const providerFields = ctx.el('div', { class: 'plugin-config-options' }, [providerField, modelField]);
-  const localHint = ctx.el('span', { class: 'hint', text: '首次使用会自动下载约 231 MB 的 SenseVoice 模型；如果已安装 DeepSeek Harness，会直接复用它的模型缓存。录音和识别都在本机完成。输入框内长按空格，或在未选中文字处按住鼠标左键，达到设定时长后开始录音，松开后自动转写。' });
+  const localHint = ctx.el('span', { class: 'hint', text: '首次使用会自动下载约 231 MB 的 SenseVoice 模型；如果已安装 DeepSeek Harness，会直接复用它的模型缓存。录音和识别都在本机完成。默认按住 Alt 启动语音，松开结束录音；也可自定义快捷键或在未选中文字处按住鼠标左键。' });
   const systemHint = ctx.el('span', { class: 'hint', text: '系统听写会调用 Win+H 并弹出 Windows 语音浮层，不建议日常使用。' });
   const syncDisabled = () => {
     const provider = engineSelect.value === 'provider';
@@ -413,6 +475,8 @@ function openVoiceConfig(ctx, plugin) {
     modelInput.disabled = !provider;
     languageSelect.disabled = system;
     spaceHoldInput.disabled = system;
+    hotkeyCapture.disabled = system;
+    resetHotkey.disabled = system;
     providerFields.style.display = provider ? '' : 'none';
     languageField.style.display = system ? 'none' : '';
     localHint.style.display = local ? '' : 'none';
@@ -430,13 +494,14 @@ function openVoiceConfig(ctx, plugin) {
         ctx.el('div', { class: 'modal-title', text: '配置语音输入' }),
       ]),
       ctx.el('div', { class: 'modal-body plugin-config-body' }, [
-        ctx.el('p', { class: 'setting-desc', text: '麦克风按钮会注入到 ChatGPT 输入框的模型选择器与发送键之间。默认使用本机 SenseVoice 离线识别；在输入框内长按空格，或在未选中文字处按住鼠标左键，达到设定时长后开始录音，默认 1 秒，松开后自动转写。也可以改用提供商音频转写，或保留 Windows 系统听写。' }),
+        ctx.el('p', { class: 'setting-desc', text: '麦克风按钮会注入到 ChatGPT 输入框的模型选择器与发送键之间。默认使用本机 SenseVoice 离线识别；输入框聚焦时长按 Alt 启动语音，松开结束录音；快捷键和触发时长均可自定义，鼠标长按与麦克风按钮仍保留。也可以改用提供商音频转写，或保留 Windows 系统听写。' }),
         ctx.el('label', { class: 'field' }, [
           ctx.el('span', { class: 'label', text: '输入方式' }),
           engineSelect,
           localHint,
           systemHint,
         ]),
+        hotkeyField,
         spaceHoldField,
         providerFields,
         languageField,
@@ -468,6 +533,7 @@ function openVoiceConfig(ctx, plugin) {
                 model: String(modelInput.value || 'whisper-1').trim() || 'whisper-1',
                 language: String(languageSelect.value || ''),
                 spaceHoldMs: Math.round(spaceHoldSeconds * 1000),
+                hotkey: { ...selectedHotkey },
               };
               void runPluginAction(
                 ctx,

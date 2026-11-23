@@ -15,9 +15,9 @@ const STREAM_DEFAULTS = Object.freeze({
   tailPadMs: 150,
   minSpeechMs: 240,
   maxSegmentMs: 4000,
-  minPartialSpeechMs: 700,
-  partialBaseIntervalMs: 240,
-  partialMaxIntervalMs: 1200,
+  minPartialSpeechMs: 500,
+  partialBaseIntervalMs: 200,
+  partialMaxIntervalMs: 900,
   partialWindowMs: 5000,
   quietCutWindowMs: 900,
 });

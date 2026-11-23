@@ -3484,13 +3484,28 @@ test('插件市场：展示三个内置插件并支持配置、启停与卸载�
     assert.match(voiceModal.allText(), /提供商音频转写/);
     assert.match(voiceModal.allText(), /转写模型/);
     assert.match(voiceModal.allText(), /识别语言/);
-    assert.match(voiceModal.allText(), /长按触发时长/);
+    assert.match(voiceModal.allText(), /快捷键长按触发时长/);
+    const hotkeyCapture = findNodes(voiceModal, (n) => n.tagName === 'BUTTON' && n.attributes['aria-label'] === '语音输入快捷键')[0];
+    assert.ok(hotkeyCapture, '语音设置应提供快捷键录制按钮');
+    assert.match(hotkeyCapture.textContent, /^Alt/);
+    click(hotkeyCapture);
+    for (const handler of hotkeyCapture.listeners.keydown || []) handler({ preventDefault() {}, stopPropagation() {}, key: 'Alt', code: 'AltLeft', altKey: true });
+    assert.match(hotkeyCapture.textContent, /^Alt/);
+    click(hotkeyCapture);
+    for (const event of [
+      { key: 'Control', code: 'ControlLeft', ctrlKey: true },
+      { key: 'Shift', code: 'ShiftLeft', ctrlKey: true, shiftKey: true },
+      { key: 'v', code: 'KeyV', ctrlKey: true, shiftKey: true },
+    ]) {
+      for (const handler of hotkeyCapture.listeners.keydown || []) handler({ preventDefault() {}, stopPropagation() {}, ...event });
+    }
+    assert.match(hotkeyCapture.textContent, /Ctrl\+Shift\+V/);
     assert.match(voiceModal.allText(), /未选中文字处按住鼠标左键/);
     assert.match(voiceModal.allText(), /默认 1 秒/);
     const voiceSelects = findNodes(voiceModal, (n) => n.tagName === 'SELECT');
     assert.ok(voiceSelects.length >= 3, '语音配置应包含输入方式、提供商与语言选择');
     const spaceHoldInput = findNodes(voiceModal, (n) => n.tagName === 'INPUT' && n.attributes.type === 'number')[0];
-    assert.ok(spaceHoldInput, '语音配置应包含空格长按时长输入');
+    assert.ok(spaceHoldInput, '语音配置应包含快捷键长按时长输入');
     assert.equal(spaceHoldInput.value, '1');
     spaceHoldInput.value = '2.4';
     voiceSelects[0].value = 'provider';
@@ -3498,7 +3513,7 @@ test('插件市场：展示三个内置插件并支持配置、启停与卸载�
     assert.ok(saveVoice, '语音配置应有保存按钮');
     saveVoice.listeners.click[0]();
     await new Promise((resolve) => setImmediate(resolve));
-    assert.ok(calls.some((entry) => entry[0] === 'setPluginConfig' && entry[1].id === 'voice-input' && entry[1].config.engine === 'provider' && entry[1].config.spaceHoldMs === 2400), '语音插件应保存提供商转写模式和空格长按时长');
+    assert.ok(calls.some((entry) => entry[0] === 'setPluginConfig' && entry[1].id === 'voice-input' && entry[1].config.engine === 'provider' && entry[1].config.spaceHoldMs === 2400 && entry[1].config.hotkey.code === 'KeyV' && entry[1].config.hotkey.ctrl === true && entry[1].config.hotkey.shift === true), '语音插件应保存提供商转写模式、长按时长和组合键');
 
     const uninstall = root.findTag('button').find((node) => node.textContent.includes('卸载'));
     assert.ok(uninstall, '已安装插件应有卸载入口');
