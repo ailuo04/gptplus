@@ -51,7 +51,7 @@ test('voice input: 回环开关只随本地流式引擎注入，且运行时自�
   assert.match(script, /loopback-start/);
   assert.match(script, /loopbackReady/);
   assert.match(script, /streamLevel/);
-  assert.match(script, /gptplus-voice-input-v20/);
+  assert.match(script, /gptplus-voice-input-v21/);
   assert.doesNotThrow(() => new Function('return ' + script));
   const provider = buildVoiceInputScript({ engine: 'provider', streaming: true, loopback: true });
   assert.match(provider, /, 1000, false, false, \{\"code\":\"Alt\",\"ctrl\":false,\"shift\":false,\"alt\":false\}\)$/);
@@ -563,6 +563,11 @@ for (const trigger of ['button', 'mouse', 'Alt']) {
     assert.notDeepEqual(heights(), silent);
     for (let frame = 0; frame < 5; frame++) runtime.frame(500 + frame * 60, 0.5);
     assert.ok(Math.max(...heights()) > Math.max(...silent) + 3);
+    if (trigger === 'Alt') {
+      runtime.pointer('pointerdown');
+      runtime.pointer('pointerup');
+      assert.equal(runtime.api.context().status, 'recording');
+    }
     runtime.api.streamCaption(sessionId, '', '临时');
     if (trigger === 'button') runtime.click(button);
     else if (trigger === 'mouse') runtime.pointer('pointerup');
@@ -576,6 +581,47 @@ for (const trigger of ['button', 'mouse', 'Alt']) {
     runtime.dispose();
   });
 }
+
+test('voice input: 静音和底噪接近点状，轻声与响声分级并在停声后回落', async () => {
+  const runtime = await createVoiceRuntime({ engine: 'local' });
+  const button = runtime.findById('gptplus-voice-input');
+  runtime.click(button);
+  await runtime.flush();
+  let now = 0;
+  const amplitude = level => {
+    for (let frame = 0; frame < 5; frame++) runtime.frame(now += 60, level);
+    return Math.max(...button.children[0].children.map(line => Number(line.getAttribute('y2')) - 16));
+  };
+  assert.ok(amplitude(0) < 0.4);
+  assert.ok(amplitude(0.003) < 0.4);
+  const soft = amplitude(0.025);
+  const normal = amplitude(0.08);
+  const loud = amplitude(0.25);
+  assert.ok(soft > 1 && normal > soft + 2 && loud > normal + 2);
+  assert.ok(amplitude(0) < 0.4);
+  runtime.dispose();
+});
+
+test('voice input: 单击麦克风后短按输入框空白处收尾，排除拖动、取消、长按和框外操作', async () => {
+  const runtime = await createVoiceRuntime({ engine: 'local' });
+  const target = runtime.editor.parentElement;
+  const pointer = (type, options) => runtime.pointer(type, { target, ...options });
+  runtime.click(runtime.findById('gptplus-voice-input'));
+  await runtime.flush();
+  const { sessionId } = runtime.api.context();
+  pointer('pointerdown'); pointer('pointermove', { clientX: 12 }); pointer('pointerup');
+  pointer('pointerdown'); pointer('pointercancel'); pointer('pointerup');
+  pointer('pointerdown'); runtime.fireHoldTimer(); pointer('pointerup');
+  pointer('pointerdown'); pointer('pointerup', { target: runtime.document.body });
+  assert.equal(runtime.api.context().status, 'recording');
+  pointer('pointerdown'); pointer('pointerup'); pointer('pointerup');
+  assert.equal(runtime.api.context().status, 'transcribing');
+  assert.deepEqual(Array.from(runtime.outbox(), item => item.type), ['end']);
+  runtime.api.streamAppend(sessionId, '定稿。');
+  runtime.api.streamDone(sessionId, { ok: true });
+  assert.equal(runtime.editor.value, '定稿。');
+  runtime.dispose();
+});
 
 test('voice input: 回环模式单击不采麦克风，就绪后进入录音并复用流式写入', async () => {
   const runtime = await createVoiceRuntime({ engine: 'local', loopback: true });

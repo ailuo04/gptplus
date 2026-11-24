@@ -60,7 +60,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
   var WRAP_ID = 'gptplus-voice-input-wrap';
   var STYLE_ID = 'gptplus-voice-input-style';
   var EXT_ATTR = 'data-gptplus-voice-input';
-  var RUNTIME_KEY = 'gptplus-voice-input-v20';
+  var RUNTIME_KEY = 'gptplus-voice-input-v21';
   var MAX_RECORD_MS = 120000;
   var MAX_STREAM_MS = 600000;
   var PCM_CHUNK = 2048;
@@ -138,8 +138,8 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     var zh = isZh();
     return {
       idle: ENGINE === 'system' ? (zh ? 'Windows 系统听写' : 'Windows dictation') : zh
-        ? '点击麦克风开始或结束录音，也可长按 ' + PTT_HOTKEY_LABEL + ' 或输入框空白处 ' + PTT_HOLD_LABEL + ' 秒口述'
-        : 'Click to start or stop dictation, or hold ' + PTT_HOTKEY_LABEL + ' or the mouse in the composer for ' + PTT_HOLD_LABEL + 's',
+        ? '点击麦克风开始，再点麦克风或输入框空白处结束；也可长按 ' + PTT_HOTKEY_LABEL + ' 或输入框空白处 ' + PTT_HOLD_LABEL + ' 秒口述'
+        : 'Click to dictate. Click again or click an empty area in the composer to finish. Or hold ' + PTT_HOTKEY_LABEL + ' or the mouse in the composer for ' + PTT_HOLD_LABEL + 's',
       requesting: zh ? '请允许使用麦克风…' : 'Allow microphone access…',
       loopbackRequesting: zh ? '正在连接系统音频…' : 'Connecting to system audio…',
       preparing: zh ? '正在准备本地识别' : 'Preparing local speech',
@@ -210,8 +210,8 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
       var line = document.createElementNS(NS, 'line');
       line.setAttribute('x1', String(i * 6 + 4));
       line.setAttribute('x2', String(i * 6 + 4));
-      line.setAttribute('y1', '15');
-      line.setAttribute('y2', '17');
+      line.setAttribute('y1', '15.8');
+      line.setAttribute('y2', '16.2');
       line.setAttribute('stroke', 'currentColor');
       line.setAttribute('stroke-linecap', 'round');
       line.setAttribute('stroke-width', '3.5');
@@ -888,6 +888,11 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     var bars = [];
     var lines = state.waveform.querySelectorAll('line');
     for (var i = lines.length - 1; i >= 0; i -= 1) bars.push({ element: lines[i], level: 0 });
+    // 重用的 SVG 可能保留了上一段录音的末帧。
+    for (var bar of bars) {
+      bar.element.setAttribute('y1', '15.8');
+      bar.element.setAttribute('y2', '16.2');
+    }
     var previous = -Infinity;
     function draw(now) {
       if (now - previous >= 50) {
@@ -913,8 +918,10 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
           next = carried;
           var peak = 14 - Math.abs(j - 2) * 4;
           var pulse = 0.5 + 0.5 * Math.sin(now / 165 - j * 1.15);
-          var baseline = 2 + 4 * pulse;
-          var height = baseline + Math.min(1, bar.level * 7) * (peak + 1 - baseline);
+          // 安静时线段几乎收为圆点，超过底噪的音量才拉高波形。
+          var baseline = 0.1 + 0.18 * pulse;
+          var volume = Math.min(1, 1.9 * Math.sqrt(Math.max(0, bar.level - 0.006)));
+          var height = baseline + volume * (peak - baseline);
           bar.element.setAttribute('y1', String(16 - height));
           bar.element.setAttribute('y2', String(16 + height));
         }
@@ -1195,29 +1202,55 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     beginPushToTalk('mouse');
   }
 
+  function composerMouseTarget(editor, target) {
+    if (!editor || !state.card?.contains(target)) return false;
+    if (target.closest?.('button, a, [role="button"], [' + EXT_ATTR + ']')) return false;
+    return editor.contains(target) || !target.closest?.('input, textarea, select, [contenteditable="true"], [tabindex]');
+  }
+
+  function pointsAtText(editor, event) {
+    if (!editor.isContentEditable || !editor.contains(event.target)) return false;
+    var caret = document.caretRangeFromPoint?.(event.clientX, event.clientY);
+    var node = caret?.startContainer;
+    if (!node || node.nodeType !== 3 || !editor.contains(node)) return false;
+    // 光标会吸附到最近的字；用字的实际边界区分文字和行尾空白。
+    var offset = caret.startOffset;
+    for (var i = Math.max(0, offset - 1); i < Math.min(node.length, offset + 1); i++) {
+      if (!node.data[i].trim()) continue;
+      caret.setStart(node, i);
+      caret.setEnd(node, i + 1);
+      var rect = caret.getBoundingClientRect();
+      if (event.clientX >= rect.left && event.clientX < rect.right && event.clientY >= rect.top && event.clientY < rect.bottom) return true;
+    }
+    return false;
+  }
+
   function onMouseDown(event) {
     if (ENGINE === 'system' || event.button !== 0 || event.pointerType !== 'mouse') return;
     if (event.ctrlKey || event.metaKey || event.altKey || !pageHasFocus()) return;
     if (state.spaceHold || state.hotkeyHold || state.mouseHold || state.pttActive) return;
-    if (state.status !== 'idle' && state.status !== 'error') return;
+    var recording = state.status === 'recording' ? state.session || state.recorder : null;
+    if (!recording && state.status !== 'idle' && state.status !== 'error') return;
     var editor = editorNode();
     var target = event.target;
-    if (!editor || !state.card?.contains(target) || editorHasSelection(editor)) return;
-    if (!editor.contains(target) && target.closest?.('button, a, input, textarea, select, [role="button"], [contenteditable="true"], [tabindex], [' + EXT_ATTR + ']')) return;
+    if (!composerMouseTarget(editor, target) || editorHasSelection(editor)) return;
+    if (recording && (event.shiftKey || pointsAtText(editor, event))) return;
     var hold = {
       active: false,
       editor: editor,
       blank: !editor.contains(target),
+      finishRecording: recording,
       pointerId: event.pointerId,
       startX: Number(event.clientX) || 0,
       startY: Number(event.clientY) || 0,
       timer: 0,
     };
     hold.timer = setTimeout(function () {
-      activateMouseHold(hold);
+      if (hold.finishRecording) cancelMouseHold(hold);
+      else activateMouseHold(hold);
     }, PTT_HOLD_MS);
     state.mouseHold = hold;
-    if (state.wrap) state.wrap.dataset.holding = 'true';
+    if (!recording && state.wrap) state.wrap.dataset.holding = 'true';
   }
 
   function onMouseMove(event) {
@@ -1234,6 +1267,14 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     clearTimeout(hold.timer);
     state.mouseHold = null;
     if (state.wrap && !state.spaceHold) state.wrap.dataset.holding = 'false';
+    if (hold.finishRecording) {
+      if (state.status === 'recording' && !state.pttActive && hold.finishRecording === (state.session || state.recorder)
+          && pageHasFocus() && event.button === 0 && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey
+          && composerMouseTarget(hold.editor, event.target) && !editorHasSelection(hold.editor) && !pointsAtText(hold.editor, event)) {
+        stopRecording(true);
+      }
+      return;
+    }
     if (!hold.active) return;
     event.preventDefault();
     if (pageHasFocus()) endPushToTalk();

@@ -91,7 +91,7 @@ const BUILTIN_PLUGIN_DEFINITIONS = Object.freeze([
     category: '效率',
     icon: 'mic',
     description: '在 ChatGPT 输入框的发送键旁加入麦克风按钮，把语音转成文字。',
-    detail: '默认在本机用 SenseVoice 预览、Qwen3-ASR 0.6B INT8 定稿，不弹出系统语音浮层；在 ChatGPT 输入框聚焦时按住 Alt 开始实时录音，按住期间持续录音，松开结束；也可在设置里自定义快捷键；边说话边预览并按停顿分句、补标点，鼠标长按和麦克风按钮仍可使用。点击麦克风、长按输入框空白处和长按快捷键均使用麦克风，点击录音时再点结束，长按松开结束。也可以改用支持 /audio/transcriptions 的 OpenAI 兼容提供商（整段转写）。',
+    detail: '默认在本机用 SenseVoice 预览、Qwen3-ASR 0.6B INT8 定稿，不弹出系统语音浮层；在 ChatGPT 输入框聚焦时按住 Alt 开始实时录音，按住期间持续录音，松开结束；也可在设置里自定义快捷键；边说话边预览并按停顿分句、补标点，鼠标长按和麦克风按钮仍可使用。点击麦克风、长按输入框空白处和长按快捷键均使用麦克风，单击开始后可点输入框空白处或麦克风结束，长按松开结束。也可以改用支持 /audio/transcriptions 的 OpenAI 兼容提供商（整段转写）。',
     builtIn: true,
     defaultInstalled: true,
     defaultEnabled: true,
