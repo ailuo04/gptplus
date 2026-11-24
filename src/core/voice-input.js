@@ -17,7 +17,7 @@ const { createSystemProxyFetch } = require('./system-proxy.js');
 const { localSpeechStatus, prepareSpeechModel, startSpeechStream, transcribeLocal } = require('./local-speech.js');
 const { createSegmentComposer, joinClauses, needsSpace } = require('./speech-segmenter.js');
 const { normalizeVoiceHotkey, normalizeVoiceSpaceHoldMs } = require('./plugin-manager.js');
-const { createLoopbackCapture, loopbackAvailable } = require('./voice-loopback.js');
+const { createLoopbackCapture } = require('./voice-loopback.js');
 
 const DEFAULT_INJECT_TIMEOUT_MS = 30000;
 const SCRIPT_READY_WAIT_MS = 15000;
@@ -58,10 +58,9 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
   var LOOPBACK = loopback === true && STREAMING;
   var ID = 'gptplus-voice-input';
   var WRAP_ID = 'gptplus-voice-input-wrap';
-  var PANEL_ID = 'gptplus-voice-panel';
   var STYLE_ID = 'gptplus-voice-input-style';
   var EXT_ATTR = 'data-gptplus-voice-input';
-  var RUNTIME_KEY = 'gptplus-voice-input-v19';
+  var RUNTIME_KEY = 'gptplus-voice-input-v20';
   var MAX_RECORD_MS = 120000;
   var MAX_STREAM_MS = 600000;
   var PCM_CHUNK = 2048;
@@ -75,9 +74,6 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
   var state = {
     wrap: null,
     button: null,
-    panel: null,
-    message: null,
-    actionButton: null,
     waveform: null,
     status: 'idle',
     recorder: null,
@@ -103,6 +99,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     request: null,
     activeId: '',
     requestId: 0,
+    captureAttempt: 0,
     disposed: false,
     discard: false,
     toast: null,
@@ -140,9 +137,9 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
   function text() {
     var zh = isZh();
     return {
-      idle: zh
-        ? (ENGINE === 'local' ? (LOOPBACK ? '语音输入（本地识别，长按 ' + PTT_HOTKEY_LABEL + ' 或输入框鼠标左键 ' + PTT_HOLD_LABEL + ' 秒口述；单击转写系统声音）' : '语音输入（本地识别，长按 ' + PTT_HOTKEY_LABEL + ' 或输入框鼠标左键 ' + PTT_HOLD_LABEL + ' 秒）') : ENGINE === 'provider' ? '语音输入（提供商转写，长按 ' + PTT_HOTKEY_LABEL + ' 或输入框鼠标左键 ' + PTT_HOLD_LABEL + ' 秒）' : '语音输入（Windows 系统听写）')
-        : (ENGINE === 'system' ? 'Voice input (Windows dictation)' : LOOPBACK ? 'Voice input (hold ' + PTT_HOTKEY_LABEL + ' or left mouse in composer for ' + PTT_HOLD_LABEL + 's to dictate; click to transcribe system audio)' : 'Voice input (hold ' + PTT_HOTKEY_LABEL + ' or left mouse in composer for ' + PTT_HOLD_LABEL + 's)'),
+      idle: ENGINE === 'system' ? (zh ? 'Windows 系统听写' : 'Windows dictation') : zh
+        ? '点击麦克风开始或结束录音，也可长按 ' + PTT_HOTKEY_LABEL + ' 或输入框空白处 ' + PTT_HOLD_LABEL + ' 秒口述'
+        : 'Click to start or stop dictation, or hold ' + PTT_HOTKEY_LABEL + ' or the mouse in the composer for ' + PTT_HOLD_LABEL + 's',
       requesting: zh ? '请允许使用麦克风…' : 'Allow microphone access…',
       loopbackRequesting: zh ? '正在连接系统音频…' : 'Connecting to system audio…',
       preparing: zh ? '正在准备本地识别' : 'Preparing local speech',
@@ -151,9 +148,6 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
       recording: zh ? '停止并识别' : 'Stop and transcribe',
       transcribing: zh ? '正在识别…' : 'Transcribing…',
       finishing: zh ? '正在完成转写…' : 'Finishing transcript…',
-      retry: zh ? '重试' : 'Retry',
-      cancel: zh ? '取消' : 'Cancel',
-      empty: zh ? '未识别到语音' : 'No speech detected',
       error: zh ? '语音输入失败' : 'Voice input failed',
       external: zh ? 'Windows 系统听写会弹出系统浮层' : 'Windows dictation opens a system overlay',
       noProvider: zh ? '请先在插件设置中选择转写提供商' : 'Choose a transcription provider in plugin settings',
@@ -319,42 +313,19 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     if (state.status === 'requesting') return state.session && state.session.loopback ? labels.loopbackRequesting : labels.requesting;
     if (state.status === 'transcribing') return state.session && !state.session.active ? labels.finishing : labels.transcribing;
     if (state.status === 'error') return state.lastError || labels.error;
-    if (state.status === 'feedback') return state.lastError || labels.empty;
     return '';
   }
 
   function render() {
-    if (!state.wrap || !state.panel) return;
-    var labels = text();
+    if (!state.button) return;
     var recording = state.status === 'recording';
-    var finishingInline = state.status === 'transcribing' && state.recordMode === 'stream';
-    var active = state.status !== 'idle' && !recording && !finishingInline;
+    var busy = !recording && state.status !== 'idle' && state.status !== 'error';
     state.wrap.dataset.recording = String(recording);
-    state.wrap.dataset.active = active ? 'true' : 'false';
-    state.panel.dataset.phase = state.status;
-    if (state.button) {
-      state.button.replaceChildren(recording ? state.waveform : svgIcon('mic'));
-      state.button.title = finishingInline ? labels.finishing : labels.idle;
-      state.button.setAttribute('aria-label', state.button.title);
-      state.button.setAttribute('aria-busy', String(finishingInline));
-    }
-    if (state.message) {
-      var message = messageForStatus();
-      state.message.textContent = message;
-      state.message.title = message;
-      state.message.style.display = state.status === 'recording' ? 'none' : 'flex';
-    }
-    if (state.actionButton) {
-      if (state.status === 'error' || state.status === 'feedback') {
-        state.actionButton.style.display = 'inline-flex';
-        state.actionButton.replaceChildren(svgIcon('mic'));
-        state.actionButton.title = labels.retry;
-        state.actionButton.setAttribute('aria-label', labels.retry);
-      } else {
-        state.actionButton.style.display = 'none';
-      }
-    }
-    if (state.status === 'recording') updateRecordingLabel();
+    state.button.replaceChildren(recording ? state.waveform : svgIcon(busy ? 'spinner' : 'mic'));
+    state.button.title = messageForStatus() || text().idle;
+    state.button.setAttribute('aria-label', state.button.title);
+    state.button.setAttribute('aria-busy', String(busy));
+    if (recording) updateRecordingLabel();
   }
 
   function setStatus(next) {
@@ -387,11 +358,6 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     clearTimeout(state.transcribeTimer);
     state.lastError = String(message || text().error);
     setStatus('error');
-  }
-
-  function emptyResult() {
-    state.lastError = text().empty;
-    setStatus('feedback');
   }
 
   function captureSelection() {
@@ -668,11 +634,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     setStatus('idle');
   }
 
-  function captureConstraints(mode) {
-    // 连续模式常用于外放听力素材，关闭回声消除否则会把要转写的声音当成回声压掉
-    if (mode === 'listen') {
-      return { audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true, channelCount: 1 } };
-    }
+  function captureConstraints() {
     return { audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } };
   }
 
@@ -684,13 +646,14 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     clearStatusTimer();
     state.timer = setInterval(updateRecordingLabel, 500);
     updateRecordingLabel();
+    var session = state.session;
     setTimeout(function () {
-      if (!state.disposed && state.status === 'recording' && state.recordMode === 'stream') stopRecording(true);
+      if (!state.disposed && state.status === 'recording' && state.session === session) stopRecording(true);
     }, MAX_STREAM_MS);
   }
 
   /**
-   * 单击「转写系统声音」：不在页面采麦克风，交给主进程的隐藏采集窗口做系统音频回环。
+   * 显式请求回环时由主进程采集系统音频。
    * 页面只发 loopback-start，等主进程 loopbackReady 后进入录音态；分句/字幕仍走原有流事件。
    */
   function startLoopbackRecording() {
@@ -723,13 +686,13 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     }, 12000);
   }
 
-  async function startStreamRecording(mode) {
+  async function startStreamRecording(attempt) {
     captureSelection();
     setStatus('requesting');
     var media = null;
     try {
-      media = await navigator.mediaDevices.getUserMedia(captureConstraints(mode));
-      if (state.disposed || state.status === 'idle') {
+      media = await navigator.mediaDevices.getUserMedia(captureConstraints());
+      if (state.disposed || attempt !== state.captureAttempt) {
         stopStream(media);
         return;
       }
@@ -778,6 +741,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
       enterStreamRecording();
     } catch (error) {
       stopStream(media);
+      if (state.disposed || attempt !== state.captureAttempt) return;
       if (state.stream === media) state.stream = null;
       teardownStreamCapture();
       state.session = null;
@@ -827,7 +791,6 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
   async function decodeLocalAudio(chunks, mime) {
     if (!state.audioContext) throw new Error(isZh() ? '音频上下文已关闭' : 'Audio context closed');
     var blob = new Blob(chunks, { type: mime || 'audio/webm' });
-    if (!blob.size) throw new Error(text().empty);
     var decoded = await state.audioContext.decodeAudioData(await blob.arrayBuffer());
     var seconds = Math.min(decoded.duration, MAX_RECORD_MS / 1000);
     var offline = new OfflineAudioContext(1, Math.max(1, Math.floor(seconds * 16000)), 16000);
@@ -841,7 +804,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
 
   function uploadProvider(blob) {
     if (!blob || !blob.size) {
-      emptyResult();
+      setStatus('idle');
       return;
     }
     setStatus('transcribing');
@@ -897,10 +860,8 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
   }
 
   function stopRecording(send) {
-    if (state.pttSource === 'hotkey') {
-      state.pttActive = false;
-      state.pttSource = '';
-    }
+    state.pttActive = false;
+    state.pttSource = '';
     if (state.recordMode === 'stream') {
       stopStreamRecording(send === true);
       return;
@@ -951,7 +912,9 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
           bar.level = next;
           next = carried;
           var peak = 14 - Math.abs(j - 2) * 4;
-          var height = 1 + Math.min(1, bar.level * 6) * peak;
+          var pulse = 0.5 + 0.5 * Math.sin(now / 165 - j * 1.15);
+          var baseline = 2 + 4 * pulse;
+          var height = baseline + Math.min(1, bar.level * 7) * (peak + 1 - baseline);
           bar.element.setAttribute('y1', String(16 - height));
           bar.element.setAttribute('y2', String(16 + height));
         }
@@ -961,14 +924,13 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     state.waveformFrame = requestAnimationFrame(draw);
   }
 
-  async function startRecording(mode) {
-    var captureMode = mode === 'click' ? 'listen' : 'dictate';
+  async function startRecording() {
     if (state.disposed || state.recorder || state.session || state.status === 'recording' || state.status === 'transcribing') return;
     if (!bridgeReady()) {
       fail(isZh() ? 'gpt++ 未连接，请先启动 gpt++' : 'gpt++ is not connected');
       return;
     }
-    if (STREAMING && LOOPBACK && captureMode === 'listen') {
+    if (LOOPBACK) {
       startLoopbackRecording();
       return;
     }
@@ -976,9 +938,10 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
       fail(isZh() ? '当前页面不支持录音' : 'Recording is not supported here');
       return;
     }
+    var attempt = ++state.captureAttempt;
     if (STREAMING) {
       try {
-        await startStreamRecording(captureMode);
+        await startStreamRecording(attempt);
         return;
       } catch (error) {
         if (!error || error.streamUnsupported !== true) {
@@ -993,15 +956,15 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
       fail(isZh() ? '当前页面不支持录音' : 'Recording is not supported here');
       return;
     }
-    await startBatchRecording(captureMode);
+    await startBatchRecording(attempt);
   }
 
-  async function startBatchRecording(mode) {
+  async function startBatchRecording(attempt) {
     captureSelection();
     setStatus('requesting');
     try {
-      var stream = await navigator.mediaDevices.getUserMedia(captureConstraints(mode));
-      if (state.disposed || state.status === 'idle') {
+      var stream = await navigator.mediaDevices.getUserMedia(captureConstraints());
+      if (state.disposed || attempt !== state.captureAttempt) {
         stopStream(stream);
         return;
       }
@@ -1040,7 +1003,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
         state.recorder = null;
         stopStream(stream);
         if (state.stream === stream) state.stream = null;
-        if (state.discard) {
+        if (state.discard || !chunks.length) {
           state.discard = false;
           closeAudioContext();
           setStatus('idle');
@@ -1063,9 +1026,10 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
       state.timer = setInterval(updateRecordingLabel, 500);
       updateRecordingLabel();
       setTimeout(function () {
-        if (!state.disposed && state.status === 'recording') stopRecording(true);
+        if (!state.disposed && state.status === 'recording' && state.recorder === recorder) stopRecording(true);
       }, MAX_RECORD_MS);
     } catch (error) {
+      if (state.disposed || attempt !== state.captureAttempt) return;
       stopStream(state.stream);
       state.stream = null;
       closeAudioContext();
@@ -1086,6 +1050,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
   }
 
   function cancelActive() {
+    state.captureAttempt += 1;
     var had = state.status !== 'idle';
     state.pttActive = false;
     state.pttSource = '';
@@ -1218,6 +1183,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
   function activateMouseHold(hold) {
     if (state.disposed || state.mouseHold !== hold || hold.active) return;
     var editor = editorNode();
+    if (hold.blank && editor === hold.editor && pageHasFocus() && !editorHasSelection(editor)) editor.focus();
     if (!pageHasFocus() || !editor || editor !== hold.editor || !composerFocused() || !editorSelectionCollapsed()) {
       cancelMouseHold(hold);
       return;
@@ -1233,12 +1199,15 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     if (ENGINE === 'system' || event.button !== 0 || event.pointerType !== 'mouse') return;
     if (event.ctrlKey || event.metaKey || event.altKey || !pageHasFocus()) return;
     if (state.spaceHold || state.hotkeyHold || state.mouseHold || state.pttActive) return;
-    if (state.status !== 'idle' && state.status !== 'error' && state.status !== 'feedback') return;
+    if (state.status !== 'idle' && state.status !== 'error') return;
     var editor = editorNode();
-    if (!editor || (event.target !== editor && !editor.contains(event.target)) || editorHasSelection(editor)) return;
+    var target = event.target;
+    if (!editor || !state.card?.contains(target) || editorHasSelection(editor)) return;
+    if (!editor.contains(target) && target.closest?.('button, a, input, textarea, select, [role="button"], [contenteditable="true"], [tabindex], [' + EXT_ATTR + ']')) return;
     var hold = {
       active: false,
       editor: editor,
+      blank: !editor.contains(target),
       pointerId: event.pointerId,
       startX: Number(event.clientX) || 0,
       startY: Number(event.clientY) || 0,
@@ -1282,20 +1251,20 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
   function beginPushToTalk(source) {
     if (state.disposed || state.pttActive) return;
     if (ENGINE === 'system') return;
-    if (state.status !== 'idle' && state.status !== 'error' && state.status !== 'feedback') return;
+    if (state.status !== 'idle' && state.status !== 'error') return;
+    state.pttActive = true;
+    state.pttSource = source;
+    beginDictation();
+  }
+
+  function beginDictation() {
+    state.lastError = '';
     if (!bridgeReady()) {
       fail(isZh() ? 'gpt++ 未连接，请先启动 gpt++' : 'gpt++ is not connected');
       return;
     }
-    state.pttActive = true;
-    state.pttSource = source || 'button';
-    state.lastError = '';
-    if (state.status === 'error' || state.status === 'feedback') setStatus('idle');
-    if (ENGINE === 'local' && !state.localReady) {
-      requestPreparation();
-      return;
-    }
-    void startRecording('hold');
+    if (ENGINE === 'local' && !state.localReady) requestPreparation();
+    else void startRecording();
   }
 
   function endPushToTalk() {
@@ -1364,7 +1333,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     if (event.repeat === true) return;
     var inEditor = composerFocused();
     if (!inEditor || !editorSelectionCollapsed()) return;
-    if (state.status !== 'idle' && state.status !== 'error' && state.status !== 'feedback') return;
+    if (state.status !== 'idle' && state.status !== 'error') return;
     var hold = { active: false, timer: 0, startedAt: Date.now(), inEditor: inEditor, selection: null, range: null };
     captureSpaceSelection(hold);
     hold.timer = setTimeout(function () {
@@ -1453,7 +1422,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     }
     if (event.repeat === true || !pageHasFocus() || !composerFocused() || !editorSelectionCollapsed()) return false;
     if (state.spaceHold || state.mouseHold || state.pttActive) return false;
-    if (state.status !== 'idle' && state.status !== 'error' && state.status !== 'feedback') return false;
+    if (state.status !== 'idle' && state.status !== 'error') return false;
     var hold = { code: PTT_HOTKEY_CODE === 'Alt' ? event.code : PTT_HOTKEY_CODE, active: false, timer: 0 };
     hold.timer = setTimeout(function () { activateHotkeyHold(hold); }, PTT_HOLD_MS);
     state.hotkeyHold = hold;
@@ -1492,15 +1461,11 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
       return;
     }
     if (state.status === 'requesting') return;
-    if (state.status === 'error' || state.status === 'feedback') {
-      state.lastError = '';
-      setStatus('idle');
-    }
-    if (!bridgeReady()) {
-      fail(isZh() ? 'gpt++ 未连接，请先启动 gpt++' : 'gpt++ is not connected');
-      return;
-    }
     if (ENGINE === 'system') {
+      if (!bridgeReady()) {
+        fail(isZh() ? 'gpt++ 未连接，请先启动 gpt++' : 'gpt++ is not connected');
+        return;
+      }
       focusEditor();
       var id = String(++state.requestId);
       state.activeId = id;
@@ -1510,18 +1475,13 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
       setTimeout(function () { if (!state.disposed) focusEditor(); }, 0);
       return;
     }
-    if (ENGINE === 'local' && !state.localReady) {
-      requestPreparation();
-      return;
-    }
-    void startRecording('click');
+    beginDictation();
   }
 
   function buildButton() {
     var wrap = document.createElement('span');
     wrap.id = WRAP_ID;
     wrap.setAttribute(EXT_ATTR, 'true');
-    wrap.dataset.active = 'false';
     var button = document.createElement('button');
     button.id = ID;
     button.type = 'button';
@@ -1531,58 +1491,9 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     button.addEventListener('click', onClick);
     wrap.appendChild(button);
 
-    var panel = document.createElement('span');
-    panel.id = PANEL_ID;
-    panel.setAttribute(EXT_ATTR, 'true');
-    panel.dataset.phase = 'idle';
-    var cancel = document.createElement('button');
-    cancel.type = 'button';
-    cancel.className = 'gptplus-voice-round';
-    cancel.setAttribute(EXT_ATTR, 'true');
-    cancel.title = text().cancel;
-    cancel.setAttribute('aria-label', text().cancel);
-    cancel.addEventListener('mousedown', function (event) { event.preventDefault(); });
-    cancel.addEventListener('click', function (event) {
-      event.preventDefault();
-      event.stopPropagation();
-      cancelActive();
-    });
-    cancel.replaceChildren(svgIcon('close'));
-    panel.appendChild(cancel);
-
-    var body = document.createElement('span');
-    body.className = 'gptplus-voice-body';
-    var waveform = buildWaveform();
-    var message = document.createElement('span');
-    message.className = 'gptplus-voice-message';
-    message.setAttribute('role', 'status');
-    body.appendChild(message);
-    panel.appendChild(body);
-
-    var action = document.createElement('button');
-    action.type = 'button';
-    action.className = 'gptplus-voice-round';
-    action.setAttribute(EXT_ATTR, 'true');
-    action.addEventListener('mousedown', function (event) { event.preventDefault(); });
-    action.addEventListener('click', function (event) {
-      event.preventDefault();
-      event.stopPropagation();
-      if (state.status === 'recording') stopRecording(true);
-      else if (state.status === 'error' || state.status === 'feedback') {
-        state.lastError = '';
-        setStatus('idle');
-        void startRecording();
-      }
-    });
-    panel.appendChild(action);
-    wrap.appendChild(panel);
-
     state.wrap = wrap;
     state.button = button;
-    state.panel = panel;
-    state.message = message;
-    state.actionButton = action;
-    state.waveform = waveform;
+    state.waveform = buildWaveform();
     render();
     return wrap;
   }
@@ -1644,29 +1555,15 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
         + '@keyframes gptplus-voice-hold{from{--gptplus-hold:0deg}to{--gptplus-hold:360deg}}'
         + '#gptplus-voice-input svg{width:16px;height:16px;display:block}'
         + '#gptplus-voice-input-wrap{display:inline-flex;align-items:center;position:relative;margin-inline-start:4px;margin-inline-end:2px;min-width:0}'
-        + '#gptplus-voice-panel{display:none;position:absolute;right:0;bottom:calc(100% + 8px);z-index:2147483000;box-sizing:border-box;align-items:center;gap:8px;width:min(320px,44vw);min-width:250px;height:44px;padding:6px 8px;border:1px solid color-mix(in srgb,var(--color-token-text-primary,#1a1c1f) 18%,transparent);border-radius:14px;background:var(--color-token-main-surface-primary,#fff);color:var(--color-token-text-primary,#1a1c1f);box-shadow:0 16px 40px rgba(0,0,0,.16),0 2px 8px rgba(0,0,0,.07);pointer-events:auto}'
-        + '#gptplus-voice-input-wrap[data-active="true"] #gptplus-voice-panel{display:inline-flex;animation:gptplus-voice-pop .14s ease-out}'
-        + '#gptplus-voice-input-wrap[data-active="true"] #gptplus-voice-input{visibility:hidden;pointer-events:none}'
-        + '.gptplus-voice-round{display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;width:30px;height:30px;padding:0;border:0;border-radius:999px;background:color-mix(in srgb,var(--color-token-text-primary,#dfdfdf) 9%,transparent);color:color-mix(in srgb,var(--color-token-text-primary,#dfdfdf) 82%,transparent);cursor:pointer;transition:background-color .15s,color .15s;outline:none}'
-        + '.gptplus-voice-round:hover{background:color-mix(in srgb,var(--color-token-text-primary,#dfdfdf) 16%,transparent);color:var(--color-token-text-primary,#dfdfdf)}'
-        + '.gptplus-voice-round:focus-visible{outline:2px solid color-mix(in srgb,var(--color-token-text-primary,#dfdfdf) 45%,transparent);outline-offset:1px}'
-        + '.gptplus-voice-round svg{width:14px;height:14px;display:block}'
-        + '.gptplus-voice-body{display:flex;align-items:center;gap:8px;flex:1;min-width:0;overflow:hidden}'
+        + '#gptplus-voice-input #gptplus-voice-wave{width:22px;height:22px}'
         + '#gptplus-voice-input-wrap[data-recording="true"] #gptplus-voice-input{color:var(--color-token-text-primary,currentColor);background:color-mix(in srgb,currentColor 8%,transparent)}'
-        + '.gptplus-voice-message{display:none;align-items:center;flex:1;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:12px;line-height:1.2;color:color-mix(in srgb,var(--color-token-text-primary,#1a1c1f) 68%,transparent)}'
-        + '#gptplus-voice-panel[data-phase="error"] .gptplus-voice-message{color:#ef4444}'
-        + '#gptplus-voice-panel[data-phase="feedback"] .gptplus-voice-message{color:color-mix(in srgb,var(--color-token-text-primary,#1a1c1f) 55%,transparent)}'
         + '.gptplus-voice-spin{animation:gptplus-voice-spin .85s linear infinite;transform-origin:center}'
-        + '@keyframes gptplus-voice-spin{to{transform:rotate(360deg)}}'
-        + '@keyframes gptplus-voice-pop{from{opacity:0;transform:translateY(4px) scale(.98)}to{opacity:1;transform:none}}';
+        + '@keyframes gptplus-voice-spin{to{transform:rotate(360deg)}}';
       document.head?.appendChild(style);
     }
     document.getElementById(WRAP_ID)?.remove();
     state.wrap = null;
     state.button = null;
-    state.panel = null;
-    state.message = null;
-    state.actionButton = null;
     state.waveform = null;
     state.observer = new MutationObserver(function (records) {
       var relevant = false;
@@ -1817,7 +1714,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
         state.request = null;
         state.prepareText = '';
         setStatus('idle');
-        void startRecording(state.pttActive ? 'hold' : 'click');
+        void startRecording();
         return true;
       },
       /** 稳定分句：直接追加到输入框，永不回改。 */
@@ -1872,16 +1769,12 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
         state.outbox = [];
         if (result && result.ok === true) {
           if (session.preview) replaceDictation(session, session.insertedText, session.preview, '');
-          if (!session.insertedText || session.insertFailed) {
-            if (session.insertFailed) {
-              fail(isZh() ? '转写结果插入失败' : 'Could not insert transcript');
-            } else {
-              emptyResult();
-            }
+          if (session.insertFailed) {
+            fail(isZh() ? '转写结果插入失败' : 'Could not insert transcript');
             return true;
           }
           setStatus('idle');
-          if (result.notice) showToast(result.notice, 'ok');
+          if (session.insertedText && result.notice) showToast(result.notice, 'ok');
           return true;
         }
         rollbackSession(session);
@@ -1895,7 +1788,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
         clearTimeout(state.transcribeTimer);
         state.lastBridgeAt = Date.now();
         if (result && result.ok === true) {
-          if (result.text) {
+          if (String(result.text || '').trim()) {
             var inserted = insertText(result.text);
             if (!inserted) {
               fail(isZh() ? '转写结果插入失败' : 'Could not insert transcript');
@@ -1905,7 +1798,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
             if (result.notice) showToast(result.notice, 'ok');
             return true;
           }
-          emptyResult();
+          setStatus('idle');
           return true;
         }
         fail((result && result.error) || (isZh() ? '识别失败' : 'Transcription failed'));
@@ -2165,7 +2058,7 @@ async function transcribeVoice({ ctx, config, pending, fetchImpl } = {}) {
     : '';
   if (!transcript && text && !json) transcript = text;
   var trimmed = String(transcript || '').trim();
-  if (!trimmed) throw new Error('提供商没有返回转写文本');
+  if (!trimmed && json && typeof json.text !== 'string' && typeof json.transcription !== 'string') throw new Error('提供商没有返回转写文本');
   return trimmed;
 }
 
@@ -2504,9 +2397,8 @@ async function startVoiceInputOnPort({ ctx, cdpPort, target = null, timeoutMs = 
   stopVoiceInputBridge();
   var config = voiceConfig(ctx);
   var localReady = config.engine === 'local' ? localSpeechStatus().ready : false;
-  var loopback = config.engine === 'local' && loopbackAvailable();
-  await injectVoiceInput({ cdpPort: cdpPort, target: target, timeoutMs: timeoutMs, engine: config.engine, localReady: localReady, language: config.language, spaceHoldMs: config.spaceHoldMs, loopback: loopback, hotkey: config.hotkey });
-  var bridge = startVoiceInputBridge({ cdpPort: cdpPort, ctx: ctx, log: ctx?.log, loopbackEnabled: loopback });
+  await injectVoiceInput({ cdpPort: cdpPort, target: target, timeoutMs: timeoutMs, engine: config.engine, localReady: localReady, language: config.language, spaceHoldMs: config.spaceHoldMs, hotkey: config.hotkey });
+  var bridge = startVoiceInputBridge({ cdpPort: cdpPort, ctx: ctx, log: ctx?.log });
   return { ok: true, cdpPort: cdpPort, bridge: !!bridge };
 }
 

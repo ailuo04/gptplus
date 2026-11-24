@@ -12,7 +12,7 @@ const {
 test('voice input: 注入脚本包含内联录音条、波形与本地 WAV 编码', () => {
   const script = buildVoiceInputScript({ readyWaitMs: 1234, engine: 'local', localReady: true, language: 'zh', spaceHoldMs: 1800, streaming: true });
   assert.match(script, /gptplus-voice-input/);
-  assert.match(script, /gptplus-voice-panel/);
+  assert.doesNotMatch(script, /gptplus-voice-panel/);
   assert.match(script, /gptplus-voice-wave/);
   assert.doesNotMatch(script, /gptplus-voice-caption/);
   assert.match(script, /__gptplusVoice/);
@@ -29,7 +29,6 @@ test('voice input: 注入脚本包含内联录音条、波形与本地 WAV 编�
   assert.match(script, /insertSpaceForHold/);
   assert.match(script, /pageHasFocus/);
   assert.match(script, /position:absolute/);
-  assert.match(script, /--color-token-main-surface-primary/);
   assert.match(script, /takeOutbox/);
   assert.match(script, /streamAppend/);
   assert.match(script, /pcmToBase64/);
@@ -52,7 +51,7 @@ test('voice input: 回环开关只随本地流式引擎注入，且运行时自�
   assert.match(script, /loopback-start/);
   assert.match(script, /loopbackReady/);
   assert.match(script, /streamLevel/);
-  assert.match(script, /gptplus-voice-input-v19/);
+  assert.match(script, /gptplus-voice-input-v20/);
   assert.doesNotThrow(() => new Function('return ' + script));
   const provider = buildVoiceInputScript({ engine: 'provider', streaming: true, loopback: true });
   assert.match(provider, /, 1000, false, false, \{\"code\":\"Alt\",\"ctrl\":false,\"shift\":false,\"alt\":false\}\)$/);
@@ -540,6 +539,44 @@ test('voice input: 过期会话的流式事件不会写入输入框', async () =
   runtime.dispose();
 });
 
+for (const trigger of ['button', 'mouse', 'Alt']) {
+  test('voice input: 三种入口共用麦克风、动态波形和静默收尾 / ' + trigger, async () => {
+    const runtime = await createVoiceRuntime({ engine: 'local' });
+    const button = runtime.findById('gptplus-voice-input');
+    runtime.editor.value = '已有内容';
+    runtime.editor.selectionStart = runtime.editor.selectionEnd = 2;
+    if (trigger === 'button') runtime.click(button);
+    else {
+      if (trigger === 'mouse') runtime.pointer('pointerdown', { target: runtime.editor.parentElement });
+      else runtime.key('keydown', 'Alt', { code: 'AltLeft', altKey: true });
+      runtime.fireHoldTimer();
+    }
+    await runtime.flush();
+    const { status, sessionId } = runtime.api.context();
+    assert.equal(status, 'recording');
+    assert.equal(runtime.micCalls.length, 1);
+    assert.equal(runtime.micCalls[0].audio.echoCancellation, true);
+    const heights = () => button.children[0].children.map(line => Number(line.getAttribute('y2')));
+    runtime.frame(100);
+    const silent = heights();
+    runtime.frame(360);
+    assert.notDeepEqual(heights(), silent);
+    for (let frame = 0; frame < 5; frame++) runtime.frame(500 + frame * 60, 0.5);
+    assert.ok(Math.max(...heights()) > Math.max(...silent) + 3);
+    runtime.api.streamCaption(sessionId, '', '临时');
+    if (trigger === 'button') runtime.click(button);
+    else if (trigger === 'mouse') runtime.pointer('pointerup');
+    else runtime.key('keyup', 'Alt', { code: 'AltLeft' });
+    assert.equal(runtime.api.context().status, 'transcribing');
+    assert.deepEqual(Array.from(runtime.outbox(), item => item.type), ['end']);
+    runtime.api.streamDone(sessionId, { ok: true });
+    assert.equal(runtime.api.context().status, 'idle');
+    assert.equal(runtime.editor.value, '已有内容');
+    assert.equal(runtime.findById('gptplus-voice-panel'), null);
+    runtime.dispose();
+  });
+}
+
 test('voice input: 回环模式单击不采麦克风，就绪后进入录音并复用流式写入', async () => {
   const runtime = await createVoiceRuntime({ engine: 'local', loopback: true });
   runtime.editor.value = '原文';
@@ -577,8 +614,8 @@ test('voice input: 回环模式单击不采麦克风，就绪后进入录音并�
   runtime.dispose();
 });
 
-test('voice input: 回环模式长按空格仍走麦克风采集', async () => {
-  const runtime = await createVoiceRuntime({ engine: 'local', loopback: true, hotkey: { code: 'Space', ctrl: false, shift: false, alt: false } });
+test('voice input: 自定义空格长按也使用麦克风', async () => {
+  const runtime = await createVoiceRuntime({ engine: 'local', hotkey: { code: 'Space', ctrl: false, shift: false, alt: false } });
   runtime.key('keydown', ' ');
   runtime.fireHoldTimer();
   await runtime.flush();
@@ -793,6 +830,8 @@ async function createVoiceRuntime({ focused = true, hidden = false, contentEdita
   const nodes = [];
   const timers = [];
   const micCalls = [];
+  let frame;
+  let audioLevel = 0;
   let isFocused = focused;
   let isHidden = hidden;
   class Node {
@@ -837,7 +876,7 @@ async function createVoiceRuntime({ focused = true, hidden = false, contentEdita
       if (this === card && (selector.includes('.ProseMirror') || selector.includes('[role="textbox"]'))) return editor;
       return null;
     }
-    querySelectorAll() { return []; }
+    querySelectorAll(selector) { return this.children.filter(child => child.tagName === selector.toUpperCase()); }
     setRangeText(text, start, end, selectionMode) {
       this.value = this.value.slice(0, start) + text + this.value.slice(end);
       const cursor = start + text.length;
@@ -886,7 +925,7 @@ async function createVoiceRuntime({ focused = true, hidden = false, contentEdita
         this.state = 'running';
         this.destination = {};
       }
-      createAnalyser() { return { fftSize: 256, getFloatTimeDomainData() {} }; }
+      createAnalyser() { return { fftSize: 256, getFloatTimeDomainData(samples) { samples.fill(audioLevel); } }; }
       createMediaStreamSource() { return { connect() {} }; }
       createScriptProcessor() { return { connect() {}, disconnect() {}, onaudioprocess: null }; }
       createGain() { return { gain: { value: 1 }, connect() {}, disconnect() {} }; }
@@ -897,7 +936,7 @@ async function createVoiceRuntime({ focused = true, hidden = false, contentEdita
     setTimeout: (callback, delay) => { const timer = { callback, delay, cleared: false }; timers.push(timer); return timers.length; },
     clearTimeout: id => { if (timers[id - 1]) timers[id - 1].cleared = true; },
     setInterval: () => 1, clearInterval() {},
-    requestAnimationFrame: () => 1, cancelAnimationFrame() {},
+    requestAnimationFrame(callback) { frame = callback; return 1; }, cancelAnimationFrame() { frame = null; },
     Event: class { constructor(type, options) { this.type = type; Object.assign(this, options); } },
     InputEvent: class { constructor(type, options) { this.type = type; Object.assign(this, options); } },
   };
@@ -907,6 +946,7 @@ async function createVoiceRuntime({ focused = true, hidden = false, contentEdita
     editor,
     api: sandbox.__gptplusVoice,
     micCalls,
+    frame(now, level = 0) { audioLevel = level; frame(now); },
     outbox() { return sandbox.__gptplusVoice.takeOutbox() || []; },
     findById(id) { return nodes.find(node => node.id === id && node.isConnected) || null; },
     click(node) {
