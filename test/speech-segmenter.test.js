@@ -132,3 +132,17 @@ test('speech segmenter: 批量与英文软切同样拼接无缝', () => {
   ], { language: 'en' });
   assert.equal(english, 'The weather is lovely, shall we go out?');
 });
+
+test('speech segmenter: 短句后的长停顿优先于碎片合并', () => {
+  const composer = createSegmentComposer();
+  composer.push({ text: '好的', durationMs: 420 });
+  assert.deepEqual(composer.push({ text: '我们下午再讨论。', pauseMs: 1800 }).map(e => e.append), ['好的。']);
+  composer.flush();
+  assert.equal(composer.committed(), '好的。我们下午再讨论。');
+});
+
+test('speech segmenter: 保留定稿模型提供的句中标点与引号内句尾', () => {
+  assert.equal(composeTranscript([{ text: '他说：“走吧。”' }]), '他说：“走吧。”');
+  assert.equal(composeTranscript([{ text: '第一，' }, { text: '请确认时间。', pauseMs: 200 }]), '第一，请确认时间。');
+  assert.equal(joinClauses('待确认。', ''), '待确认。');
+});

@@ -1,5 +1,5 @@
 'use strict';
-// 本地语音识别：SenseVoiceSmall + Silero VAD。
+// 本地语音识别：SenseVoice 预览、Silero 检测停顿、Qwen3-ASR 0.6B 定稿。
 // 模型首次使用时下载；如果机器上已有 DeepSeek Harness 的模型缓存，直接复用。
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
@@ -20,6 +20,12 @@ const DOWNLOAD_TIMEOUT_MS = 30 * 60 * 1000;
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const SUPPORTED_LANGUAGES = new Set(['auto', 'zh', 'en', 'yue', 'ja', 'ko']);
 
+const QWEN_ROOT = path.join(APP_DIR, 'voice-models', 'qwen3-asr-0.6b-int8');
+const QWEN_URL = 'https://huggingface.co/csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/68818b2313fe77bd06f6a7c5068ff3ef59d02b8a';
+function qwenFile(name, bytes, sha256) {
+  return Object.freeze({ name, bytes, sha256, url: `${QWEN_URL}/${name}` });
+}
+
 const MODEL_FILES = Object.freeze({
   model: Object.freeze({
     name: 'model.int8.onnx',
@@ -39,6 +45,12 @@ const MODEL_FILES = Object.freeze({
     sha256: 'a35ebf52fd3ce5f1469b2a36158dba761bc47b973ea3382b3186ca15b1f5af28',
     url: 'https://huggingface.co/csukuangfj/vad/resolve/fba88cd2e921609e7675c3aaf51e0b9b295da4bc/silero_vad.onnx',
   }),
+  convFrontend: qwenFile('conv_frontend.onnx', 44148281, 'd22dc4423e0940e49884e903d2ea2f7e5567c14fc1aed97e4e26d6b8f208ef9e'),
+  encoder: qwenFile('encoder.int8.onnx', 182491662, '60748d3e6744a57c9c91e1b17424a6c2990567e8adceb0783940c03ed98fa9d9'),
+  decoder: qwenFile('decoder.int8.onnx', 755914231, '4f6885be5959ae26af3089d38ee7972c5fafbeeb1cf8d5e76eab6d8b61ca5771'),
+  merges: qwenFile('tokenizer/merges.txt', 1671853, '8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5'),
+  vocab: qwenFile('tokenizer/vocab.json', 2776833, 'ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910'),
+  tokenizerConfig: qwenFile('tokenizer/tokenizer_config.json', 12487, '4942d005604266809309cabc9f4e9cb89ce855d59b14681fdc0e1cc62ea26c4c'),
 });
 
 function unpacked(file) {
@@ -54,11 +66,11 @@ function normalizeLanguage(value) {
 }
 
 function managedPaths() {
-  return {
-    model: path.join(MANAGED_ROOT, MODEL_FILES.model.name),
-    tokens: path.join(MANAGED_ROOT, MODEL_FILES.tokens.name),
-    vad: path.join(MANAGED_ROOT, MODEL_FILES.vad.name),
-  };
+  const files = {};
+  for (const [key, spec] of Object.entries(MODEL_FILES)) {
+    files[key] = path.join(['model', 'tokens', 'vad'].includes(key) ? MANAGED_ROOT : QWEN_ROOT, spec.name);
+  }
+  return files;
 }
 
 function dshPaths() {
@@ -81,19 +93,21 @@ function fileMatches(file, expected) {
 /** 查找可用的模型：优先 gpt++ 自己的缓存，其次复用 DeepSeek Harness 的缓存。 */
 function resolveSpeechModel(options = {}) {
   const verifySize = options.verifySize !== false;
-  const candidates = [
-    { source: 'gpt++', root: MANAGED_ROOT, files: managedPaths() },
-    { source: 'DeepSeek Harness', root: DSH_ROOT, files: dshPaths() },
-  ];
-  for (const candidate of candidates) {
-    const keys = Object.keys(candidate.files);
-    const missing = keys.filter((key) => {
-      const file = candidate.files[key];
-      return verifySize ? !fileMatches(file, MODEL_FILES[key]) : !fs.existsSync(file);
-    });
-    if (!missing.length) return { ready: true, source: candidate.source, root: candidate.root, files: candidate.files };
+  const files = managedPaths();
+  const shared = dshPaths();
+  let source = 'gpt++';
+  const missing = [];
+  for (const [key, spec] of Object.entries(MODEL_FILES)) {
+    const available = file => verifySize ? fileMatches(file, spec) : fs.existsSync(file);
+    if (available(files[key])) continue;
+    if (shared[key] && available(shared[key])) {
+      files[key] = shared[key];
+      source = 'DeepSeek Harness';
+    } else {
+      missing.push(key);
+    }
   }
-  return { ready: false, source: 'gpt++', root: MANAGED_ROOT, files: managedPaths(), missing: Object.keys(MODEL_FILES) };
+  return { ready: !missing.length, source, root: MANAGED_ROOT, files, missing };
 }
 
 function localSpeechStatus() {
@@ -184,17 +198,12 @@ let preparePromise = null;
 async function runPreparation() {
   let resolved = resolveSpeechModel();
   if (!resolved.ready) {
-    const files = managedPaths();
-    const totalBytes = Object.values(MODEL_FILES).reduce((sum, file) => sum + file.bytes, 0);
+    const files = resolved.files;
+    const totalBytes = resolved.missing.reduce((sum, key) => sum + MODEL_FILES[key].bytes, 0);
     let completedBytes = 0;
-    for (const key of Object.keys(MODEL_FILES)) {
+    for (const key of resolved.missing) {
       const spec = MODEL_FILES[key];
       const destination = files[key];
-      if (fileMatches(destination, spec)) {
-        completedBytes += spec.bytes;
-        continue;
-      }
-      await fsp.rm(destination, { force: true }).catch(() => {});
       publishProgress({ phase: 'download', percent: Math.floor((completedBytes / totalBytes) * 100), file: spec.name, received: 0, total: spec.bytes });
       await downloadFile(spec, destination, (update) => {
         const percent = Math.min(99, Math.floor(((completedBytes + update.received) / totalBytes) * 100));
@@ -299,6 +308,12 @@ function ensureWorker() {
     model: resolved.files.model,
     tokens: resolved.files.tokens,
     vad: resolved.files.vad,
+    qwen: {
+      convFrontend: resolved.files.convFrontend,
+      encoder: resolved.files.encoder,
+      decoder: resolved.files.decoder,
+      tokenizer: path.dirname(resolved.files.tokenizerConfig),
+    },
     threads: Math.max(1, Math.min(4, os.cpus().length)),
   });
   const state = { child: null, ready: false, starting: null, pending: null, stream: null, stderr: '', idleTimer: 0 };
@@ -354,7 +369,7 @@ function ensureWorker() {
         else pending.reject(new Error(message.error || '本地识别失败'));
         return;
       }
-      if (message.type === 'stream-open' || message.type === 'partial' || message.type === 'segment'
+      if (message.type === 'stream-open' || message.type === 'partial' || message.type === 'segment' || message.type === 'boundary'
         || message.type === 'stream-done' || message.type === 'stream-error' || message.type === 'ack' || message.type === 'stream-closed') {
         const session = state.stream;
         if (!session || String(message.id || '') !== session.id) return;
@@ -369,6 +384,10 @@ function ensureWorker() {
         }
         if (message.type === 'partial') {
           if (message.text) emitStream(state, { kind: 'partial', text: message.text });
+          return;
+        }
+        if (message.type === 'boundary') {
+          emitStream(state, { kind: 'boundary' });
           return;
         }
         if (message.type === 'segment') {

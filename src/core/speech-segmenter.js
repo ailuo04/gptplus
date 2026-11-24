@@ -62,7 +62,7 @@ function asciiToFullWidth(punct) {
 }
 
 function endsWithTerminal(value) {
-  const text = String(value || '').trim();
+  const text = String(value || '').trim().replace(/[”’」』）)\]\"']+$/, '');
   return !!text && TERMINAL_PUNCT.has(text.slice(-1));
 }
 
@@ -96,7 +96,8 @@ function pickPunctuation({ text, pauseMs = 0, final = false } = {}) {
 function applyPunctuation(value, punct) {
   let text = normalizeTranscript(value);
   if (!text) return '';
-  text = text.replace(/[，,、：:；;]+$/, '');
+  if (endsWithTerminal(text) || (!punct && SOFT_PUNCT.has(text.slice(-1)))) return text;
+  text = text.replace(/[，,、：:]+$/, '');
   if (!text) return '';
   if (endsWithTerminal(text)) return text;
   return text + (punct || '');
@@ -122,7 +123,7 @@ function joinClauses(prev, next) {
   const left = String(prev || '');
   const right = String(next || '');
   if (!left) return right;
-  if (!right) return right;
+  if (!right) return left;
   return needsSpace(left, right) ? left + ' ' + right : left + right;
 }
 
@@ -222,7 +223,7 @@ function createSegmentComposer({ language = '', onEmit = null } = {}) {
         pending = current;
         return [];
       }
-      if (isFragment(pending)) {
+      if (isFragment(pending) && current.pauseMs < CLAUSE_PAUSE_MS && !endsWithTerminal(pending.text)) {
         carry = joinClauses(carry, pending.text);
         pending = current;
         return [];

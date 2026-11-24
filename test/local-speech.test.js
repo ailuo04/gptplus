@@ -32,3 +32,13 @@ test('local speech: 状态包含可用性和模型来源', () => {
   assert.equal(typeof resolved.ready, 'boolean');
   if (resolved.ready) assert.ok(resolved.source === 'gpt++' || resolved.source === 'DeepSeek Harness');
 });
+
+test('local speech: 双模型缓存须包含固定版本的 Qwen 声学、解码器和词表文件', () => {
+  const required = ['convFrontend', 'encoder', 'decoder', 'vocab', 'merges', 'tokenizerConfig'];
+  const status = resolveSpeechModel();
+  for (const key of required) {
+    assert.match(MODEL_FILES[key]?.url || '', /qwen3-asr-0\.6B-int8[^/]*\/resolve\/[0-9a-f]{40}\//i);
+    assert.match(MODEL_FILES[key].sha256, /^[0-9a-f]{64}$/);
+    assert.equal(typeof status.files[key], 'string');
+  }
+});

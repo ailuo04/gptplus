@@ -59,10 +59,9 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
   var ID = 'gptplus-voice-input';
   var WRAP_ID = 'gptplus-voice-input-wrap';
   var PANEL_ID = 'gptplus-voice-panel';
-  var CAPTION_ID = 'gptplus-voice-caption';
   var STYLE_ID = 'gptplus-voice-input-style';
   var EXT_ATTR = 'data-gptplus-voice-input';
-  var RUNTIME_KEY = 'gptplus-voice-input-v17';
+  var RUNTIME_KEY = 'gptplus-voice-input-v19';
   var MAX_RECORD_MS = 120000;
   var MAX_STREAM_MS = 600000;
   var PCM_CHUNK = 2048;
@@ -78,12 +77,8 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     button: null,
     panel: null,
     message: null,
-    timerLabel: null,
     actionButton: null,
     waveform: null,
-    caption: null,
-    captionText: null,
-    captionTail: null,
     status: 'idle',
     recorder: null,
     stream: null,
@@ -214,19 +209,18 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
   function buildWaveform() {
     var svg = document.createElementNS(NS, 'svg');
     svg.id = 'gptplus-voice-wave';
-    svg.setAttribute('viewBox', '0 0 512 32');
+    svg.setAttribute('viewBox', '0 0 32 32');
     svg.setAttribute('preserveAspectRatio', 'none');
     svg.setAttribute('aria-hidden', 'true');
-    for (var i = 0; i < 64; i += 1) {
+    for (var i = 0; i < 5; i += 1) {
       var line = document.createElementNS(NS, 'line');
-      line.setAttribute('x1', String(i * 8 + 4));
-      line.setAttribute('x2', String(i * 8 + 4));
+      line.setAttribute('x1', String(i * 6 + 4));
+      line.setAttribute('x2', String(i * 6 + 4));
       line.setAttribute('y1', '15');
       line.setAttribute('y2', '17');
       line.setAttribute('stroke', 'currentColor');
-      line.setAttribute('stroke-width', '2.5');
       line.setAttribute('stroke-linecap', 'round');
-      line.setAttribute('opacity', String(0.25 + i / 120));
+      line.setAttribute('stroke-width', '3.5');
       svg.appendChild(line);
     }
     return svg;
@@ -311,7 +305,6 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     var elapsed = Math.max(0, Math.floor((Date.now() - state.startedAt) / 1000));
     var minutes = Math.floor(elapsed / 60);
     var seconds = String(elapsed % 60).padStart(2, '0');
-    if (state.timerLabel) state.timerLabel.textContent = minutes + ':' + seconds;
     if (state.button) {
       state.button.title = text().recording + ' ' + minutes + ':' + seconds;
       state.button.setAttribute('aria-label', text().recording);
@@ -333,13 +326,17 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
   function render() {
     if (!state.wrap || !state.panel) return;
     var labels = text();
-    var active = state.status !== 'idle';
+    var recording = state.status === 'recording';
+    var finishingInline = state.status === 'transcribing' && state.recordMode === 'stream';
+    var active = state.status !== 'idle' && !recording && !finishingInline;
+    state.wrap.dataset.recording = String(recording);
     state.wrap.dataset.active = active ? 'true' : 'false';
     state.panel.dataset.phase = state.status;
     if (state.button) {
-      state.button.replaceChildren(svgIcon('mic'));
-      state.button.title = labels.idle;
-      state.button.setAttribute('aria-label', labels.idle);
+      state.button.replaceChildren(recording ? state.waveform : svgIcon('mic'));
+      state.button.title = finishingInline ? labels.finishing : labels.idle;
+      state.button.setAttribute('aria-label', state.button.title);
+      state.button.setAttribute('aria-busy', String(finishingInline));
     }
     if (state.message) {
       var message = messageForStatus();
@@ -347,16 +344,8 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
       state.message.title = message;
       state.message.style.display = state.status === 'recording' ? 'none' : 'flex';
     }
-    var wave = state.panel.querySelector('#gptplus-voice-wave');
-    if (wave) wave.style.display = state.status === 'recording' ? 'block' : 'none';
-    if (state.timerLabel) state.timerLabel.style.display = state.status === 'recording' ? 'inline-block' : 'none';
     if (state.actionButton) {
-      if (state.status === 'recording') {
-        state.actionButton.style.display = 'inline-flex';
-        state.actionButton.replaceChildren(svgIcon('stop'));
-        state.actionButton.title = labels.recording;
-        state.actionButton.setAttribute('aria-label', labels.recording);
-      } else if (state.status === 'error' || state.status === 'feedback') {
+      if (state.status === 'error' || state.status === 'feedback') {
         state.actionButton.style.display = 'inline-flex';
         state.actionButton.replaceChildren(svgIcon('mic'));
         state.actionButton.title = labels.retry;
@@ -366,7 +355,6 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
       }
     }
     if (state.status === 'recording') updateRecordingLabel();
-    renderCaption();
   }
 
   function setStatus(next) {
@@ -551,107 +539,87 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     try { feedPcm(event.inputBuffer.getChannelData(0)); } catch (e) {}
   }
 
-  function renderCaption() {
-    if (!state.caption) return;
-    var session = state.session;
-    var stable = session ? session.captionStable || '' : '';
-    var tail = session ? session.captionTail || '' : '';
-    var show = !!(stable || tail) && (state.status === 'recording' || state.status === 'transcribing');
-    if (state.wrap) state.wrap.dataset.caption = show ? 'true' : 'false';
-    state.captionText.textContent = show ? stable : '';
-    state.captionTail.textContent = show ? tail : '';
-    if (show) state.caption.scrollTop = state.caption.scrollHeight;
+  // 定位到开始口述的段落。编辑器可在输入事件后合并或替换文本节点，不能长期保存文本节点引用。
+  function startDictationRange(editor) {
+    if (editor.tagName === 'TEXTAREA') {
+      var offset = state.savedSelection ? state.savedSelection.end : editor.selectionEnd;
+      return { editor: editor, offset: offset, prefix: editor.value.slice(0, offset) };
+    }
+    var caret = state.savedRange && editor.contains(state.savedRange.endContainer) ? state.savedRange.cloneRange() : document.createRange();
+    if (!editor.contains(caret.endContainer)) caret.selectNodeContents(editor);
+    caret.collapse(false);
+    var element = caret.endContainer.nodeType === 1 ? caret.endContainer : caret.endContainer.parentElement;
+    var block = element.closest('p,li,pre,div') || editor;
+    if (!editor.contains(block)) block = editor;
+    var before = caret.cloneRange();
+    before.selectNodeContents(block);
+    before.setEnd(caret.endContainer, caret.endOffset);
+    var prefix = before.toString();
+    return { editor: editor, block: block, offset: prefix.length, prefix: prefix, caret: caret };
   }
 
-  function clearCaption() {
-    if (state.wrap) state.wrap.dataset.caption = 'false';
-    if (state.captionText) state.captionText.textContent = '';
-    if (state.captionTail) state.captionTail.textContent = '';
+  function textPoint(block, offset) {
+    var walker = document.createTreeWalker(block, 4); // NodeFilter.SHOW_TEXT
+    for (var node = walker.nextNode(); node; node = walker.nextNode()) {
+      if (offset <= node.length) return { node: node, offset: offset };
+      offset -= node.length;
+    }
+    return null;
   }
 
-  /** 边录边写：只在稳定分句后追加，永不回改已写入的文字。 */
-  function appendStreamText(value) {
-    var session = state.session;
-    if (!session || !value) return true;
+  // 只选中本会话持有的区间。用户已改写该区间时停止覆盖。
+  function replaceDictation(session, committed, previous, value) {
+    if (previous === value) return true;
     var editor = editorNode();
     if (!editor) return false;
-    if (document.activeElement !== editor) {
-      focusEditor();
-      session.focused = true;
-    }
+    var anchor = session.anchor || (session.anchor = startDictationRange(editor));
+    if (anchor.editor !== editor || (anchor.block && !editor.contains(anchor.block))) return false;
+    var text = anchor.block ? anchor.block.textContent : editor.value;
+    var start = anchor.offset + committed.length;
+    var end = start + previous.length;
+    if (text.slice(0, end) !== anchor.prefix + committed + previous) return false;
     if (editor.tagName === 'TEXTAREA') {
-      var start = editor.selectionStart == null ? editor.value.length : editor.selectionStart;
-      var end = editor.selectionEnd == null ? start : editor.selectionEnd;
-      if (!session.anchor) session.anchor = { kind: 'textarea', start: start };
-      editor.setRangeText(value, start, end, 'end');
+      var follow = editor.selectionStart === editor.selectionEnd && editor.selectionEnd === end;
+      editor.setRangeText(value, start, end, follow ? 'end' : 'preserve');
       editor.dispatchEvent(new Event('input', { bubbles: true }));
-      session.insertedText += value;
-      state.savedSelection = { start: editor.selectionStart, end: editor.selectionEnd };
-      state.savedRange = null;
       return true;
     }
+    var range = anchor.caret.cloneRange();
+    var left = textPoint(anchor.block, start);
+    var right = textPoint(anchor.block, end);
+    if (left && right) {
+      range.setStart(left.node, left.offset);
+      range.setEnd(right.node, right.offset);
+    } else if (text.length || !editor.contains(range.startContainer)) return false;
     var selection = window.getSelection();
-    if (!selection || !selection.rangeCount) return false;
-    if (!session.anchor) session.anchor = { kind: 'range', range: selection.getRangeAt(0).cloneRange() };
-    var ok = false;
-    try { ok = document.execCommand('insertText', false, value); } catch (e) { ok = false; }
+    if (!selection) return false;
+    var old = selection.rangeCount ? selection.getRangeAt(0).cloneRange() : null;
+    var followCaret = !old || (old.collapsed && old.compareBoundaryPoints(Range.END_TO_END, range) === 0);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    // 通过原生编辑命令通知 ProseMirror，预览直接继承输入框字体和颜色。
+    var ok = document.execCommand(value ? 'insertText' : 'delete', false, value);
     if (!ok) {
-      try {
-        var range = selection.getRangeAt(0);
-        range.deleteContents();
+      range.deleteContents();
+      if (value) {
         var node = document.createTextNode(value);
         range.insertNode(node);
         range.setStartAfter(node);
-        range.collapse(true);
-        selection.removeAllRanges();
-        selection.addRange(range);
-        editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
-      } catch (e) {
-        return false;
       }
+      range.collapse(true);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: value ? 'insertText' : 'deleteContentBackward', data: value }));
     }
-    session.insertedText += value;
-    if (selection.rangeCount) state.savedRange = selection.getRangeAt(0).cloneRange();
+    if (!followCaret && old && editor.contains(old.startContainer)) {
+      selection.removeAllRanges();
+      selection.addRange(old);
+    }
     return true;
   }
 
-  /** 取消时只回滚本会话写入的内容，绝不动用户原有文字。 */
   function rollbackSession(session) {
-    if (!session || !session.insertedText) return true;
-    var editor = editorNode();
-    if (!editor) return false;
-    var anchor = session.anchor;
-    if (editor.tagName === 'TEXTAREA') {
-      if (!anchor || anchor.kind !== 'textarea') return false;
-      var start = Math.max(0, Math.min(editor.value.length, anchor.start));
-      var end = start + session.insertedText.length;
-      if (editor.value.slice(start, end) !== session.insertedText) return false;
-      editor.setRangeText('', start, end, 'end');
-      editor.dispatchEvent(new Event('input', { bubbles: true }));
-      state.savedSelection = { start: start, end: start };
-      return true;
-    }
-    if (!anchor || anchor.kind !== 'range' || !anchor.range) return false;
-    if (!editor.contains(anchor.range.startContainer)) return false;
-    var selection = window.getSelection();
-    if (!selection || !selection.rangeCount) return false;
-    var caret = selection.getRangeAt(0);
-    if (!editor.contains(caret.endContainer)) return false;
-    var range = document.createRange();
-    range.setStart(anchor.range.startContainer, anchor.range.startOffset);
-    range.setEnd(caret.endContainer, caret.endOffset);
-    var content = String(range.toString()).replace(/\s+/g, '');
-    var expected = session.insertedText.replace(/\s+/g, '');
-    if (!content || content.slice(-Math.min(24, expected.length)) !== expected.slice(-Math.min(24, expected.length))) return false;
-    selection.removeAllRanges();
-    selection.addRange(range);
-    var ok = false;
-    try { ok = document.execCommand('delete'); } catch (e) { ok = false; }
-    if (ok) {
-      state.savedRange = null;
-      state.savedSelection = null;
-    }
-    return ok;
+    return replaceDictation(session, '', session.insertedText + session.preview, '');
   }
 
   function teardownStreamCapture() {
@@ -697,7 +665,6 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     state.session = null;
     state.streamId = '';
     state.recordMode = '';
-    clearCaption();
     setStatus('idle');
   }
 
@@ -738,8 +705,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
       focused: false,
       anchor: null,
       insertedText: '',
-      captionStable: '',
-      captionTail: '',
+      preview: '',
       loopback: true,
     };
     state.recordMode = 'stream';
@@ -805,8 +771,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
         focused: false,
         anchor: null,
         insertedText: '',
-        captionStable: '',
-        captionTail: '',
+        preview: '',
       };
       state.recordMode = 'stream';
       state.startedAt = Date.now();
@@ -985,7 +950,8 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
           var carried = bar.level;
           bar.level = next;
           next = carried;
-          var height = 1 + Math.min(1, bar.level * 6) * 14;
+          var peak = 14 - Math.abs(j - 2) * 4;
+          var height = 1 + Math.min(1, bar.level * 6) * peak;
           bar.element.setAttribute('y1', String(16 - height));
           bar.element.setAttribute('y2', String(16 + height));
         }
@@ -1147,7 +1113,6 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
       state.session = null;
       state.streamId = '';
       state.recordMode = '';
-      clearCaption();
     }
     if (state.recorder) {
       try { state.recorder.stop(); } catch (e) {}
@@ -1588,14 +1553,10 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     var body = document.createElement('span');
     body.className = 'gptplus-voice-body';
     var waveform = buildWaveform();
-    body.appendChild(waveform);
     var message = document.createElement('span');
     message.className = 'gptplus-voice-message';
     message.setAttribute('role', 'status');
     body.appendChild(message);
-    var timerLabel = document.createElement('span');
-    timerLabel.className = 'gptplus-voice-timer';
-    body.appendChild(timerLabel);
     panel.appendChild(body);
 
     var action = document.createElement('button');
@@ -1616,30 +1577,12 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     panel.appendChild(action);
     wrap.appendChild(panel);
 
-    var caption = document.createElement('span');
-    caption.id = CAPTION_ID;
-    caption.setAttribute(EXT_ATTR, 'true');
-    caption.setAttribute('role', 'status');
-    caption.setAttribute('aria-live', 'polite');
-    var captionText = document.createElement('span');
-    captionText.className = 'gptplus-voice-caption-stable';
-    var captionTail = document.createElement('span');
-    captionTail.className = 'gptplus-voice-caption-tail';
-    caption.appendChild(captionText);
-    caption.appendChild(captionTail);
-    wrap.appendChild(caption);
-    wrap.dataset.caption = 'false';
-
     state.wrap = wrap;
     state.button = button;
     state.panel = panel;
     state.message = message;
-    state.timerLabel = timerLabel;
     state.actionButton = action;
     state.waveform = waveform;
-    state.caption = caption;
-    state.captionText = captionText;
-    state.captionTail = captionTail;
     render();
     return wrap;
   }
@@ -1709,12 +1652,8 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
         + '.gptplus-voice-round:focus-visible{outline:2px solid color-mix(in srgb,var(--color-token-text-primary,#dfdfdf) 45%,transparent);outline-offset:1px}'
         + '.gptplus-voice-round svg{width:14px;height:14px;display:block}'
         + '.gptplus-voice-body{display:flex;align-items:center;gap:8px;flex:1;min-width:0;overflow:hidden}'
-        + '#gptplus-voice-wave{display:none;flex:1;min-width:36px;height:24px;color:color-mix(in srgb,var(--color-token-text-primary,#1a1c1f) 70%,transparent)}'
+        + '#gptplus-voice-input-wrap[data-recording="true"] #gptplus-voice-input{color:var(--color-token-text-primary,currentColor);background:color-mix(in srgb,currentColor 8%,transparent)}'
         + '.gptplus-voice-message{display:none;align-items:center;flex:1;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:12px;line-height:1.2;color:color-mix(in srgb,var(--color-token-text-primary,#1a1c1f) 68%,transparent)}'
-        + '#gptplus-voice-caption{display:none;position:absolute;right:0;bottom:calc(100% + 60px);box-sizing:border-box;width:min(460px,52vw);max-height:min(200px,32vh);overflow:auto;padding:8px 10px;border:1px solid color-mix(in srgb,var(--color-token-text-primary,#1a1c1f) 14%,transparent);border-radius:12px;background:var(--color-token-main-surface-primary,#fff);color:var(--color-token-text-primary,#1a1c1f);font:13px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif;box-shadow:0 12px 32px rgba(0,0,0,.14),0 2px 6px rgba(0,0,0,.06);pointer-events:none;white-space:pre-wrap;word-break:break-word;scrollbar-width:thin}'
-        + '#gptplus-voice-input-wrap[data-caption="true"] #gptplus-voice-caption{display:block;animation:gptplus-voice-pop .14s ease-out}'
-        + '.gptplus-voice-caption-tail{opacity:.6}'
-        + '.gptplus-voice-timer{display:none;flex:0 0 auto;font-size:11px;font-variant-numeric:tabular-nums;color:color-mix(in srgb,var(--color-token-text-primary,#1a1c1f) 55%,transparent)}'
         + '#gptplus-voice-panel[data-phase="error"] .gptplus-voice-message{color:#ef4444}'
         + '#gptplus-voice-panel[data-phase="feedback"] .gptplus-voice-message{color:color-mix(in srgb,var(--color-token-text-primary,#1a1c1f) 55%,transparent)}'
         + '.gptplus-voice-spin{animation:gptplus-voice-spin .85s linear infinite;transform-origin:center}'
@@ -1727,12 +1666,8 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
     state.button = null;
     state.panel = null;
     state.message = null;
-    state.timerLabel = null;
     state.actionButton = null;
     state.waveform = null;
-    state.caption = null;
-    state.captionText = null;
-    state.captionTail = null;
     state.observer = new MutationObserver(function (records) {
       var relevant = false;
       for (var i = 0; i < records.length; i += 1) {
@@ -1890,17 +1825,22 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
         var session = state.session;
         if (state.disposed || !session || String(id) !== session.id) return false;
         if (value == null || value === '') return true;
-        var inserted = appendStreamText(String(value));
+        var inserted = replaceDictation(session, session.insertedText, session.preview, String(value));
+        if (inserted) {
+          session.insertedText += String(value);
+          session.preview = '';
+        }
         if (!inserted) session.insertFailed = true;
         return inserted;
       },
-      /** 实时字幕：稳定部分与未定稿部分分开着色。 */
+      /** 预览只替换光标处当前尚未定稿的片段。 */
       streamCaption: function (id, stable, tail) {
         var session = state.session;
         if (state.disposed || !session || String(id) !== session.id) return false;
-        session.captionStable = String(stable == null ? '' : stable);
-        session.captionTail = String(tail == null ? '' : tail);
-        renderCaption();
+        var next = String(tail || '');
+        if (String(stable || '') !== session.insertedText) return false;
+        if (!replaceDictation(session, session.insertedText, session.preview, next)) return false;
+        session.preview = next;
         return true;
       },
       /** 回环采集就绪：从「连接系统音频」进入录音态。 */
@@ -1925,14 +1865,15 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
         if (!session || String(id) !== session.id) return false;
         clearTimeout(state.loopbackWait);
         state.loopbackWait = 0;
+        if (session.active) teardownStreamCapture();
         state.session = null;
         state.streamId = '';
         state.recordMode = '';
         state.outbox = [];
-        clearCaption();
         if (result && result.ok === true) {
-          if (!session.insertedText) {
-            if (session.insertFailed || session.captionStable) {
+          if (session.preview) replaceDictation(session, session.insertedText, session.preview, '');
+          if (!session.insertedText || session.insertFailed) {
+            if (session.insertFailed) {
               fail(isZh() ? '转写结果插入失败' : 'Could not insert transcript');
             } else {
               emptyResult();
@@ -1992,6 +1933,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
         try { state.mute.disconnect(); } catch (e) {}
         state.mute = null;
       }
+      if (state.session && state.session.preview) replaceDictation(state.session, state.session.insertedText, state.session.preview, '');
       state.session = null;
       state.outbox = [];
       stopStream(state.stream);
@@ -2396,9 +2338,10 @@ function startVoiceInputBridge({ cdpPort, ctx, log, visibleIntervalMs = VOICE_PO
       updateCaption(session, '');
       return;
     }
-    if (event.kind === 'done') {
+    if (event.kind === 'done' || event.kind === 'boundary') {
       session.composer.flush().forEach(function (item) { pushOp('streamAppend', session.id, [item.append]); });
-      finishLive(session, { ok: true });
+      if (event.kind === 'boundary') updateCaption(session, '');
+      else finishLive(session, { ok: true });
       return;
     }
     if (event.kind === 'error') {

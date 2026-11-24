@@ -1,5 +1,5 @@
 'use strict';
-// 用真实 SenseVoice 模型验证实时转写：按 128 ms 分块推送 WAV，打印预览、分句、标点与到达延迟。
+// 用真实 SenseVoice 与 Qwen3-ASR 模型验证实时转写：按 128 ms 分块推送 WAV，打印预览、分句、标点与到达延迟。
 // 用法: node tools/verify-voice-stream.cjs <16kHz 单声道 PCM16 WAV> [--language zh] [--realtime]
 // 说明：--realtime 按录音速度推送，可看到逐字预览；默认尽快推送，只验证分句与标点。
 const fs = require('node:fs');

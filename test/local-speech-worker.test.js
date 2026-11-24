@@ -180,3 +180,30 @@ test('local speech worker: 结束会话会把未收尾的语音补成最后一�
   assert.equal(segments.length, 1);
   assert.equal(result.text, '最后一句。');
 });
+
+test('local speech worker: SenseVoice 只预览，Qwen 在停顿/松键时各定稿一次', () => {
+  const ranges = [{ start: 0, end: 16000 }, { start: 48000, end: 64000 }];
+  const events = [];
+  let clock = 0, finals = 0;
+  const session = createStreamSession({
+    vad: new ScriptedVad(ranges), now: () => (clock += 300),
+    decodePreview: () => '预览的错字', decode: () => ['好的', '我们下午再讨论。'][finals++],
+    onPartial: e => events.push(e.text), onSegment: e => events.push(e.text),
+    onBoundary: () => events.push('长停顿'),
+  });
+  feed(session, 4, { ranges });
+  assert.equal(session.end().text, '好的。我们下午再讨论。');
+  assert.equal(finals, 2);
+  assert.ok(events.indexOf('预览的错字') < events.indexOf('好的') && events.includes('预览的错字'));
+  assert.equal(events.filter(e => e === '长停顿').length, 1);
+  assert.ok(events.indexOf('长停顿') < events.indexOf('我们下午再讨论。'));
+});
+
+test('local speech worker: 定稿解码失败不能当作成功的空文本', () => {
+  const session = createStreamSession({
+    vad: new ScriptedVad([{ start: 0, end: 12000 }]), settings: { partial: false },
+    decode: () => { throw new Error('定稿失败'); },
+  });
+  feed(session, 0.75);
+  assert.throws(() => session.end(), /定稿失败/);
+});

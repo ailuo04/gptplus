@@ -1,24 +1,24 @@
 'use strict';
-// 本地识别工作进程：加载 SenseVoiceSmall 与 Silero VAD。
+// 本地识别工作进程：用 SenseVoice 预览、Silero VAD 找停顿、Qwen3-ASR 定稿。
 // 既支持整段 WAV 批量识别，也支持边收音频边出字的流式会话（VAD 边界 + 周期性预解码）。
 const fs = require('node:fs');
-const { composeTranscript, normalizeTranscript } = require('./speech-segmenter.js');
+const { composeTranscript, normalizeTranscript, PERIOD_PAUSE_MS } = require('./speech-segmenter.js');
 
 const SAMPLE_RATE = 16000;
 const VAD_WINDOW = 512;
 
 const STREAM_DEFAULTS = Object.freeze({
-  bufferSeconds: 12,
+  bufferSeconds: 18,
   partial: true,
   prerollMs: 180,
   headPadMs: 120,
   tailPadMs: 150,
   minSpeechMs: 240,
-  maxSegmentMs: 4000,
+  maxSegmentMs: 12000,
   minPartialSpeechMs: 500,
   partialBaseIntervalMs: 200,
   partialMaxIntervalMs: 900,
-  partialWindowMs: 5000,
+  partialWindowMs: 12000,
   quietCutWindowMs: 900,
 });
 
@@ -166,7 +166,9 @@ function findQuietCut(samples, { frame = 320, keepTail = 640 } = {}) {
   return bestIndex;
 }
 
-let recognizer = null;
+const QWEN_LANGUAGES = { zh: 'Chinese', en: 'English', yue: 'Cantonese', ja: 'Japanese', ko: 'Korean' };
+let previewRecognizer = null;
+let finalRecognizer = null;
 let detector = null;
 let nativeConfig = null;
 let config = null;
@@ -191,7 +193,11 @@ function createTranscriber(payload) {
       debug: 0,
     },
   };
-  recognizer = new sherpa.OfflineRecognizer(nativeConfig);
+  previewRecognizer = new sherpa.OfflineRecognizer(nativeConfig);
+  finalRecognizer = new sherpa.OfflineRecognizer({
+    featConfig: nativeConfig.featConfig,
+    modelConfig: { qwen3Asr: payload.qwen, tokens: '', provider: 'cpu', numThreads: config.threads, debug: 0 },
+  });
   detector = new sherpa.Vad({
     sileroVad: {
       model: payload.vad,
@@ -208,13 +214,18 @@ function createTranscriber(payload) {
   }, config.segmentSeconds + config.minSilenceSeconds + 1);
 }
 
-function recognizeSegments(samples, language) {
+function setPreviewLanguage(language) {
   nativeConfig.modelConfig.senseVoice.language = language || 'auto';
-  recognizer.setConfig(nativeConfig);
+  previewRecognizer.setConfig(nativeConfig);
+}
+
+function recognizeAudio(recognizer, samples, language) {
   const stream = recognizer.createStream();
+  if (language) stream.setOption('language', language);
   stream.acceptWaveform({ sampleRate: SAMPLE_RATE, samples });
   recognizer.decode(stream);
-  return normalizeTranscript(String(recognizer.getResult(stream).text || ''));
+  const text = String(recognizer.getResult(stream).text || '');
+  return normalizeTranscript(text.replace(/^language\s+[^<\n]{1,80}<asr_text>\s*/i, ''));
 }
 
 /**
@@ -223,6 +234,8 @@ function recognizeSegments(samples, language) {
  * @param {{
  *   vad: { acceptWaveform(f: Float32Array): void, isEmpty(): boolean, isDetected(): boolean, front(b?: boolean): any, pop(): void, flush(): void, reset(): void },
  *   decode: (samples: Float32Array) => string,
+ *   decodePreview?: (samples: Float32Array) => string,
+ *   onBoundary?: () => void,
  *   language?: string,
  *   bufferSeconds?: number,
  *   onPartial?: (payload: { text: string }) => void,
@@ -235,6 +248,7 @@ function createStreamSession(options = {}) {
   const settings = { ...STREAM_DEFAULTS, ...(options.settings || {}) };
   const vad = options.vad;
   const decode = typeof options.decode === 'function' ? options.decode : () => '';
+  const decodePreview = options.decodePreview || decode;
   const now = typeof options.now === 'function' ? options.now : Date.now;
   const language = options.language || 'auto';
   const buffer = new SampleBuffer(Math.round(settings.bufferSeconds * SAMPLE_RATE));
@@ -251,6 +265,7 @@ function createStreamSession(options = {}) {
   let carry = new Float32Array(0);
   let decodedUntil = 0;
   let lastRawEnd = null;
+  let pendingBoundaryEnd = null;
   let finished = false;
   let ended = false;
   let lastPartialAt = 0;
@@ -260,11 +275,6 @@ function createStreamSession(options = {}) {
 
   function emit(payload) {
     try { options.onSegment?.(payload); } catch { /* 回调失败不能影响识别 */ }
-  }
-
-  function decodeText(samples) {
-    if (!samples.length) return '';
-    try { return normalizeTranscript(decode(samples)); } catch { return ''; }
   }
 
   function emitSegment(start, end, softCut) {
@@ -278,8 +288,9 @@ function createStreamSession(options = {}) {
     lastRawEnd = Math.max(lastRawEnd == null ? end : lastRawEnd, end);
     lastPartial = '';
     if (to - from < minSpeech) return;
-    const text = decodeText(buffer.read(from, to));
+    const text = normalizeTranscript(decode(buffer.read(from, to)));
     if (!text) return;
+    pendingBoundaryEnd = softCut ? null : end;
     const payload = {
       text,
       pauseMs,
@@ -320,7 +331,8 @@ function createStreamSession(options = {}) {
     lastPartialAt = stamp;
     const from = Math.max(buffer.start, speechStart - preroll, decodedUntil, buffer.end - partialWindow);
     const started = now();
-    const text = decodeText(buffer.read(from, buffer.end));
+    let text = '';
+    try { text = normalizeTranscript(decodePreview(buffer.read(from, buffer.end))); } catch { /* 预览失败仍可定稿 */ }
     const cost = Math.max(1, now() - started);
     partialInterval = Math.min(settings.partialMaxIntervalMs, Math.max(settings.partialBaseIntervalMs, Math.round(cost * 1.6)));
     if (!text || text === lastPartial) return;
@@ -347,7 +359,14 @@ function createStreamSession(options = {}) {
       offset += VAD_WINDOW;
       drainVad((start, end) => emitSegment(start, end, false));
       speaking = vad.isDetected();
-      if (speaking && !wasSpeaking) speechStart = Math.max(0, buffer.end - VAD_WINDOW);
+      if (speaking && !wasSpeaking) {
+        speechStart = Math.max(decodedUntil, buffer.start, buffer.end - preroll);
+        pendingBoundaryEnd = null;
+      }
+      if (!speaking && pendingBoundaryEnd !== null && buffer.end - pendingBoundaryEnd >= PERIOD_PAUSE_MS * SAMPLE_RATE / 1000) {
+        pendingBoundaryEnd = null;
+        options.onBoundary?.();
+      }
       if (speaking && buffer.end - speechStart >= maxSegment) softCut();
       maybePartial();
     }
@@ -403,12 +422,10 @@ function createStreamSession(options = {}) {
 function transcribeWave(buffer, language) {
   if (buffer.length > config.maxAudioBytes) throw new Error('录音过长，请缩短后重试');
   const samples = parseWave(buffer);
-  nativeConfig.modelConfig.senseVoice.language = language || 'auto';
-  recognizer.setConfig(nativeConfig);
   detector.reset();
   const session = createStreamSession({
     vad: detector,
-    decode: (input) => recognizeSegments(input, language),
+    decode: (input) => recognizeAudio(finalRecognizer, input, QWEN_LANGUAGES[language]),
     language: language || 'auto',
     settings: { bufferSeconds: Math.max(15, Math.ceil(samples.length / SAMPLE_RATE) + 2), partial: false },
   });
@@ -425,7 +442,7 @@ process.on('message', (message) => {
   if (message.type === 'transcribe') {
     const id = String(message.id || '');
     try {
-      if (!recognizer) throw new Error('识别器尚未初始化');
+      if (!finalRecognizer) throw new Error('识别器尚未初始化');
       const audio = Buffer.from(String(message.audio || ''), 'base64');
       const text = transcribeWave(audio, message.language);
       process.send?.({ type: 'result', id, text });
@@ -437,17 +454,19 @@ process.on('message', (message) => {
   if (message.type === 'stream-start') {
     const id = String(message.id || '');
     try {
-      if (!recognizer) throw new Error('识别器尚未初始化');
+      if (!finalRecognizer) throw new Error('识别器尚未初始化');
       streamSession?.cancel();
       detector.reset();
+      setPreviewLanguage(message.language);
       streamSession = createStreamSession({
         id,
         vad: detector,
-        decode: (input) => recognizeSegments(input, message.language),
+        decodePreview: (input) => recognizeAudio(previewRecognizer, input),
+        decode: (input) => recognizeAudio(finalRecognizer, input, QWEN_LANGUAGES[message.language]),
+        onBoundary: () => process.send?.({ type: 'boundary', id }),
         language: message.language || 'auto',
         onPartial: (payload) => process.send?.({ type: 'partial', id, text: payload.text }),
         onSegment: (payload) => process.send?.({ type: 'segment', id, ...payload }),
-        onDone: (payload) => process.send?.({ type: 'stream-done', id, text: payload.text }),
       });
       process.send?.({ type: 'stream-open', id });
     } catch (error) {

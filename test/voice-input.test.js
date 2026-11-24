@@ -14,7 +14,7 @@ test('voice input: 注入脚本包含内联录音条、波形与本地 WAV 编�
   assert.match(script, /gptplus-voice-input/);
   assert.match(script, /gptplus-voice-panel/);
   assert.match(script, /gptplus-voice-wave/);
-  assert.match(script, /gptplus-voice-caption/);
+  assert.doesNotMatch(script, /gptplus-voice-caption/);
   assert.match(script, /__gptplusVoice/);
   assert.match(script, /data-composer-surface-variant/);
   assert.match(script, /div\.ms-2\.flex\.items-center/);
@@ -52,7 +52,7 @@ test('voice input: 回环开关只随本地流式引擎注入，且运行时自�
   assert.match(script, /loopback-start/);
   assert.match(script, /loopbackReady/);
   assert.match(script, /streamLevel/);
-  assert.match(script, /gptplus-voice-input-v17/);
+  assert.match(script, /gptplus-voice-input-v19/);
   assert.doesNotThrow(() => new Function('return ' + script));
   const provider = buildVoiceInputScript({ engine: 'provider', streaming: true, loopback: true });
   assert.match(provider, /, 1000, false, false, \{\"code\":\"Alt\",\"ctrl\":false,\"shift\":false,\"alt\":false\}\)$/);
@@ -479,7 +479,10 @@ test('voice input: 本地引擎边录边把稳定分句写入输入框', async (
   assert.equal(runtime.hasTimer(3000), false, '麦克风按钮手动录音不受快捷键计时器影响');
 
   assert.equal(runtime.api.streamCaption(id, '', '今天我们'), true);
-  assert.equal(runtime.findById('gptplus-voice-caption').children[1].textContent, '今天我们');
+  assert.equal(runtime.editor.value, '用户原文今天我们');
+  assert.equal(runtime.findById('gptplus-voice-input').children[0].id, 'gptplus-voice-wave');
+  runtime.api.streamCaption(id, '', '今天天气');
+  assert.equal(runtime.editor.value, '用户原文今天天气');
 
   assert.equal(runtime.api.streamAppend(id, '今天天气不错。'), true);
   assert.equal(runtime.editor.value, '用户原文今天天气不错。');
@@ -488,7 +491,24 @@ test('voice input: 本地引擎边录边把稳定分句写入输入框', async (
 
   runtime.api.streamDone(id, { ok: true });
   assert.equal(runtime.api.context().status, 'idle');
-  assert.equal(runtime.findById('gptplus-voice-caption').children[0].textContent, '');
+  assert.notEqual(runtime.findById('gptplus-voice-input').children[0].id, 'gptplus-voice-wave');
+  runtime.dispose();
+});
+
+test('voice input: 在光标处替换临时假设，取消时保留前后原文', async () => {
+  const runtime = await createVoiceRuntime({ engine: 'local' });
+  runtime.editor.value = '前文后文';
+  runtime.editor.selectionStart = runtime.editor.selectionEnd = 2;
+  runtime.click(runtime.findById('gptplus-voice-input'));
+  await runtime.flush();
+  const id = runtime.api.context().sessionId;
+  runtime.api.streamCaption(id, '', '临时');
+  assert.equal(runtime.editor.value, '前文临时后文');
+  runtime.api.streamAppend(id, '第一句。');
+  runtime.api.streamCaption(id, '第一句。', '第二');
+  assert.equal(runtime.editor.value, '前文第一句。第二后文');
+  runtime.key('keydown', 'Escape');
+  assert.equal(runtime.editor.value, '前文后文');
   runtime.dispose();
 });
 
@@ -696,6 +716,34 @@ test('voice input: 桥接把回环采集接入流式会话并转发分句/收尾
     env.state.emit({ kind: 'done', text: '你好。世界' });
     await waitUntil(() => env.evaluations.some((expression) => expression.includes('streamAppend("s1","世界。")')));
     await waitUntil(() => env.evaluations.some((expression) => expression.includes('streamDone("s1",{"ok":true})')));
+  } finally {
+    bridge.stop();
+    stopVoiceInputBridge();
+  }
+});
+
+test('voice input: 长停顿立即写入短句，继续说话并松键后只追加一次定稿', async () => {
+  const env = createFakeBridgeEnv();
+  const bridge = startVoiceInputBridge({
+    cdpPort: 9222, ctx: env.ctx, cdpImpl: env.cdpImpl, startStreamImpl: env.startStreamImpl,
+    visibleIntervalMs: 5, hiddenIntervalMs: 5,
+  });
+  try {
+    const id = 'pause';
+    env.inbox.push({ type: 'stream', items: [{ type: 'pcm', id, data: 'AAA=' }] });
+    await waitUntil(() => env.pushed.length === 1);
+    env.state.emit({ kind: 'segment', text: '好的', durationMs: 400 });
+    env.state.emit({ kind: 'boundary' });
+    await waitUntil(() => env.evaluations.some(expression => expression.includes('streamAppend("pause","好的。")')));
+    assert.ok(!env.evaluations.some(expression => expression.includes('streamDone("pause"')));
+    env.state.emit({ kind: 'partial', text: '还要' });
+    env.state.emit({ kind: 'segment', text: '还要继续吗？', pauseMs: 1800 });
+    env.inbox.push({ type: 'stream', items: [{ type: 'end', id }] });
+    await waitUntil(() => env.state.ended === 1);
+    env.state.emit({ kind: 'done', text: '好的。还要继续吗？' });
+    await waitUntil(() => env.evaluations.some(expression => expression.includes('streamDone("pause",{"ok":true})')));
+    const appends = env.evaluations.flatMap(expression => [...expression.matchAll(/streamAppend\("pause","([^"]+)"\)/g)].map(match => match[1]));
+    assert.deepEqual(appends, ['好的。', '还要继续吗？']);
   } finally {
     bridge.stop();
     stopVoiceInputBridge();

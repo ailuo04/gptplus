@@ -369,7 +369,7 @@ function openVoiceConfig(ctx, plugin) {
     value: selectedEngine,
     ariaLabel: '输入方式',
     options: [
-      { value: 'local', label: '本地识别（SenseVoice，离线）' },
+      { value: 'local', label: '本地识别（SenseVoice 预览 + Qwen3-ASR 定稿，离线）' },
       { value: 'provider', label: '提供商音频转写' },
       { value: 'system', label: 'Windows 系统听写（会弹出 Win+H 浮层）' },
     ],
@@ -485,7 +485,7 @@ function openVoiceConfig(ctx, plugin) {
     ctx.el('span', { class: 'hint', text: '范围 0.3-5 秒，默认 1 秒。按住快捷键或鼠标达到该时长后开始录音；松开对应按键或鼠标结束录音。' }),
   ]);
   const providerFields = ctx.el('div', { class: 'plugin-config-options voice-provider-fields' }, [providerField, modelField]);
-  const localHint = ctx.el('span', { class: 'hint', text: '首次使用会自动下载约 231 MB 的 SenseVoice 模型；如果已安装 DeepSeek Harness，会直接复用它的模型缓存。录音和识别都在本机完成。默认按住 Alt 启动语音，松开结束录音；也可自定义快捷键或在未选中文字处按住鼠标左键。' });
+  const localHint = ctx.el('span', { class: 'hint', text: '首次使用需要约 1.23 GB 模型文件。已有 SenseVoice 缓存可复用，只需补充约 987 MB 的定稿模型。录音和识别都在本机完成。默认按住 Alt 启动语音，松开结束录音；也可自定义快捷键或在未选中文字处按住鼠标左键。' });
   const systemHint = ctx.el('span', { class: 'hint', text: '系统听写会调用 Win+H 并弹出 Windows 语音浮层，不建议日常使用。' });
   const syncDisabled = () => {
     const provider = selectedEngine === 'provider';
@@ -529,7 +529,7 @@ function openVoiceConfig(ctx, plugin) {
         ctx.el('div', { class: 'modal-title', text: '配置语音输入' }),
       ]),
       ctx.el('div', { class: 'modal-body plugin-config-body voice-config-body' }, [
-        ctx.el('p', { class: 'setting-desc', text: '默认使用本机 SenseVoice 离线识别；按住 Alt 开始录音，松开结束。快捷键、识别来源和触发时长都可调整，麦克风按钮与鼠标长按入口仍可使用。' }),
+        ctx.el('p', { class: 'setting-desc', text: '默认使用本机 SenseVoice 预览、Qwen3-ASR 0.6B INT8 定稿；按住 Alt 开始录音，松开结束。快捷键、识别来源和触发时长都可调整，麦克风按钮与鼠标长按入口仍可使用。' }),
         recognitionSection,
         recordingSection,
         languageSection,
