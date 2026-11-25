@@ -1201,6 +1201,15 @@ function registerIpc(deps) {
     return err ? { ok: false, error: err } : { ok: true };
   });
 
+  handle('gptplus:codex:open-agents', async () => {
+    const file = path.join(ctx.paths.CODEX_HOME, 'AGENTS.md');
+    if (!fs.statSync(file, { throwIfNoEntry: false })?.isFile()) {
+      return { ok: false, error: `AGENTS.md 文件不存在: ${file}` };
+    }
+    const err = await shell.openPath(file);
+    return err ? { ok: false, error: err } : { ok: true };
+  });
+
   handle('gptplus:chatgpt:relaunch', async () => {
     // 结束正在运行的 ChatGPT 客户端，再通过 Windows 应用入口重新拉起，使其重新读取配置。
     // 不能直接 spawn 包内 exe：那样会丢掉 MSIX 应用身份，任务栏显示成通用图标，

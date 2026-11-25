@@ -1364,6 +1364,10 @@ function makeApi(state, calls) {
       calls.push(['openCodexConfig']);
       return { ok: true };
     },
+    openCodexAgents: async () => {
+      calls.push(['openCodexAgents']);
+      return { ok: true };
+    },
     relaunchChatGpt: async () => {
       calls.push(['relaunchChatGpt']);
       return { ok: true };
@@ -1719,14 +1723,24 @@ test('主页：三段接线、今日流量与注入开关都来自真实状态',
     click(split.find('codex-split-main')[0]);
     await flush();
     assert.equal(callsOf(ctx, 'openCodexFolder').length, 1, '主按钮应默认打开配置文件夹');
-    click(split.find('codex-split-caret')[0]);
+    const caret = split.find('codex-split-caret')[0];
+    click(caret);
     assert.ok(split.classList.contains('is-open'), '点小箭头应展开二级菜单');
     const codexItems = split.find('codex-split-item');
-    assert.equal(codexItems.length, 2, '二级菜单应有打开文件夹/打开配置文件两个条目');
+    assert.deepEqual(codexItems.map((item) => item.textContent), ['打开配置文件夹', '打开配置文件', '打开 AGENTS.md']);
+    click(codexItems[0]);
+    await flush();
+    assert.equal(callsOf(ctx, 'openCodexFolder').length, 2, '「打开配置文件夹」条目应调用 openCodexFolder');
+    click(caret);
     click(codexItems[1]);
     await flush();
     assert.equal(callsOf(ctx, 'openCodexConfig').length, 1, '「打开配置文件」条目应调用 openCodexConfig');
-    assert.ok(!split.classList.contains('is-open'), '选择条目后二级菜单应收起');
+    assert.ok(!split.classList.contains('is-open'), '选择打开配置文件后二级菜单应收起');
+    click(caret);
+    click(codexItems[2]);
+    await flush();
+    assert.equal(callsOf(ctx, 'openCodexAgents').length, 1, '「打开 AGENTS.md」条目应调用 openCodexAgents');
+    assert.ok(!split.classList.contains('is-open'), '选择打开 AGENTS.md 后二级菜单应收起');
 
     // 网关未运行时打开注入应被拦下，并引导到设置页
     const blockedState = fixtureState({

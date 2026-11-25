@@ -605,8 +605,17 @@ async function openCodexConfig(ctx) {
   }
 }
 
-// 右上角 Codex 入口：主按钮默认打开配置文件夹，右侧小箭头展开二级菜单，
-// 在「打开配置文件夹 / 打开配置文件」之间选择；点菜单外或按 Esc 收起。
+async function openCodexAgents(ctx) {
+  try {
+    const res = await ctx.api.openCodexAgents();
+    if (res && res.ok) ctx.toast('已打开 AGENTS.md', 'ok');
+    else ctx.toast(`打开 AGENTS.md 失败：${(res && res.error) || '未知错误'}`, 'error');
+  } catch (err) {
+    ctx.toastError(err, '打开 AGENTS.md 失败');
+  }
+}
+
+// 右上角 Codex 入口：主按钮打开配置文件夹，右侧小箭头展开菜单，点菜单外或按 Esc 收起。
 function codexSplitButton(ctx) {
   const { el, icon } = ctx;
   let open = false;
@@ -627,6 +636,7 @@ function codexSplitButton(ctx) {
   }, [
     menuItem('folder', '打开配置文件夹', () => void openCodexFolder(ctx)),
     menuItem('code', '打开配置文件', () => void openCodexConfig(ctx)),
+    menuItem('message', '打开 AGENTS.md', () => void openCodexAgents(ctx)),
   ]);
 
   const caret = el('button', {
@@ -640,7 +650,7 @@ function codexSplitButton(ctx) {
     el('button', {
       class: 'btn btn-ghost btn-sm codex-split-main',
       type: 'button',
-      title: '默认打开 Codex 配置文件夹；右侧小箭头可选择打开配置文件',
+      title: '默认打开 Codex 配置文件夹，右侧菜单可打开配置文件或 AGENTS.md',
       on: { click: () => void openCodexFolder(ctx) },
     }, [icon('folder', 13), el('span', { text: 'Codex 配置' })]),
     caret,

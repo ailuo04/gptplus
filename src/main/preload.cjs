@@ -127,6 +127,7 @@ contextBridge.exposeInMainWorld('gptplus', {
   setInject: (patch) => invoke('gptplus:inject:set', patch),
   openCodexFolder: () => invoke('gptplus:codex:open'),
   openCodexConfig: () => invoke('gptplus:codex:open-config'),
+  openCodexAgents: () => invoke('gptplus:codex:open-agents'),
   relaunchChatGpt: () => invoke('gptplus:chatgpt:relaunch'),
   getLogs: () => invoke('gptplus:logs:get'),
   getUsage: () => invoke('gptplus:usage:get'),

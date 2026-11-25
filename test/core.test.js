@@ -2162,6 +2162,38 @@ test('codex-config: 只收回我们补的那一个尾换行，用户注入期间
   assert.equal(fs.readFileSync(configPath, 'utf8'), 'model = "old"\n');
 });
 
+test('ipc: 打开有效 Codex 目录中的 AGENTS.md，缺失时返回文件路径', async (t) => {
+  const { registerIpc } = require(path.join(CORE, 'ipc.js'));
+  const codexHome = tmpDir('ipc-codex-agents');
+  cleanup(t, codexHome);
+  const file = path.join(codexHome, 'AGENTS.md');
+  const handlers = new Map();
+  const opened = [];
+  registerIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    shell: { openPath: async (target) => { opened.push(target); return ''; } },
+    ctx: { paths: { CODEX_HOME: codexHome }, onLogEvent: () => () => {} },
+  });
+  let api;
+  require('node:vm').runInNewContext(fs.readFileSync(path.join(ROOT, 'src', 'main', 'preload.cjs'), 'utf8'), {
+    process: { argv: [] },
+    require: () => ({
+      contextBridge: { exposeInMainWorld: (name, value) => { if (name === 'gptplus') api = value; } },
+      ipcRenderer: { invoke: (channel) => handlers.get(channel)({}) },
+    }),
+  });
+
+  const missing = await api.openCodexAgents();
+  assert.equal(missing.ok, false);
+  assert.ok(missing.error.includes(file));
+  assert.deepEqual(opened, []);
+  assert.equal(fs.existsSync(file), false);
+
+  fs.writeFileSync(file, '# Codex instructions', 'utf8');
+  assert.deepEqual(await api.openCodexAgents(), { ok: true });
+  assert.deepEqual(opened, [file]);
+});
+
 test('ipc: Codex 写入失败必须回滚注入开关，不能留下「界面已注入、配置没写」', async () => {
   const { registerIpc } = require(path.join(CORE, 'ipc.js'));
   const dir = tmpDir('ipc-rollback');
