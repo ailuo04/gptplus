@@ -63,6 +63,7 @@ test('app-server: 真实子进程完成 initialize → thread → turn，并拒�
   });
   try {
     assert.equal(server.isRunning(), true);
+    assert.deepEqual(await server.listModels(), ['m1', 'm2']);
     assert.equal(await server.prepareThread(null), 'thread-1');
     assert.equal(await server.prepareThread('saved-thread'), 'thread-1');
     const turn = await server.runTurn('thread-1', 'hello');

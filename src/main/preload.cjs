@@ -121,6 +121,8 @@ contextBridge.exposeInMainWorld('gptplus', {
   getGateway: () => invoke('gptplus:gateway:get'),
   setGateway: (patch) => invoke('gptplus:gateway:set', patch),
   probeGateway: () => invoke('gptplus:gateway:probe'),
+  diagnoseHome: () => invoke('gptplus:diagnostics:home'),
+  probeDiagnosticModel: (slug) => invoke('gptplus:diagnostics:model', slug),
 
   // 注入到 ChatGPT 桌面客户端
   getInject: () => invoke('gptplus:inject:get'),

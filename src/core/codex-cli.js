@@ -138,4 +138,4 @@ async function resolveCodexCli(opts = {}) {
   throw new Error('找不到可运行的 Codex CLI，请填写 codex.exe 路径或安装 Codex CLI');
 }
 
-module.exports = { resolveCodexCli, execTextImpl, managedDesktopCodex };
+module.exports = { resolveCodexCli, execTextImpl, managedDesktopCodex, chatGptBundledCodex };

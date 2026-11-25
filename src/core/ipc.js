@@ -577,7 +577,7 @@ function registerIpc(deps) {
   handle('gptplus:provider:models:test', (patch = {}) => {
     const providerId = String(patch.providerId || '').trim();
     const modelIds = Array.isArray(patch.modelIds) ? patch.modelIds : [];
-    return ctx.providerClient.testProviderModels(providerId, modelIds);
+    return ctx.providerClient.testProviderModels(providerId, modelIds, patch.capabilities);
   });
   handle('gptplus:provider:models:remote', (id) => ctx.providerClient.fetchRemoteModels(id));
 
@@ -1118,6 +1118,12 @@ function registerIpc(deps) {
   });
 
   handle('gptplus:gateway:probe', () => ctx.gateway.probe());
+  let homeDiagnosis = null;
+  handle('gptplus:diagnostics:home', () => {
+    homeDiagnosis ??= ctx.diagnoseHome().finally(() => { homeDiagnosis = null; });
+    return homeDiagnosis;
+  });
+  handle('gptplus:diagnostics:model', (slug) => ctx.gateway.probeModel(typeof slug === 'string' ? slug : ''));
 
   // ---- 注入 ----
   handle('gptplus:inject:get', () => {

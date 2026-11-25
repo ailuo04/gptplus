@@ -6,6 +6,7 @@ const paths = require('./paths.js');
 const { createStore } = require('./store.js');
 const { createCatalog } = require('./catalog.js');
 const { createCodexConfig } = require('./codex-config.js');
+const { runHomeDiagnosis, listCatalogModels } = require('./diagnostics.js');
 const { createProviderClient } = require('./provider-client.js');
 const { createProviderBalanceClient } = require('./provider-balance.js');
 const { createBalanceRuntime } = require('./balance-runtime.js');
@@ -213,6 +214,15 @@ async function createContext(opts = {}) {
     };
   }
 
+  async function diagnoseHome() {
+    const cfg = store.get();
+    return runHomeDiagnosis({
+      gateway, codex, catalogPath: paths.CATALOG_PATH, injectionEnabled: cfg.inject.enabled, models: models(),
+      authConfigPath: cfg.gateway.token ? paths.CONFIG_PATH : null,
+      listModels: (catalogPath) => listCatalogModels(catalogPath, { preferredPath: cfg.chatgpt?.executablePath, appVersion }),
+    });
+  }
+
   /** @type {{at:number, ok:boolean, error?:string}|null} */
   let lastWrite = null;
 
@@ -341,6 +351,7 @@ async function createContext(opts = {}) {
       return { mode, usage: usageStore.all(), trend: usageStore.trend() };
     },
     models,
+    diagnoseHome,
     peerState,
     remoteSync: remoteSyncManager,
     status,

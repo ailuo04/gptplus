@@ -13,6 +13,12 @@ function handle(message) {
     send({ jsonrpc: '2.0', id: message.id, result: { userAgent: 'fake-app-server' } });
     return;
   }
+  if (message.method === 'model/list') {
+    const first = message.params?.cursor == null;
+    const data = first ? [{ model: 'm1' }, { model: 'hidden', hidden: true }] : [{ model: 'm2' }];
+    send({ jsonrpc: '2.0', id: message.id, result: { data, nextCursor: first ? 'page-2' : null } });
+    return;
+  }
   if (message.method === 'thread/start' || message.method === 'thread/resume') {
     send({ jsonrpc: '2.0', id: message.id, result: { thread: { id: 'thread-1' } } });
     return;

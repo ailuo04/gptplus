@@ -347,6 +347,27 @@ async function createCodexAppServer(opts = {}) {
     }
   }
 
+  async function listModels({ timeoutMs = 5000 } = {}) {
+    const deadline = Date.now() + timeoutMs;
+    const models = new Set();
+    const cursors = new Set();
+    let cursor = null;
+    do {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error('读取 Codex 模型列表超时');
+      const result = await request('model/list', { includeHidden: false, cursor, limit: 100 }, remaining);
+      if (!Array.isArray(result?.data)) throw new Error('Codex 模型列表格式无效');
+      for (const model of result.data) {
+        const slug = model?.model || model?.slug;
+        if (typeof slug === 'string' && slug && model.hidden !== true) models.add(slug);
+      }
+      cursor = typeof result.nextCursor === 'string' && result.nextCursor ? result.nextCursor : null;
+      if (cursor && cursors.has(cursor)) throw new Error('Codex 模型列表分页异常');
+      if (cursor) cursors.add(cursor);
+    } while (cursor);
+    return [...models];
+  }
+
   function threadParams() {
     const params = {
       cwd: workDir,
@@ -362,15 +383,15 @@ async function createCodexAppServer(opts = {}) {
   async function initialize() {
     await request('initialize', {
       clientInfo: {
-        name: 'gptplus-weixin',
-        title: 'gpt++ 微信连接',
+        name: opts.clientInfo?.name || 'gptplus-weixin',
+        title: opts.clientInfo?.title || 'gpt++ 微信连接',
         version: String(opts.appVersion || '0.0.0'),
       },
       capabilities: {
         experimentalApi: true,
         optOutNotificationMethods: OPT_OUT_METHODS,
       },
-    });
+    }, opts.initializeTimeoutMs);
     writeJson({ jsonrpc: '2.0', method: 'initialized' });
   }
 
@@ -461,6 +482,19 @@ async function createCodexAppServer(opts = {}) {
     running = false;
     rejectWaiter(new Error('Codex app-server 已关闭'));
     try { child.stdin.end(); } catch { /* ignore */ }
+    if (opts.gracefulCloseMs > 0 && child.pid && child.exitCode == null && child.signalCode == null) {
+      // Isolated diagnostics can give Codex time to close SQLite after stdin EOF.
+      await new Promise((resolve) => {
+        const finish = () => {
+          clearTimeout(timer);
+          child.removeListener('close', finish);
+          resolve();
+        };
+        const timer = setTimeout(finish, opts.gracefulCloseMs);
+        child.once('close', finish);
+      });
+      if (child.exitCode != null || child.signalCode != null) return;
+    }
     await killProcessTree(child, spawnImpl);
   }
 
@@ -475,6 +509,7 @@ async function createCodexAppServer(opts = {}) {
 
   return {
     prepareThread,
+    listModels,
     runTurn,
     isRunning,
     close,

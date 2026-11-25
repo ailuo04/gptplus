@@ -544,6 +544,53 @@ function createGateway(deps = {}) {
   // 请求处理
   // -------------------------------------------------------------------------
 
+  // Explicitly requested by the user from the diagnostic dialog. Go through the
+  // same authenticated local route as a client, without returning the raw body.
+  async function probeModel(slug) {
+    const started = Date.now();
+    const result = (ok, status, error) => ({ ok, latencyMs: Date.now() - started,
+      ...(status ? { status } : {}), ...(error ? { error } : {}) });
+    const address = state.server?.address();
+    if (!state.running || !address || typeof address !== 'object') return result(false, null, '网关未启动');
+    if (!router.listModels().some((model) => model.slug === slug && model.enabled)) {
+      return result(false, null, '该模型已停用或不在当前网关清单中');
+    }
+    const host = address.address === '::' ? '::1' : address.address === '0.0.0.0' ? '127.0.0.1' : address.address;
+    const body = JSON.stringify({ model: slug, input: 'Reply OK.', stream: false, store: false, max_output_tokens: 64 });
+    return new Promise((resolve) => {
+      const req = http.request({
+        host, port: address.port, path: '/v1/responses', method: 'POST',
+        headers: { ...authHeaders(), 'Content-Type': 'application/json', 'User-Agent': 'gptplus-diagnostics', 'Content-Length': Buffer.byteLength(body) },
+        signal: AbortSignal.timeout(10000),
+      }, (res) => {
+        if (res.statusCode !== 200) {
+          res.resume();
+          resolve(result(false, res.statusCode, '网关返回 HTTP ' + res.statusCode + '，可在最近请求查看失败阶段。'));
+          return;
+        }
+        let data = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk) => {
+          data += chunk;
+          if (data.length > 256 * 1024) req.destroy(new Error('诊断响应过大'));
+        });
+        res.on('error', () => resolve(result(false, res.statusCode, '测试响应中断或超出诊断限制')));
+        res.on('end', () => {
+          try {
+            const json = JSON.parse(data);
+            if (!json.error && json.status === 'completed' && extractResponseText(json.output).trim()) {
+              resolve(result(true, res.statusCode));
+              return;
+            }
+          } catch { /* invalid response */ }
+          resolve(result(false, res.statusCode, '网关未返回有效的测试文本'));
+        });
+      });
+      req.on('error', (err) => resolve(result(false, null, err.name === 'AbortError' ? '测试请求超时（10 秒）' : '本地网关连接中断')));
+      req.end(body);
+    });
+  }
+
   function authorized(req) {
     const token = effectiveToken();
     if (!token) return true;
@@ -796,7 +843,8 @@ function createGateway(deps = {}) {
       : null;
     logEntry({ level: 'info', msg: `开始请求 ${slug}`, ...baseLog, status: 0 });
 
-    const observeTask = !peerRequest && !isWeixinGatewayRequest(req)
+    const diagnosticProbe = !peerRequest && req.headers['user-agent'] === 'gptplus-diagnostics';
+    const observeTask = !peerRequest && !diagnosticProbe && !isWeixinGatewayRequest(req)
       && !!taskObserver && taskObserver.turnRequest !== undefined;
     let turnInfo = null;
     if (observeTask && typeof taskObserver.turnRequest === 'function') {
@@ -819,6 +867,8 @@ function createGateway(deps = {}) {
     const observed = { hasToolCalls: false, text: '' };
 
     let finalLogged = false;
+    let retryKind = 'none';
+    let upstreamStage = 'upstream-connect';
 
     // 所有已进入上游处理的请求都必须有且只有一条终结记录，避免统计漏项或重复计数。
     const logFinal = (entry = {}) => {
@@ -831,6 +881,7 @@ function createGateway(deps = {}) {
         level: 'info',
         ...baseLog,
         ...entry,
+        retryKind,
         ...(sentEffort !== undefined ? { reasoningEffort: sentEffort } : {}),
         ...(requestedEffort ? { reasoningEffortRequested: requestedEffort } : {}),
         ...(speed ? { speed } : {}),
@@ -907,6 +958,7 @@ function createGateway(deps = {}) {
           level: 'error',
           msg: `上游返回失败事件: ${pipe.failed.message}`,
           status: 502,
+          failureStage: 'upstream-stream',
           ...usage,
         });
       }
@@ -914,6 +966,7 @@ function createGateway(deps = {}) {
         level: 'warn',
         msg: `客户端中断: ${slug}`,
         status: 499,
+        failureStage: 'client-disconnect',
         ...usage,
       });
     };
@@ -924,6 +977,7 @@ function createGateway(deps = {}) {
         { provider, modelId: route.modelId, body, stream: wantStream, compat: false, userAgent },
         controller.signal,
       );
+      upstreamStage = 'upstream-response';
       let upstream = firstAttempt.upstream;
       built = firstAttempt.built;
       logEntry({ level: 'info', msg: `上游返回 HTTP ${upstream.status}`, ...baseLog, status: upstream.status });
@@ -937,24 +991,28 @@ function createGateway(deps = {}) {
         // 原样重发只会再失败一次。
         const effortRequested = typeof body.reasoning?.effort === 'string';
         const effortRejected = effortRequested && /output_config|thinking|effort/i.test(firstText);
-        const paramIssue = !effortRejected
+        const paramIssue = !diagnosticProbe && !effortRejected
           && !adapter.passthrough
           && isCompatRetryableStatus(upstream.status)
           && COMPAT_TRIGGER.test(firstText);
-        const transientIssue = !paramIssue && isTransientUpstreamStatus(upstream.status);
+        const transientIssue = !diagnosticProbe && !paramIssue && isTransientUpstreamStatus(upstream.status);
 
         if (paramIssue) {
+          controller.signal.throwIfAborted();
+          retryKind = 'compat';
           logEntry({
             level: 'warn',
             msg: `上游拒绝可选参数，改用兼容请求重试: HTTP ${upstream.status}`,
             ...baseLog,
             status: upstream.status,
           });
+          upstreamStage = 'upstream-connect';
           const compatAttempt = await callUpstream(
             adapter,
             { provider, modelId: route.modelId, body, stream: wantStream, compat: extractErrorMessage(firstText, ''), userAgent },
             controller.signal,
           );
+          upstreamStage = 'upstream-response';
           upstream = compatAttempt.upstream;
           built = compatAttempt.built;
           if (!upstream.ok) {
@@ -972,11 +1030,15 @@ function createGateway(deps = {}) {
             status: upstream.status,
           });
           await sleep(UPSTREAM_TRANSIENT_RETRY_DELAY_MS);
+          controller.signal.throwIfAborted();
+          retryKind = 'transient';
+          upstreamStage = 'upstream-connect';
           const retryAttempt = await callUpstream(
             adapter,
             { provider, modelId: route.modelId, body, stream: wantStream, compat: false, userAgent },
             controller.signal,
           );
+          upstreamStage = 'upstream-response';
           upstream = retryAttempt.upstream;
           built = retryAttempt.built;
           if (!upstream.ok) {
@@ -1109,6 +1171,7 @@ function createGateway(deps = {}) {
               level: 'error',
               msg: `上游返回失败事件: ${pipe.failed.message}`,
               status: 502,
+              failureStage: 'upstream-stream',
               ...partialUsage(),
             });
             // 上游的 response.failed/error 已经逐字节转发，不能再补发第二个失败帧。
@@ -1121,6 +1184,7 @@ function createGateway(deps = {}) {
               level: 'error',
               msg: `流式转发失败: ${message}`,
               status: 502,
+              failureStage: 'upstream-stream',
               ...partialUsage(),
             });
             sendResponsesFailure(res, { responseId: pipe.responseId, message });
@@ -1167,6 +1231,7 @@ function createGateway(deps = {}) {
           level: 'error',
           msg: `流式转发失败: ${err.message}`,
           status: 502,
+          failureStage: 'upstream-stream',
           ...partialUsage(),
         });
         if (adapter.passthrough) {
@@ -1187,6 +1252,7 @@ function createGateway(deps = {}) {
         level: 'error',
         msg: `上游请求失败: ${err.message}`,
         status,
+        failureStage: upstreamStage,
       });
       if (!res.headersSent) sendProtocolError(status, err.message, status < 500 ? 'invalid_request_error' : 'api_error');
     } finally {
@@ -1215,6 +1281,7 @@ function createGateway(deps = {}) {
     getState,
     autoStart,
     probe,
+    probeModel,
     on,
     // ---- 以下为契约外的便利方法（渲染层/测试/诊断用）----
     getLogs: () => ring.slice(),

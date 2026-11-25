@@ -922,6 +922,8 @@ async function openImportDialog(ctx, initialFiles = null) {
   if (initialFiles) await acceptFiles(initialFiles);
 }
 
+const MODEL_TEST_CAPABILITIES = { text: '基础文本', stream: '流式输出', tools: '工具调用', image: '图片输入' };
+
 function probeResult(ctx, p, probe) {
   const { el, icon, fmt } = ctx;
   if (Array.isArray(probe.modelResults)) {
@@ -936,7 +938,7 @@ function probeResult(ctx, p, probe) {
         : `${fmt.dur(Math.min(...latencies))}–${fmt.dur(Math.max(...latencies))}`
       : '—';
     const title = probe.modelResults.map((result) =>
-      `${result.modelId}: ${result.ok ? `通过 ${fmt.dur(result.latencyMs)}` : `失败 ${result.error || '未知错误'}`}`,
+      `${result.modelId}${result.capability ? ` · ${MODEL_TEST_CAPABILITIES[result.capability]}` : ''}: ${result.ok ? `通过 ${fmt.dur(result.latencyMs)}` : `失败 ${result.error || '未知错误'}`}`,
     ).join('\n');
     return el('div', {
       class: 'probe-result ' + (probe.ok ? 'probe-ok' : 'probe-bad'),
@@ -1006,12 +1008,25 @@ function openModelTestDialog(ctx, p) {
   const { el, icon, fmt } = ctx;
   const models = (p.models || []).filter((model) => String(model && model.id || '').trim());
   const selected = new Set(models.filter((model) => model.enabled !== false).map((model) => model.id));
+  const capabilities = new Set(['text']);
   let running = false;
   let results = [];
 
   const selectedText = el('span', { class: 'model-test-selected-count' });
   const modelList = el('div', { class: 'model-test-list' });
   const resultBox = el('div', { class: 'model-test-results' });
+  const requestCount = el('span', { class: 'hint' });
+  const capabilityInputs = Object.entries(MODEL_TEST_CAPABILITIES).map(([id, label]) => {
+    const input = el('input', {
+      type: 'checkbox', checked: capabilities.has(id), attrs: { 'aria-label': label },
+      on: { change: (event) => {
+        if (event.target.checked) capabilities.add(id);
+        else capabilities.delete(id);
+        updateControls();
+      } },
+    });
+    return [input, el('label', { class: 'model-test-option' }, [input, el('span', { text: label })])];
+  });
   const startBtn = el('button', {
     class: 'btn btn-primary',
     type: 'button',
@@ -1020,7 +1035,9 @@ function openModelTestDialog(ctx, p) {
 
   function updateControls() {
     selectedText.textContent = `${selected.size}/${models.length} 个模型已选择`;
-    startBtn.disabled = running || selected.size === 0;
+    startBtn.disabled = running || selected.size === 0 || capabilities.size === 0;
+    requestCount.textContent = '将发送 ' + (selected.size * capabilities.size) + ' 个固定测试请求，可能计费。';
+    for (const [input] of capabilityInputs) input.disabled = running;
     const buttons = modelList.querySelectorAll ? modelList.querySelectorAll('input') : [];
     for (const input of buttons) input.disabled = running;
   }
@@ -1066,7 +1083,7 @@ function openModelTestDialog(ctx, p) {
       const model = models.find((item) => item.id === result.modelId);
       return el('div', { class: 'model-test-result ' + (result.ok ? 'is-ok' : 'is-error') }, [
         el('span', { class: 'model-test-result-icon' }, [icon(result.ok ? 'check' : 'alert', 13)]),
-        el('span', { class: 'model-test-result-name', text: model?.label || result.modelId }),
+        el('span', { class: 'model-test-result-name', text: (model?.label || result.modelId) + (result.capability ? ` · ${MODEL_TEST_CAPABILITIES[result.capability]}` : '') }),
         el('span', { class: 'model-test-result-id mono', text: result.modelId }),
         el('span', { class: 'model-test-result-status', text: result.ok ? `通过 · HTTP ${result.status ?? 200}` : `失败${result.status ? ` · HTTP ${result.status}` : ''}` }),
         el('span', { class: 'model-test-result-latency mono', text: fmt.dur(result.latencyMs) }),
@@ -1076,8 +1093,9 @@ function openModelTestDialog(ctx, p) {
   }
 
   async function runModelTest() {
-    if (running || selected.size === 0) {
-      if (!selected.size) ctx.toast('请至少选择一个模型', 'warn');
+    if (running || selected.size === 0 || capabilities.size === 0) {
+      if (!capabilities.size) ctx.toast('请至少选择一个测试项目', 'warn');
+      else if (!selected.size) ctx.toast('请至少选择一个模型', 'warn');
       return;
     }
     running = true;
@@ -1088,6 +1106,9 @@ function openModelTestDialog(ctx, p) {
       const response = await ctx.api.testProviderModels({
         providerId: p.id,
         modelIds: models.filter((model) => selected.has(model.id)).map((model) => model.id),
+        ...(capabilities.size === 1 && capabilities.has('text') ? {} : {
+          capabilities: Object.keys(MODEL_TEST_CAPABILITIES).filter((id) => capabilities.has(id)),
+        }),
       });
       results = Array.isArray(response?.results) ? response.results : [];
       viewState.probe[p.id] = {
@@ -1133,7 +1154,7 @@ function openModelTestDialog(ctx, p) {
     el('div', { class: 'modal-head' }, [
       el('div', { class: 'grow' }, [
         el('h2', { text: `测试「${p.name}」的模型` }),
-        el('div', { class: 'modal-sub', text: '逐个发送最小生成请求，确认模型可用并测量响应延时' }),
+        el('div', { class: 'modal-sub', text: '按模型和项目逐项验证；工具测试不会执行工具，图片测试仅使用内置图片。' }),
       ]),
       closeBtn,
     ]),
@@ -1145,10 +1166,11 @@ function openModelTestDialog(ctx, p) {
         clearBtn,
       ]),
       modelList,
+      el('div', { class: 'model-test-capabilities', attrs: { role: 'group', 'aria-label': '测试项目' } }, capabilityInputs.map(([, label]) => label)),
       resultBox,
     ]),
     el('div', { class: 'modal-foot' }, [
-      el('span', { class: 'hint', text: '每个模型发送一次最小生成请求，可能产生少量用量；不会修改配置' }),
+      requestCount,
       el('span', { class: 'right' }),
       el('button', { class: 'btn btn-ghost', type: 'button', disabled: running ? true : null, on: { click: () => ctx.closeModal() } }, [el('span', { text: '关闭' })]),
       startBtn,

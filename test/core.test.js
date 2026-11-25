@@ -1819,6 +1819,85 @@ test('provider-client: 按 Anthropic 与 Responses 协议构造最小生成请�
   assert.equal(requests[1].body.model, 'gpt-test');
 });
 
+test('provider-client: 按需验证文本流、实际工具调用和固定测试图', async (t) => {
+  const dir = tmpDir('pc-model-capabilities');
+  cleanup(t, dir);
+  const store = createStore({ configPath: path.join(dir, 'config.json') });
+  const requests = [];
+  const { server, url } = await startServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    requests.push(body);
+    if (body.stream && body.model === 'works') {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.write('data: {"choices":[{"delta":{"content":"OK"}}]}\n\ndata: [DONE]\n\n');
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    if (body.tools && body.model === 'works') {
+      res.end(JSON.stringify({ choices: [{ message: { tool_calls: [{ function: { name: 'gptplus_probe', arguments: '{"value":"ok"}' } }] } }] }));
+    } else {
+      res.end(JSON.stringify({ choices: [{ message: { content: body.model === 'works' ? 'RED' : 'OK' } }] }));
+    }
+  });
+  closeServer(t, server);
+  const provider = store.upsertProvider({ name: 'Probe', baseUrl: url, api: 'openai', models: [{ id: 'works' }, { id: 'ignores' }] });
+  const client = createProviderClient({ store });
+  const result = await client.testProviderModels(provider.id, ['works', 'ignores'], ['stream', 'tools', 'image']);
+  assert.deepEqual(result.results.map(({ modelId, capability, ok }) => [modelId, capability, ok]), [
+    ['works', 'stream', true], ['works', 'tools', true], ['works', 'image', true],
+    ['ignores', 'stream', false], ['ignores', 'tools', false], ['ignores', 'image', false],
+  ]);
+  assert.equal(requests.length, 6);
+  assert.equal(requests[1].tool_choice.function.name, 'gptplus_probe');
+  const image = requests[2].messages[0].content.find((part) => part.type === 'image_url');
+  assert.match(image.image_url.url, /^data:image\/png;base64,/);
+});
+
+test('provider-client: 能力测试按 Responses 和 Anthropic 协议验收，不把断开的流判成成功', async (t) => {
+  const dir = tmpDir('pc-model-capability-protocols');
+  cleanup(t, dir);
+  const store = createStore({ configPath: path.join(dir, 'config.json') });
+  const requests = [];
+  const { server, url } = await startServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    const anthropic = req.url.endsWith('/messages');
+    requests.push(body);
+    if (body.stream) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      const events = anthropic ? [
+        { type: 'content_block_delta', delta: { type: 'text_delta', text: 'OK' } }, { type: 'message_stop' },
+      ] : [{ type: 'response.output_text.delta', delta: 'OK' }];
+      const frames = events.map((event) => 'data: ' + JSON.stringify(event) + '\n\n').join('');
+      if (anthropic) res.write(frames); // Does not close after a valid terminal frame.
+      else res.end(frames);
+      return;
+    }
+    const tool = body.tools?.[0];
+    const output = anthropic
+      ? { content: tool ? [{ type: 'tool_use', name: 'gptplus_probe', input: { value: 'ok' } }] : [{ type: 'text', text: 'Red' }] }
+      : { status: 'completed', output: tool ? [{ type: 'function_call', name: 'gptplus_probe', arguments: '{"value":"ok"}' }]
+        : [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Red' }] }] };
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(output));
+  });
+  closeServer(t, server);
+  const api = createProviderClient({ store });
+  for (const kind of ['responses', 'anthropic']) {
+    const provider = store.upsertProvider({ name: kind, baseUrl: url, api: kind, models: [{ id: 'test' }] });
+    const result = await api.testProviderModels(provider.id, ['test'], ['stream', 'tools', 'image']);
+    assert.deepEqual(result.results.map((item) => item.ok), [kind === 'anthropic', true, true]);
+    if (kind === 'responses') assert.match(result.results[0].error, /结束事件前断开/);
+  }
+  assert.equal(requests[1].tool_choice.name, 'gptplus_probe');
+  assert.match(requests[2].input[0].content[1].image_url, /^data:image\/png/);
+  assert.equal(requests[4].tool_choice.name, 'gptplus_probe');
+  assert.equal(requests[5].messages[0].content[1].source.media_type, 'image/png');
+});
+
 test('provider-client: 模型测试不会用上游拒绝的极小输出上限', async (t) => {
   let requestBody = null;
   const { server, url } = await startServer(async (req, res) => {

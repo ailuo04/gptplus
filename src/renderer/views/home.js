@@ -1,4 +1,4 @@
-import { requestStatusDetails } from '../request-status.js';
+import { requestStatusDetails, requestStatusHint } from '../request-status.js';
 
 // 主页：把「提供商 → 本地网关 → ChatGPT 客户端」这条接线放在首屏，
 // 下面接着是最近请求、今日流量、提供商清单和常用入口。所有数据都来自已有状态快照。
@@ -182,6 +182,7 @@ function hero(ctx) {
       el('strong', { text: '三段线路，接在一起才算接通' }),
     ]),
     el('div', { class: 'home-hero-status' }, [
+      el('button', { class: 'btn btn-sm btn-ghost', type: 'button', on: { click: () => openHomeDiagnosis(ctx) } }, ['一键诊断']),
       el('span', {
         class: `chip ${statusTone}`,
         attrs: { role: 'status' },
@@ -353,6 +354,103 @@ function chainLink(ctx, live) {
   ]);
 }
 
+// Local checks are started when the dialog opens; the paid probe needs its own click.
+function openHomeDiagnosis(ctx) {
+  const { el, icon, fmt } = ctx;
+  const progress = el('div', { class: 'hint', attrs: { role: 'status' }, text: '正在检查本地网关、注入配置和模型目录…' });
+  const results = el('div', { class: 'home-diagnostic-results' });
+  const tests = el('div', { class: 'home-diagnostic-results' });
+  const headings = { gateway: '本地网关', injection: '注入配置', picker: '客户端模型列表' };
+  const badges = { ok: ['通过', 'chip-ok'], failed: ['未通过', 'chip-err'], skipped: ['未检查', 'faint'], unavailable: ['无法验证', 'chip-warn'], partial: ['部分验证', 'chip-warn'] };
+  const modal = el('section', { class: 'modal', attrs: { role: 'dialog', 'aria-modal': 'true', 'aria-label': '一键诊断' } }, [
+    el('div', { class: 'modal-head' }, [el('div', { class: 'grow' }, [el('h2', { text: '一键诊断' }),
+      el('div', { class: 'modal-sub', text: '不会修改设置或重启 ChatGPT；上游测试需另外点击。' })]),
+      el('button', { class: 'btn btn-icon', type: 'button', attrs: { 'aria-label': '关闭' }, on: { click: () => ctx.closeModal() } }, [icon('x', 15)])]),
+    el('div', { class: 'modal-body' }, [progress, results, tests]),
+    el('div', { class: 'modal-foot' }, [el('span', { class: 'right' }), el('button', { class: 'btn', type: 'button', on: { click: () => ctx.closeModal() } }, ['关闭'])]),
+  ]);
+  ctx.openModal(modal);
+  async function run() {
+    try {
+      const report = await ctx.api.diagnoseHome();
+      progress.textContent = '本地诊断已完成。';
+      results.replaceChildren(...report.steps.map((step) => {
+        const [label, tone] = badges[step.state] || badges.unavailable;
+        return el('div', { class: 'home-diagnostic-step' }, [
+          el('div', { class: 'home-diagnostic-heading' }, [el('strong', { text: headings[step.id] || '检查' }), el('span', { class: 'chip ' + tone, text: label })]),
+          el('div', { class: 'hint', text: step.detail }),
+          step.action === 'models' || step.action === 'settings' ? el('button', {
+            class: 'btn btn-sm btn-ghost', type: 'button', on: { click: () => { ctx.closeModal(); ctx.navigate(step.action); } },
+          }, [step.action === 'models' ? '打开模型页' : '打开网关设置']) : null,
+        ]);
+      }));
+      if (!report.routableModels?.length) return;
+      const choices = report.routableModels;
+      const picker = el('select', { class: 'input', value: choices[0].slug, attrs: { 'aria-label': '选择上游测试模型' } }, choices.map((model) =>
+        el('option', { value: model.slug, text: model.providerName ? model.label + ' · ' + model.providerName : model.label || model.slug })));
+      const message = el('div', { class: 'hint', attrs: { role: 'status' } });
+      const button = el('button', { class: 'btn btn-sm', type: 'button', on: { click: async () => {
+        if (button.disabled || !picker.value) return;
+        button.disabled = picker.disabled = true;
+        message.textContent = '正在通过本地网关发送测试…';
+        try {
+          const result = await ctx.api.probeDiagnosticModel(picker.value);
+          message.textContent = result.ok ? '上游测试通过 · ' + fmt.dur(result.latencyMs) : result.error || '上游测试未通过。';
+        } catch { message.textContent = '无法运行上游测试。'; }
+        finally { button.disabled = picker.disabled = false; }
+      } } }, ['发送测试请求']);
+      tests.replaceChildren(el('div', { class: 'home-diagnostic-step' }, [
+        el('strong', { text: '上游测试（可选）' }),
+        el('div', { class: 'hint', text: '只发送一条固定测试提示，不发送对话内容；可能计费。' }),
+        el('div', { class: 'home-diagnostic-heading' }, [picker, button]), message,
+      ]));
+    } catch { progress.textContent = '无法完成诊断，请先在设置页检查本地网关。'; }
+  }
+  void run();
+}
+
+const REQUEST_FAILURE = {
+  'upstream-connect': '连接上游', 'upstream-response': '上游响应', 'upstream-stream': '上游流式输出',
+  'client-disconnect': '客户端断开',
+};
+const REQUEST_RETRY = { transient: '上游瞬时错误，已重试', compat: '参数不兼容，已重试', none: '未重试' };
+
+function openRequestDetail(ctx, row, model, provider) {
+  const { el, fmt, icon, state } = ctx;
+  const status = Number(row.status);
+  const metric = (value, formatter) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? formatter(value) : '未记录';
+  // For older records only classify known event prefixes; never show or copy the raw upstream error.
+  const oldPhase = status === 499 ? 'client-disconnect'
+    : /^(流式转发失败|上游返回失败事件):/.test(row.msg || '') ? 'upstream-stream' : '';
+  const retryEvent = row.requestId && !row.retryKind && (state.logs || []).find((entry) => entry.requestId === row.requestId &&
+    /^上游(?:拒绝可选参数|临时错误，短暂重试一次)/.test(entry.msg || ''));
+  const retry = row.retryKind || (retryEvent ? (retryEvent.msg.startsWith('上游拒绝可选参数') ? 'compat' : 'transient') : '');
+  const phase = row.failureStage || oldPhase;
+  const syntheticStatus = phase === 'upstream-stream' || phase === 'client-disconnect';
+  const fields = [
+    ['网关结果', (syntheticStatus ? '记录码 ' : 'HTTP ') + status + ' · ' + requestStatusHint(status).title],
+    ['首段输出等待', metric(row.firstOutputMs, fmt.dur)],
+    ['生成速度', row.estimatedUsage === true ? '未记录' : metric(row.speed, (speed) => speed.toFixed(1) + ' tok/s')],
+    ['总耗时', metric(row.ms, fmt.dur)],
+    ['失败阶段', status >= 200 && status < 300 ? '无' : REQUEST_FAILURE[phase] || '未记录'],
+    ['重试', REQUEST_RETRY[retry] || '未记录'],
+  ];
+  // Keep sharing safe even if a provider name, URL or upstream message contains credentials.
+  const summary = ['gpt++ 请求摘要', ...fields.map(([label, value]) => label + '：' + value)].join('\n');
+  ctx.openModal(el('section', { class: 'modal', attrs: { role: 'dialog', 'aria-modal': 'true', 'aria-label': '请求详情' } }, [
+    el('div', { class: 'modal-head' }, [el('div', { class: 'grow' }, [el('h2', { text: '请求详情' }),
+      el('div', { class: 'modal-sub', text: (model || '未知模型') + ' · ' + provider })]),
+      el('button', { class: 'btn btn-icon', type: 'button', attrs: { 'aria-label': '关闭' }, on: { click: () => ctx.closeModal() } }, [icon('x', 15)])]),
+    el('div', { class: 'modal-body' }, [el('dl', { class: 'home-request-details' }, fields.flatMap(([label, value]) => [
+      el('dt', { text: label }), el('dd', { text: value }),
+    ])), el('div', { class: 'hint', text: '首段等待可能包含模型思考；仅流式请求有首段计时。' })]),
+    el('div', { class: 'modal-foot' }, [
+      el('span', { class: 'hint', text: '摘要不包含模型名、渠道、密钥或对话正文。' }), el('span', { class: 'right' }),
+      el('button', { class: 'btn btn-primary', type: 'button', on: { click: () => void ctx.copyText(summary, '请求摘要') } }, ['复制脱敏摘要']),
+    ]),
+  ]));
+}
+
 // ============ 最近请求 ============
 function recentCard(ctx) {
   const { el, icon, state, fmt } = ctx;
@@ -386,7 +484,8 @@ function recentCard(ctx) {
       return el('div', { class: 'home-recent-row' }, [
         el('span', { class: 'home-recent-time mono', text: fmt.clock(row.at) }),
         el('div', { class: 'home-recent-main' }, [
-          el('span', { class: 'home-recent-model ellipsis', text: model || provider }),
+          el('button', { class: 'home-recent-model home-recent-detail-button ellipsis', type: 'button', title: '查看请求详情',
+            on: { click: () => openRequestDetail(ctx, row, model, provider) }, text: model || provider }),
           el('span', { class: 'home-recent-provider ellipsis', title: provider, text: provider }),
         ]),
         el('span', { class: 'home-recent-effort', title: effortTitle }, effort ? [

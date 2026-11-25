@@ -7,9 +7,76 @@ const MODEL_TEST_MAX_OUTPUT_TOKENS = 64;
 const { stripEndpoint } = require('./base-url.js');
 const { redactDiagnostic } = require('./redact.js');
 const { createSystemProxyFetch } = require('./system-proxy.js');
-const { buildRequest: buildChatRequest } = require('./gateway/adapters/openai.js');
-const { buildRequest: buildResponsesRequest } = require('./gateway/adapters/responses.js');
-const { buildRequest: buildAnthropicRequest } = require('./gateway/adapters/anthropic.js');
+const { buildRequest: buildChatRequest, parseJson: parseChatJson } = require('./gateway/adapters/openai.js');
+const { buildRequest: buildResponsesRequest, parseJson: parseResponsesJson } = require('./gateway/adapters/responses.js');
+const { buildRequest: buildAnthropicRequest, parseJson: parseAnthropicJson } = require('./gateway/adapters/anthropic.js');
+
+const { parseSse } = require('./gateway/responses.js');
+const MODEL_CAPABILITIES = new Set(['text', 'stream', 'tools', 'image']);
+const PROBE_TOOL = 'gptplus_probe';
+// App-generated 64×64 solid red PNG. No user file is accessed or uploaded.
+const TEST_IMAGE = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAb0lEQVR4nO3PAQkAAAyEwO9feoshgnABdLep8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3IPanc8OLDQitxAAAAAElFTkSuQmCC';
+
+function buildProbeBody(capability, api) {
+  const body = { input: 'Reply OK.', max_output_tokens: MODEL_TEST_MAX_OUTPUT_TOKENS, stream: capability === 'stream' };
+  if (api === 'responses' && capability !== 'text') body.store = false;
+  if (capability === 'tools') {
+    body.input = 'Call gptplus_probe with value set to the string ok. Do not reply with text.';
+    body.tools = [{ type: 'function', name: PROBE_TOOL, description: 'A test function that is never executed',
+      parameters: { type: 'object', properties: { value: { type: 'string' } }, required: ['value'], additionalProperties: false } }];
+    body.tool_choice = { type: 'function', name: PROBE_TOOL };
+  } else if (capability === 'image') {
+    body.input = [{ type: 'message', role: 'user', content: [
+      { type: 'input_text', text: 'What is the color of this solid image? Reply with just the English color word.' },
+      { type: 'input_image', image_url: TEST_IMAGE, detail: 'auto' },
+    ] }];
+  }
+  return body;
+}
+
+function probeJsonError(api, json, capability) {
+  const error = generationError(api, json);
+  if (error || capability === 'text') return error;
+  const parse = api === 'anthropic' ? parseAnthropicJson : api === 'responses' ? parseResponsesJson : parseChatJson;
+  const parsed = parse(json);
+  if (capability === 'image') return /^red[.。]?$/i.test(parsed.text.trim()) ? '' : '模型没有正确识别内置测试图的颜色';
+  const validCall = parsed.toolCalls.some((call) => {
+    if (call.name !== PROBE_TOOL) return false;
+    try { return JSON.parse(call.arguments)?.value === 'ok'; } catch { return false; }
+  });
+  return validCall ? '' : '未收到有效的测试工具调用（没有执行任何工具）';
+}
+
+async function probeStreamError(api, res) {
+  if (!/^text\/event-stream\b/i.test(res.headers?.get('content-type') || '')) return '上游没有返回 SSE 流';
+  let hasText = false;
+  let finished = false;
+  for await (const { event, data } of parseSse(res.body)) {
+    if (!data) continue;
+    if (data.trim() === '[DONE]') {
+      if (api !== 'responses' && api !== 'anthropic') finished = true;
+      break;
+    }
+    let value;
+    try { value = JSON.parse(data); } catch { return '上游流包含无效 JSON'; }
+    if (!value || typeof value !== 'object') return '上游流包含无效事件';
+    const type = value.type || event;
+    if (value.error || ['error', 'response.failed', 'response.cancelled'].includes(type)) return '上游流返回失败事件';
+    if (api === 'responses') {
+      hasText ||= type === 'response.output_text.delta' && typeof value.delta === 'string' && !!value.delta.trim();
+      if (type === 'response.completed' || type === 'response.incomplete') { finished = true; break; }
+    } else if (api === 'anthropic') {
+      hasText ||= type === 'content_block_delta' && value.delta?.type === 'text_delta' && typeof value.delta.text === 'string' && !!value.delta.text.trim();
+      if (type === 'message_stop') { finished = true; break; }
+    } else {
+      const choices = Array.isArray(value.choices) ? value.choices : [];
+      hasText ||= choices.some((choice) => typeof choice?.delta?.content === 'string' && !!choice.delta.content.trim());
+      if (choices.some((choice) => typeof choice?.finish_reason === 'string' && !!choice.finish_reason)) { finished = true; break; }
+    }
+  }
+  if (!hasText) return '没有收到流式文本增量';
+  return finished ? '' : '流在结束事件前断开';
+}
 
 function trimBase(baseUrl) {
   // 老配置里可能存了完整端点 URL（.../v1/chat/completions），剥成 base 再拼 /models
@@ -219,7 +286,13 @@ function createProviderClient({ store, timeoutMs = DEFAULT_TIMEOUT, fetchImpl } 
    * 对指定模型发送一个最小非流式生成请求，确认模型本身可用并记录各自延时。
    * @returns {Promise<{ok:boolean, results:Array<{modelId:string,ok:boolean,status?:number,latencyMs:number,error?:string}>, error?:string}>}
    */
-  async function testProviderModels(id, modelIds) {
+  async function testProviderModels(id, modelIds, selectedCapabilities) {
+    const explicit = selectedCapabilities !== undefined;
+    if (explicit && (!Array.isArray(selectedCapabilities) || !selectedCapabilities.length ||
+        selectedCapabilities.some((kind) => !MODEL_CAPABILITIES.has(kind)))) {
+      return { ok: false, results: [], error: '请选择有效的测试项目' };
+    }
+    const capabilities = explicit ? [...new Set(selectedCapabilities)] : ['text'];
     const provider = getProvider(id);
     const ids = [];
     const seen = new Set();
@@ -269,51 +342,42 @@ function createProviderClient({ store, timeoutMs = DEFAULT_TIMEOUT, fetchImpl } 
       };
     }
 
+    const builder = provider.api === 'anthropic'
+      ? buildAnthropicRequest
+      : provider.api === 'responses' ? buildResponsesRequest : buildChatRequest;
     const results = [];
     for (const modelId of ids) {
-      const started = Date.now();
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), limit);
-      try {
-        const body = { input: 'Reply OK.', max_output_tokens: MODEL_TEST_MAX_OUTPUT_TOKENS, stream: false };
-        const builder = provider.api === 'anthropic'
-          ? buildAnthropicRequest
-          : provider.api === 'responses' ? buildResponsesRequest : buildChatRequest;
-        const request = builder({ provider: { ...provider, baseUrl: base }, modelId, body, stream: false });
-        const res = await doFetch(request.url, {
-          method: 'POST',
-          headers: request.headers,
-          body: JSON.stringify(request.payload),
-          signal: controller.signal,
+      for (const capability of capabilities) {
+        const started = Date.now();
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), limit);
+        const record = (status, error) => results.push({
+          modelId, ...(explicit ? { capability } : {}), ok: !error,
+          ...(status != null ? { status } : {}), latencyMs: Date.now() - started, ...(error ? { error } : {}),
         });
-        let text = '';
+        let status;
         try {
-          text = await res.text();
-        } catch (err) {
-          results.push({
-            modelId,
-            ok: false,
-            status: res.status,
-            latencyMs: Date.now() - started,
-            error: describeError(err, limit),
+          const body = buildProbeBody(capability, provider.api);
+          const request = builder({ provider: { ...provider, baseUrl: base }, modelId, body, stream: body.stream, compat: body.stream ? 'stream_options' : false });
+          const res = await doFetch(request.url, {
+            method: 'POST', headers: request.headers, body: JSON.stringify(request.payload), signal: controller.signal,
           });
-          continue;
-        }
-        const latencyMs = Date.now() - started;
-        if (!res.ok) {
+          status = res.status;
+          if (res.ok && body.stream) {
+            record(status, await probeStreamError(provider.api, res));
+            continue;
+          }
+          const text = await res.text();
           let json = null;
           try { json = text ? JSON.parse(text) : null; } catch { /* 上游不一定返回 JSON */ }
-          results.push({ modelId, ok: false, status: res.status, latencyMs, error: generationError(provider.api, json) || httpMessage(res.status, res.statusText) });
-        } else {
-          let json = null;
-          try { json = text ? JSON.parse(text) : null; } catch { /* 成功状态仍需校验响应体 */ }
-          const error = generationError(provider.api, json);
-          results.push({ modelId, ok: !error, status: res.status, latencyMs, ...(error ? { error } : {}) });
+          record(status, res.ok ? probeJsonError(provider.api, json, capability)
+            : (json && generationError(provider.api, json)) || httpMessage(status, res.statusText));
+        } catch (err) {
+          record(status, describeError(err, limit));
+        } finally {
+          clearTimeout(timer);
+          controller.abort();
         }
-      } catch (err) {
-        results.push({ modelId, ok: false, latencyMs: Date.now() - started, error: describeError(err, limit) });
-      } finally {
-        clearTimeout(timer);
       }
     }
     return { ok: results.every((result) => result.ok), results };
@@ -349,7 +413,7 @@ function createProviderClient({ store, timeoutMs = DEFAULT_TIMEOUT, fetchImpl } 
 
   return {
     testProvider: async (id) => safeResult(await testProvider(id), id),
-    testProviderModels: async (id, ids) => safeResult(await testProviderModels(id, ids), id),
+    testProviderModels: async (id, ids, capabilities) => safeResult(await testProviderModels(id, ids, capabilities), id),
     fetchRemoteModels: async (id) => {
       const result = await fetchRemoteModels(id);
       return result.ok ? result : redactDiagnostic(result, [getProvider(id)]);

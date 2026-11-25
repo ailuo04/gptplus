@@ -2936,6 +2936,37 @@ test('gateway: responses 透传终点事件后主动收尾，客户端随之关�
   }
 });
 
+test('gateway: 首页上游测试只允许已启用的模型并使用真实网关路由', async () => {
+  const upstream = await startMockUpstream((_req, res, body) => {
+    if (body.model === 'fail-once') {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'busy' } }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'completed', output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'OK' }] }] }));
+  });
+  const ctx = await withGateway({ providers: [{ ...SAMPLE_PROVIDER, baseUrl: upstream.url + '/v1', api: 'responses',
+    models: [...SAMPLE_PROVIDER.models, { id: 'fail-once' }] }] });
+  try {
+    const slug = ctx.gw.router.listModels().find((model) => model.enabled).slug;
+    assert.equal((await ctx.gw.probeModel('unregistered__model')).ok, false);
+    assert.equal(upstream.requests.length, 0);
+    const result = await ctx.gw.probeModel(slug);
+    assert.equal(result.ok, true);
+    assert.equal(result.status, 200);
+    assert.equal(upstream.requests.length, 1);
+    assert.equal(upstream.requests[0].body.input, 'Reply OK.');
+    assert.deepEqual(Object.keys(result).sort(), ['latencyMs', 'ok', 'status']);
+    const failing = ctx.gw.router.listModels().find((model) => model.modelId === 'fail-once').slug;
+    assert.equal((await ctx.gw.probeModel(failing)).ok, false);
+    assert.equal(upstream.requests.filter((entry) => entry.body.model === 'fail-once').length, 1);
+  } finally {
+    await ctx.gw.stop();
+    await upstream.close();
+  }
+});
+
 test('gateway: Responses 上游瞬时 502 -> 只重试一次并成功', async () => {
   let hits = 0;
   const upstream = await startMockUpstream((req, res) => {
@@ -2977,6 +3008,9 @@ test('gateway: Responses 上游瞬时 502 -> 只重试一次并成功', async ()
     assert.equal(hits, 2);
     assert.deepEqual(upstream.requests.map(request => request.headers['user-agent']), ['codex_cli_rs/transient-retry', 'codex_cli_rs/transient-retry']);
     assert.ok(logs.some((entry) => entry.msg.includes('短暂重试一次')));
+    const final = logs.find((entry) => entry.final === true);
+    assert.equal(final.retryKind, 'transient');
+    assert.equal(final.failureStage, undefined);
   } finally {
     await ctx.gw.stop();
     await upstream.close();

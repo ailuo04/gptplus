@@ -1816,6 +1816,70 @@ test('主页最近请求把英文思考强度放在独立列，旧记录不伪�
   }
 });
 
+test('首页一键诊断先运行本地检查，用户单独点击才测试上游', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const homeMod = await import(pathToFileURL(path.join(tmp, 'views', 'home.js')).href);
+    installFakeDom();
+    const ctx = makeCtx(appMod, fixtureState());
+    const calls = [];
+    ctx.api.diagnoseHome = async () => ({
+      steps: [{ id: 'gateway', state: 'ok', detail: '本地探活通过' }, { id: 'picker', state: 'ok', detail: '模型可见' }],
+      routableModels: [{ slug: 'ch__m1', label: 'M1' }],
+    });
+    ctx.api.probeDiagnosticModel = async (slug) => { calls.push(slug); return { ok: true, latencyMs: 70 }; };
+    const root = new FakeNode('main');
+    homeMod.renderHome(root, ctx, new FakeNode('div'));
+    click(buttonsWithText(root, '一键诊断')[0]);
+    await flush();
+    const modal = ctx._calls.find(([name]) => name === 'openModal')[1];
+    assert.match(modal.allText(), /本地探活通过/);
+    assert.match(modal.allText(), /可能计费/);
+    assert.deepEqual(calls, []);
+    click(buttonsWithText(modal, '发送测试请求')[0]);
+    await flush();
+    assert.deepEqual(calls, ['ch__m1']);
+    assert.match(modal.allText(), /上游测试通过/);
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('主页打开请求详情时可复制无正文和凭据的结构化摘要', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const homeMod = await import(pathToFileURL(path.join(tmp, 'views', 'home.js')).href);
+    installFakeDom();
+    const row = { providerId: 'p_test', model: 'p_test__m1', requestId: 'req_test',
+      status: 502, at: Date.now(), final: true, ms: 1950, firstOutputMs: 340, speed: 37,
+      failureStage: 'upstream-stream', retryKind: 'transient', msg: '用户正文 sk-do-not-copy' };
+    const root = new FakeNode('main');
+    const ctx = makeCtx(appMod, fixtureState({ usage: [row] }));
+    let copied;
+    ctx.copyText = (text) => { copied = text; };
+    homeMod.renderHome(root, ctx, new FakeNode('div'));
+    click(findNodes(root, (n) => n.getAttribute?.('title') === '查看请求详情')[0]);
+    const modal = ctx._calls.find(([name]) => name === 'openModal')[1];
+    assert.match(modal.textContent, /首段输出等待/);
+    assert.match(modal.textContent, /上游流式输出/);
+    assert.match(modal.textContent, /上游瞬时错误/);
+    click(findNodes(modal, (n) => n.tagName === 'BUTTON' && n.textContent === '复制脱敏摘要')[0]);
+    assert.match(copied, /网关结果：记录码 502/);
+    assert.match(copied, /340\s*ms/);
+    assert.doesNotMatch(copied, /sk-do-not-copy|用户正文/);
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test('主页最近请求悬停状态码显示中文结果与可能原因', async () => {
   const tmp = copyRendererToTemp();
   try {
@@ -2521,6 +2585,17 @@ test('提供商页：测试连接 / 删除 / 保存 / 从 /models 拉取都能�
     assert.match(testModal.allText(), /12ms/, '成功结果应显示单模型延时');
     const probeToast = ctx._calls.find((c) => c[0] === 'toast' && String(c[2]).includes('模型测试：1/1 通过'));
     assert.ok(probeToast, '测试完成应给出模型通过数量');
+
+    const streamBox = byAttr(testModal, 'aria-label', '流式输出')[0];
+    assert.equal(streamBox.checked, false, '额外的测试项目默认关闭');
+    streamBox.checked = true;
+    for (const handle of streamBox.listeners.change || []) handle({ target: streamBox });
+    assert.match(testModal.allText(), /2 个固定测试请求，可能计费/);
+    click(buttonsWithText(testModal, '开始测试')[0]);
+    await flush();
+    assert.deepEqual(callsOf(ctx, 'testProviderModels').at(-1), [
+      'testProviderModels', { providerId: 'p_demo0001', modelIds: ['gpt-6.1-sol'], capabilities: ['text', 'stream'] },
+    ]);
 
     // --- 删除（弹窗二次确认）---
     click(byAttr(root, 'title', '删除该提供商')[0]);
