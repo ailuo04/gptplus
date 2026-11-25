@@ -60,17 +60,15 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
   var WRAP_ID = 'gptplus-voice-input-wrap';
   var STYLE_ID = 'gptplus-voice-input-style';
   var EXT_ATTR = 'data-gptplus-voice-input';
-  var RUNTIME_KEY = 'gptplus-voice-input-v21';
+  var RUNTIME_KEY = 'gptplus-voice-input-v22';
   var MAX_RECORD_MS = 120000;
   var MAX_STREAM_MS = 600000;
   var PCM_CHUNK = 2048;
   var PCM_RATE = 16000;
   var OUTBOX_LIMIT = 240;
   var PTT_HOLD_MS = Math.min(5000, Math.max(300, Math.round((Number(spaceHoldMs) || 1000) / 100) * 100));
-  var PTT_HOLD_LABEL = String(PTT_HOLD_MS / 1000).replace(/\.0$/, '');
   var PTT_HOTKEY = hotkey && typeof hotkey === 'object' ? hotkey : { code: 'Alt', ctrl: false, shift: false, alt: false };
   var PTT_HOTKEY_CODE = String(PTT_HOTKEY.code || 'Space');
-  var PTT_HOTKEY_LABEL = PTT_HOTKEY_CODE === 'Alt' ? ((PTT_HOTKEY.ctrl ? 'Ctrl+' : '') + (PTT_HOTKEY.shift ? 'Shift+' : '') + 'Alt') : (PTT_HOTKEY.ctrl ? 'Ctrl+' : '') + (PTT_HOTKEY.shift ? 'Shift+' : '') + (PTT_HOTKEY.alt ? 'Alt+' : '') + (PTT_HOTKEY_CODE === 'Space' ? 'Space' : /^[A-Z]/.test(PTT_HOTKEY_CODE) ? PTT_HOTKEY_CODE.replace(/^(?:Key|Digit)/, '') : PTT_HOTKEY_CODE);
   var state = {
     wrap: null,
     button: null,
@@ -136,10 +134,11 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
 
   function text() {
     var zh = isZh();
+    var idleLabel = zh ? '点击麦克风开始录音' : 'Click to start recording';
+    if (LOOPBACK) idleLabel = zh ? '单击转写系统声音' : 'Click to transcribe system audio';
+    if (ENGINE === 'system') idleLabel = zh ? 'Windows 系统听写' : 'Windows dictation';
     return {
-      idle: ENGINE === 'system' ? (zh ? 'Windows 系统听写' : 'Windows dictation') : zh
-        ? '点击麦克风开始，再点麦克风或输入框空白处结束；也可长按 ' + PTT_HOTKEY_LABEL + ' 或输入框空白处 ' + PTT_HOLD_LABEL + ' 秒口述'
-        : 'Click to dictate. Click again or click an empty area in the composer to finish. Or hold ' + PTT_HOTKEY_LABEL + ' or the mouse in the composer for ' + PTT_HOLD_LABEL + 's',
+      idle: idleLabel,
       requesting: zh ? '请允许使用麦克风…' : 'Allow microphone access…',
       loopbackRequesting: zh ? '正在连接系统音频…' : 'Connecting to system audio…',
       preparing: zh ? '正在准备本地识别' : 'Preparing local speech',

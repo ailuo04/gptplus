@@ -23,7 +23,6 @@ test('voice input: 注入脚本包含内联录音条、波形与本地 WAV 编�
   assert.match(script, /16000/);
   assert.match(script, /"local"/);
   assert.match(script, /PTT_HOLD_MS = Math\.min/);
-  assert.match(script, /PTT_HOLD_LABEL/);
   assert.match(script, /, 1800, true, false, \{\"code\":\"Alt\",\"ctrl\":false,\"shift\":false,\"alt\":false\}\)$/);
   assert.match(script, /onSpaceDown/);
   assert.match(script, /insertSpaceForHold/);
@@ -51,7 +50,7 @@ test('voice input: 回环开关只随本地流式引擎注入，且运行时自�
   assert.match(script, /loopback-start/);
   assert.match(script, /loopbackReady/);
   assert.match(script, /streamLevel/);
-  assert.match(script, /gptplus-voice-input-v21/);
+  assert.match(script, /gptplus-voice-input-v22/);
   assert.doesNotThrow(() => new Function('return ' + script));
   const provider = buildVoiceInputScript({ engine: 'provider', streaming: true, loopback: true });
   assert.match(provider, /, 1000, false, false, \{\"code\":\"Alt\",\"ctrl\":false,\"shift\":false,\"alt\":false\}\)$/);
@@ -606,7 +605,9 @@ test('voice input: 单击麦克风后短按输入框空白处收尾，排除拖�
   const runtime = await createVoiceRuntime({ engine: 'local' });
   const target = runtime.editor.parentElement;
   const pointer = (type, options) => runtime.pointer(type, { target, ...options });
-  runtime.click(runtime.findById('gptplus-voice-input'));
+  const button = runtime.findById('gptplus-voice-input');
+  assert.equal(button.title, '点击麦克风开始录音');
+  runtime.click(button);
   await runtime.flush();
   const { sessionId } = runtime.api.context();
   pointer('pointerdown'); pointer('pointermove', { clientX: 12 }); pointer('pointerup');
