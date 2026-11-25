@@ -272,7 +272,12 @@ function createSelectPicker(ctx, config = {}) {
       else openMenu();
       return;
     }
-    if (event.key === 'Escape') close();
+    if (event.key === 'Escape' && open) {
+      event.preventDefault();
+      event.stopPropagation();
+      close();
+    }
+    if (event.key === 'Tab') close();
     if (event.key === 'Home' && open) {
       event.preventDefault();
       updateActive(0);

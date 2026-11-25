@@ -1826,7 +1826,7 @@ test('首页一键诊断先运行本地检查，用户单独点击才测试上�
     const calls = [];
     ctx.api.diagnoseHome = async () => ({
       steps: [{ id: 'gateway', state: 'ok', detail: '本地探活通过' }, { id: 'picker', state: 'ok', detail: '模型可见' }],
-      routableModels: [{ slug: 'ch__m1', label: 'M1' }],
+      routableModels: [{ slug: 'ch__m1', label: 'M1' }, { slug: 'ch__m2', label: 'M2', providerName: '渠道 B' }],
     });
     ctx.api.probeDiagnosticModel = async (slug) => { calls.push(slug); return { ok: true, latencyMs: 70 }; };
     const root = new FakeNode('main');
@@ -1837,9 +1837,24 @@ test('首页一键诊断先运行本地检查，用户单独点击才测试上�
     assert.match(modal.allText(), /本地探活通过/);
     assert.match(modal.allText(), /可能计费/);
     assert.deepEqual(calls, []);
+    const trigger = byAttr(modal, 'role', 'combobox')[0];
+    assert.ok(trigger, '诊断弹窗使用应用主题选择器');
+    click(trigger);
+    assert.equal(trigger.getAttribute('aria-expanded'), 'true');
+    let escapeConsumed = false;
+    for (const handle of trigger.listeners.keydown) handle({ key: 'Escape', preventDefault() {}, stopPropagation() { escapeConsumed = true; } });
+    assert.equal(trigger.getAttribute('aria-expanded'), 'false');
+    assert.equal(escapeConsumed, true, 'Escape 先收起选择器，不关闭整个弹窗');
+    click(trigger);
+    const second = byAttr(modal, 'role', 'option')[1];
+    assert.match(second.textContent, /M2 · 渠道 B/);
+    click(second);
+    assert.equal(second.getAttribute('aria-selected'), 'true');
+    assert.equal(trigger.getAttribute('aria-expanded'), 'false');
+    assert.deepEqual(calls, []);
     click(buttonsWithText(modal, '发送测试请求')[0]);
     await flush();
-    assert.deepEqual(calls, ['ch__m1']);
+    assert.deepEqual(calls, ['ch__m2']);
     assert.match(modal.allText(), /上游测试通过/);
   } finally {
     delete globalThis.document;
@@ -2551,6 +2566,49 @@ test('重启 ChatGPT：确认后立即撤下红色警示，失败时才恢复', 
     assert.equal(appMod.state.relaunchNeeded, true, '重启失败后必须恢复待重启警示');
     assert.equal(isDanger(), true);
     assert.equal(button().disabled, false);
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+    delete globalThis.navigator;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('模型测试结果：按模型把失败置顶，独立显示项目与原因，完整错误可展开', async () => {
+  const tmp = copyRendererToTemp();
+  try {
+    const appMod = await import(pathToFileURL(path.join(tmp, 'app.js')).href);
+    const providersMod = await import(pathToFileURL(path.join(tmp, 'views', 'providers.js')).href);
+    installFakeDom();
+    const state = fixtureState();
+    const provider = state.providers[0];
+    const [first, second] = provider.models;
+    const ctx = makeCtx(appMod, state);
+    const fullError = 'input_image image_url ' + '有待核对的原始错误 '.repeat(20);
+    ctx.api.testProviderModels = async () => ({ ok: false, results: [
+      { modelId: first.id, capability: 'text', ok: true, status: 200, latencyMs: 11 },
+      { modelId: first.id, capability: 'image', ok: false, status: 400, error: fullError, latencyMs: 700 },
+      { modelId: second.id, capability: 'tools', ok: false, error: '连接被重置（ECONNRESET）', latencyMs: 21 },
+      { modelId: first.id, capability: 'stream', ok: false, error: '请求超时（10 秒）', latencyMs: 10000 },
+    ] });
+    const root = new FakeNode('main');
+    providersMod.renderProviders(root, ctx, new FakeNode('div'));
+    click(buttonsWithText(root, '测试连接')[0]);
+    const modal = callsOf(ctx, 'openModal')[0][1];
+    click(buttonsWithText(modal, '开始测试')[0]);
+    await flush();
+    const resultBox = findNodes(modal, n => String(n.className || '').split(/\s+/).includes('model-test-results'))[0];
+    assert.match(resultBox.children[0].allText(), /3 项失败.*1 项通过/);
+    const disclosures = findNodes(resultBox, n => n.tagName === 'DETAILS');
+    assert.equal(disclosures.length, 4);
+    assert.deepEqual(disclosures.slice(0, 3).map(n => n.children[0].allText()), [
+      '图片输入上游拒绝请求 · HTTP 400', '流式输出请求超时', '工具调用连接被重置',
+    ]);
+    assert.match(disclosures[0].parentNode.allText(), new RegExp(first.label));
+    assert.match(disclosures[2].parentNode.allText(), new RegExp(second.label));
+    assert.equal(disclosures[0].allText().includes(fullError.trim()), true);
+    assert.match(disclosures[3].children[0].allText(), /1 项通过/);
+    assert.equal(disclosures[3].getAttribute('open'), null);
   } finally {
     delete globalThis.document;
     delete globalThis.window;

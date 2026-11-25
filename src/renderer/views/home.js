@@ -1,4 +1,5 @@
 import { requestStatusDetails, requestStatusHint } from '../request-status.js';
+import { createSelectPicker } from '../app.js';
 
 // 主页：把「提供商 → 本地网关 → ChatGPT 客户端」这条接线放在首屏，
 // 下面接着是最近请求、今日流量、提供商清单和常用入口。所有数据都来自已有状态快照。
@@ -386,23 +387,29 @@ function openHomeDiagnosis(ctx) {
       }));
       if (!report.routableModels?.length) return;
       const choices = report.routableModels;
-      const picker = el('select', { class: 'input', value: choices[0].slug, attrs: { 'aria-label': '选择上游测试模型' } }, choices.map((model) =>
-        el('option', { value: model.slug, text: model.providerName ? model.label + ' · ' + model.providerName : model.label || model.slug })));
+      let selectedSlug = choices[0].slug;
+      const picker = createSelectPicker(ctx, {
+        className: 'home-diagnostic-model-picker', ariaLabel: '选择上游测试模型', value: selectedSlug,
+        options: choices.map((model) => ({
+          value: model.slug, label: [model.label || model.slug, model.providerName].filter(Boolean).join(' · '),
+        })),
+        onChange: (value) => { selectedSlug = value; },
+      });
       const message = el('div', { class: 'hint', attrs: { role: 'status' } });
       const button = el('button', { class: 'btn btn-sm', type: 'button', on: { click: async () => {
-        if (button.disabled || !picker.value) return;
-        button.disabled = picker.disabled = true;
+        if (button.disabled || !selectedSlug) return;
+        button.disabled = picker.inert = true;
         message.textContent = '正在通过本地网关发送测试…';
         try {
-          const result = await ctx.api.probeDiagnosticModel(picker.value);
+          const result = await ctx.api.probeDiagnosticModel(selectedSlug);
           message.textContent = result.ok ? '上游测试通过 · ' + fmt.dur(result.latencyMs) : result.error || '上游测试未通过。';
         } catch { message.textContent = '无法运行上游测试。'; }
-        finally { button.disabled = picker.disabled = false; }
+        finally { button.disabled = picker.inert = false; }
       } } }, ['发送测试请求']);
       tests.replaceChildren(el('div', { class: 'home-diagnostic-step' }, [
         el('strong', { text: '上游测试（可选）' }),
         el('div', { class: 'hint', text: '只发送一条固定测试提示，不发送对话内容；可能计费。' }),
-        el('div', { class: 'home-diagnostic-heading' }, [picker, button]), message,
+        el('div', { class: 'home-diagnostic-test-controls' }, [picker, button]), message,
       ]));
     } catch { progress.textContent = '无法完成诊断，请先在设置页检查本地网关。'; }
   }

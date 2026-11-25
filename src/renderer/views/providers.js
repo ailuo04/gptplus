@@ -924,6 +924,20 @@ async function openImportDialog(ctx, initialFiles = null) {
 
 const MODEL_TEST_CAPABILITIES = { text: '基础文本', stream: '流式输出', tools: '工具调用', image: '图片输入' };
 
+function modelTestFailureReason({ status, error }) {
+  const raw = String(error || '');
+  if (/ECONNRESET|连接被重置/i.test(raw)) return '连接被重置';
+  if (/超时|timed?\s*out/i.test(raw)) return '请求超时';
+  if (/ENOTFOUND|EAI_AGAIN|域名解析失败/i.test(raw)) return '域名解析失败';
+  if (/ECONNREFUSED|无法连接上游/i.test(raw)) return '无法连接上游';
+  const code = Number(status);
+  const reason = ({ 401: '鉴权失败', 403: '访问被拒绝', 404: '接口或模型未找到', 429: '请求受限' })[code];
+  if (code >= 400 && code < 600) return (reason || (code >= 500 ? '上游服务出错' : '上游拒绝请求')) + ' · HTTP ' + code;
+  if (code >= 200 && code < 300) return '响应未通过检查 · HTTP ' + code;
+  return code >= 300 ? '响应异常 · HTTP ' + code : '测试未通过';
+}
+
+
 function probeResult(ctx, p, probe) {
   const { el, icon, fmt } = ctx;
   if (Array.isArray(probe.modelResults)) {
@@ -1011,6 +1025,7 @@ function openModelTestDialog(ctx, p) {
   const capabilities = new Set(['text']);
   let running = false;
   let results = [];
+  let runError = '';
 
   const selectedText = el('span', { class: 'model-test-selected-count' });
   const modelList = el('div', { class: 'model-test-list' });
@@ -1075,21 +1090,59 @@ function openModelTestDialog(ctx, p) {
       resultBox.replaceChildren(el('div', { class: 'model-test-empty', text: '正在逐个发送最小生成请求，请稍候…' }));
       return;
     }
+    if (runError && !results.length) {
+      resultBox.replaceChildren(el('div', { class: 'model-test-empty model-test-run-error', text: runError, attrs: { role: 'alert' } }));
+      return;
+    }
     if (!results.length) {
       resultBox.replaceChildren(el('div', { class: 'model-test-empty', text: '测试结果会显示在这里；每个模型都会单独统计延时。' }));
       return;
     }
-    resultBox.replaceChildren(...results.map((result) => {
-      const model = models.find((item) => item.id === result.modelId);
-      return el('div', { class: 'model-test-result ' + (result.ok ? 'is-ok' : 'is-error') }, [
-        el('span', { class: 'model-test-result-icon' }, [icon(result.ok ? 'check' : 'alert', 13)]),
-        el('span', { class: 'model-test-result-name', text: (model?.label || result.modelId) + (result.capability ? ` · ${MODEL_TEST_CAPABILITIES[result.capability]}` : '') }),
-        el('span', { class: 'model-test-result-id mono', text: result.modelId }),
-        el('span', { class: 'model-test-result-status', text: result.ok ? `通过 · HTTP ${result.status ?? 200}` : `失败${result.status ? ` · HTTP ${result.status}` : ''}` }),
+    const failedByModel = new Map();
+    const passed = [];
+    for (const result of results) {
+      if (result.ok) passed.push(result);
+      else {
+        if (!failedByModel.has(result.modelId)) failedByModel.set(result.modelId, []);
+        failedByModel.get(result.modelId).push(result);
+      }
+    }
+    const failedCount = results.length - passed.length;
+    const modelName = (id) => models.find((item) => item.id === id)?.label || id;
+    const capabilityName = (result) => MODEL_TEST_CAPABILITIES[result.capability] ||
+      (!result.capability && capabilities.size === 1 ? MODEL_TEST_CAPABILITIES[[...capabilities][0]] : '测试请求');
+    const failureGroups = [...failedByModel.entries()].map(([id, group]) => el('section', {
+      class: 'model-test-failure-group', attrs: { 'aria-label': modelName(id) + '的失败项目' },
+    }, [
+      el('h3', { class: 'model-test-failure-heading' }, [el('span', { text: modelName(id) }),
+        el('span', { class: 'hint', text: group.length + ' 项失败' })]),
+      ...group.map((result) => el('details', { class: 'model-test-failure' }, [
+        el('summary', { class: 'model-test-disclosure' }, [icon('alert', 14),
+          el('strong', { class: 'model-test-capability', text: capabilityName(result) }),
+          el('span', { class: 'model-test-failure-reason', text: modelTestFailureReason(result) }),
+          icon('chevronDown', 13)]),
+        el('div', { class: 'model-test-failure-detail' }, [
+          el('div', { text: result.error || '上游未提供错误详情。' }),
+          el('div', { class: 'model-test-result-id hint', text: id + (result.latencyMs > 0 ? ' · ' + fmt.dur(result.latencyMs) : '') }),
+        ]),
+      ])),
+    ]));
+    const successes = !passed.length ? null : el('details', { class: 'model-test-successes', attrs: { open: failedCount === 0 } }, [
+      el('summary', { class: 'model-test-disclosure', text: '查看 ' + passed.length + ' 项通过结果' }),
+      ...passed.map((result) => el('div', { class: 'model-test-result' }, [
+        el('span', { class: 'model-test-result-name', text: modelName(result.modelId) }),
+        el('span', { class: 'model-test-capability', text: capabilityName(result) }),
+        el('span', { class: 'model-test-result-status', text: result.status ? '通过 · HTTP ' + result.status : '通过' }),
         el('span', { class: 'model-test-result-latency mono', text: fmt.dur(result.latencyMs) }),
-        result.ok ? null : el('span', { class: 'model-test-result-error', title: result.error || '', text: result.error || '未知错误' }),
-      ]);
-    }));
+      ])),
+    ]);
+    resultBox.replaceChildren(
+      el('div', { class: 'model-test-result-summary', attrs: { role: 'status' } }, [
+        el('span', { class: 'model-test-count-failed' + (failedCount ? ' has-failures' : ''), text: failedCount + ' 项失败' }),
+        el('span', { class: 'model-test-count-passed', text: passed.length + ' 项通过' }),
+      ]),
+      ...failureGroups, ...(successes ? [successes] : []),
+    );
   }
 
   async function runModelTest() {
@@ -1100,6 +1153,7 @@ function openModelTestDialog(ctx, p) {
     }
     running = true;
     results = [];
+    runError = '';
     updateControls();
     renderResults();
     try {
@@ -1111,6 +1165,7 @@ function openModelTestDialog(ctx, p) {
         }),
       });
       results = Array.isArray(response?.results) ? response.results : [];
+      if (!results.length) runError = response?.error || '未收到测试结果，请重试。';
       viewState.probe[p.id] = {
         ok: !!response?.ok,
         modelResults: results,
@@ -1123,13 +1178,14 @@ function openModelTestDialog(ctx, p) {
       ctx.renderCurrent(true);
     } catch (err) {
       const error = ctx.describeError(err);
-      results = [...selected].map((modelId) => ({ modelId, ok: false, latencyMs: 0, error }));
+      runError = error || '模型测试未能完成。';
       viewState.probe[p.id] = { ok: false, modelResults: results, at: Date.now() };
       ctx.toastError(err, '模型测试失败');
     } finally {
       running = false;
       updateControls();
       renderResults();
+      resultBox.scrollIntoView?.({ block: 'start' });
     }
   }
 
