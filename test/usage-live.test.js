@@ -122,6 +122,64 @@ test('live usage reader rejects invalid ids and rollout paths outside session fo
   assert.equal(reader.read('thread_12345678').status, 'unavailable');
 });
 
+const cacheEvent = (second, input, cached, totals) => JSON.stringify({
+  type: 'event_msg', timestamp: new Date(Date.UTC(2026, 9, 29, 0, 0, second)).toISOString(),
+  payload: { type: 'token_count', info: {
+    last_token_usage: { input_tokens: input, cached_input_tokens: cached, output_tokens: 1 },
+    total_token_usage: totals,
+  } },
+});
+
+function cacheFixture(t, options) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gptplus-usage-live-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const sessions = path.join(home, 'sessions');
+  fs.mkdirSync(sessions);
+  return { sessions, reader: createUsageLiveReader({ codexHome: home, ...options }) };
+}
+
+test('session cache totals cover the full rollout and count only new complete records', (t) => {
+  const { sessions, reader } = cacheFixture(t);
+  const id = 'thread_cache_history';
+  const file = path.join(sessions, id + '.jsonl');
+  const totals = { input_tokens: 100, cached_input_tokens: 90, output_tokens: 1 };
+  fs.writeFileSync(file, [cacheEvent(0, 100, 90, totals),
+    cacheEvent(1, 100, 90, totals), // An unchanged usage snapshot with a new timestamp.
+    JSON.stringify({ type: 'response_item', payload: { text: 'x'.repeat(600 * 1024) } }),
+    ...Array.from({ length: 25 }, (_, i) => cacheEvent(i + 2, 10, 0)),
+    cacheEvent(27, 500, undefined), cacheEvent(28, 500, null), cacheEvent(29, 10, 11),
+  ].join('\n') + '\n');
+  assert.equal(reader.read(id).events.length, 24);
+  assert.deepEqual(reader.read(id).cacheTotals, { inputTokens: 350, cachedInputTokens: 90 });
+
+  const next = cacheEvent(30, 50, 30);
+  fs.appendFileSync(file, next.slice(0, 40));
+  assert.deepEqual(reader.read(id).cacheTotals, { inputTokens: 350, cachedInputTokens: 90 });
+  fs.appendFileSync(file, next.slice(40) + '\n');
+  assert.deepEqual(reader.read(id).cacheTotals, { inputTokens: 400, cachedInputTokens: 120 });
+  assert.deepEqual(reader.read(id).cacheTotals, { inputTokens: 400, cachedInputTokens: 120 });
+
+  fs.writeFileSync(file, cacheEvent(31, 20, 10));
+  assert.deepEqual(reader.read(id).cacheTotals, { inputTokens: 20, cachedInputTokens: 10 });
+  fs.appendFileSync(file, '\n' + cacheEvent(32, 40, 10) + '\n');
+  assert.deepEqual(reader.read(id).cacheTotals, { inputTokens: 60, cachedInputTokens: 20 });
+});
+
+test('session cache totals combine continuation files without counting copied history twice', (t) => {
+  const { sessions, reader } = cacheFixture(t, { resolutionTtlMs: 0 });
+  const id = 'thread_cache_resume';
+  const otherId = 'thread_cache_other';
+  const copied = cacheEvent(2, 20, 0);
+  fs.writeFileSync(path.join(sessions, id + '.jsonl'), [cacheEvent(1, 100, 80), copied].join('\n') + '\n');
+  fs.writeFileSync(path.join(sessions, otherId + '.jsonl'), cacheEvent(3, 500, 300) + '\n');
+  assert.deepEqual(reader.read(id).cacheTotals, { inputTokens: 120, cachedInputTokens: 80 });
+
+  fs.writeFileSync(path.join(sessions, 'rollout-' + id + '.jsonl'), [copied, cacheEvent(4, 30, 20)].join('\n') + '\n');
+  assert.deepEqual(reader.read(id).cacheTotals, { inputTokens: 150, cachedInputTokens: 100 });
+  assert.deepEqual(reader.read(otherId).cacheTotals, { inputTokens: 500, cachedInputTokens: 300 });
+  assert.deepEqual(reader.read(id).cacheTotals, { inputTokens: 150, cachedInputTokens: 100 });
+});
+
 test('usage event derives total Tokens when the rollout omits total_tokens', () => {
   const event = usageEvent({
     type: 'event_msg',
@@ -153,9 +211,9 @@ test('usage statusline script retains the composer placement, icons, and valid s
   assert.match(script, /__gptplusUsageStatusline/);
   assert.match(script, /READY_WAIT_MS = 2000/);
   assert.match(script, /SYNC_INTERVAL_MS = 1000/);
-  assert.match(script, /gptplus-usage-statusline-v12/);
+  assert.match(script, /gptplus-usage-statusline-v13/);
   assert.match(script, /request\.speed/);
-  assert.match(script, /function apply\(id, events, request\)/);
+  assert.match(script, /function apply\(id, events, request, cacheTotals\)/);
   assert.match(script, /requestTime >= latestTime - 15000/);
   assert.match(script, /opacity:1!important/);
   assert.match(script, /color:var\(--color-token-text-primary,#000\)!important/);
@@ -411,25 +469,24 @@ test('resumeUsageStatusline reattaches to a running ChatGPT and skips when absen
 });
 
 
-test('statusline delivers fresh request usage before reading the rollout tail', async () => {
+test('statusline delivers fresh request usage first and then sends session cache totals', async () => {
   const order = [];
   const bridge = startUsageStatuslineBridge({
     cdpPort: 9337,
     requestSpeed: () => ({ at: 1000, speed: 42.36, speedAvailable: true }),
-    read: () => { order.push('rollout'); return { status: 'ok', events: [] }; },
+    read: () => { order.push('rollout'); return { status: 'ok', events: [], cacheTotals: { inputTokens: 750, cachedInputTokens: 400 } }; },
     listTargetsImpl: async () => [{ id: 'fast-page', type: 'page', title: 'Codex', url: 'app://-/index.html' }],
     evaluateImpl: async (_page, expression) => {
       if (expression.includes('context?.()')) return { id: 'thread_fast_1234', hidden: false };
-      order.push('apply');
+      order.push(expression.includes('"cachedInputTokens":400') ? 'session totals' : 'apply');
       return true;
     },
     visibleIntervalMs: 5000,
   });
   try {
     const deadline = Date.now() + 1000;
-    while (!order.includes('rollout') && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
-    assert.equal(order.includes('rollout'), true);
-    assert.equal(order[0], 'apply', 'fresh speed must not wait for rollout scanning/parsing');
+    while (order.length < 3 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.deepEqual(order, ['apply', 'rollout', 'session totals']);
   } finally { bridge.stop(); }
 });
 
@@ -444,7 +501,8 @@ test('injected statusline renders one decimal immediately when usage is applied'
     remove() { this.isConnected = false; }
   }
   const anchor = { insertAdjacentElement(_position, node) { node.isConnected = true; node.previousElementSibling = anchor; } };
-  const composerRoot = { querySelector: () => ({ getAttribute: () => 'thread_render_1234' }), getAttribute: () => 'thread' };
+  let thread = 'thread_render_1234';
+  const composerRoot = { querySelector: () => ({ getAttribute: () => thread }), getAttribute: () => 'thread' };
   const card = {
     isConnected: true, parentElement: anchor, getBoundingClientRect: () => ({ width: 600 }),
     closest: selector => selector.includes('data-codex-composer-root') ? composerRoot : null,
@@ -474,6 +532,18 @@ test('injected statusline renders one decimal immediately when usage is applied'
   assert.equal(speedValue.textContent, '42.0 tok/s');
   api.apply('thread_render_1234', [], { at: Date.now(), speed: null, speedAvailable: false });
   assert.equal(speedValue.textContent, '-- tok/s');
+  const cacheValue = status.children.find((node) => node.dataset.usage === 'cache').children[1];
+  api.apply(thread, [], null, { inputTokens: 400, cachedInputTokens: 230 });
+  assert.equal(cacheValue.textContent, '缓存命中 57.5%');
+  assert.match(status.title, /本会话累计缓存命中/);
+  thread = 'thread_render_5678';
+  api.context();
+  assert.equal(cacheValue.textContent, '缓存命中 --');
+  api.apply(thread, [], null, { inputTokens: 100, cachedInputTokens: 0 });
+  assert.equal(cacheValue.textContent, '缓存命中 0.0%');
+  thread = 'thread_render_1234';
+  api.context();
+  assert.equal(cacheValue.textContent, '缓存命中 57.5%');
   assert.equal(api.applyBalance({ providerId: 'p_a', balance: '443.48', totalUsed: '79.07', delta: '0.12349', deltaKind: 'cumulative', currency: 'USD', at: Date.now(), ok: true }), true);
   const balanceItem = status.children.find((node) => node.dataset.usage === 'balance');
   api.context();

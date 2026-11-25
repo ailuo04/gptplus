@@ -20,7 +20,7 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics, balance } = {}) {
   const EXT_ATTR = "data-gptplus-usage-statusline";
   const CIRCUMFERENCE = 37.7;
   const SYNC_INTERVAL_MS = 1000;
-  const runtimeKey = "gptplus-usage-statusline-v12";
+  const runtimeKey = "gptplus-usage-statusline-v13";
   const STYLE_TEXT = ${JSON.stringify(buildUsageStatuslineStyle())};
   const computeUsageSnapshot = ${computeUsageSnapshot.toString()};
   const formatTokenRate = ${formatTokenRate.toString()};
@@ -286,7 +286,7 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics, balance } = {}) {
     node.dataset.hidden = String(Object.keys(parts).length === 0);
     const details = [];
     if (parts.speed) details.push("首包后生成速度 " + speed + " tok/s" + (value?.speedEstimated ? "（估算）" : ""));
-    if (parts.cache) details.push("缓存命中 " + cache + (value?.cacheEstimated ? "（估算）" : ""));
+    if (parts.cache) details.push("本会话累计缓存命中 " + cache + (value?.cacheEstimated ? "（估算）" : ""));
     if (parts.context) details.push("上下文占用 " + context + (value?.contextEstimated ? "（估算）" : ""));
     if (parts.context && value?.window > 0) details.push("窗口 " + value.window);
     node.title = details.join(" · ");
@@ -308,17 +308,17 @@ function buildUsageStatuslineScript({ readyWaitMs, metrics, balance } = {}) {
     state.threadId = id;
     ensureNode(card);
     const cached = state.cache.get(id);
-    render(computeUsageSnapshot(cached?.events, cached?.request));
+    render(computeUsageSnapshot(cached?.events, cached?.request, Date.now(), cached?.cacheTotals));
     if (state.parts?.delta?.dataset.hidden === "false") positionBalanceDelta();
     return { id, changed: id !== previous };
   }
 
-  function apply(id, events, request) {
+  function apply(id, events, request, cacheTotals) {
     if (state.disposed) return false;
     const key = String(id || "").trim();
     if (!key) return false;
     const previous = state.cache.get(key);
-    const merged = mergeUsageCacheEntry(previous, events, request);
+    const merged = mergeUsageCacheEntry(previous, events, request, cacheTotals);
     if (!merged) return false;
     state.cache.set(key, merged);
     while (state.cache.size > 32) state.cache.delete(state.cache.keys().next().value);

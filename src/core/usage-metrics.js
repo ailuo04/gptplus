@@ -8,10 +8,10 @@ function formatTokenRate(value) {
 }
 
 /**
- * 状态栏只展示最近一次完整请求的数据。该函数同时被打包进 ChatGPT 页面脚本，
+ * 速度和上下文展示最近一次请求，缓存展示当前会话累计值。该函数也被打包进 ChatGPT 页面脚本，
  * 因此必须保持自包含，不能引用模块级变量或 Node API。
  */
-function computeUsageSnapshot(events, request, now = Date.now()) {
+function computeUsageSnapshot(events, request, now = Date.now(), cacheTotals) {
   const list = Array.isArray(events) ? events.filter((event) => event && typeof event === 'object') : [];
   const latest = list.length ? list[list.length - 1] : null;
   const value = (input) => {
@@ -48,24 +48,51 @@ function computeUsageSnapshot(events, request, now = Date.now()) {
   const speedEstimated = false;
 
   const latestInput = latest ? value(latest.input_tokens) : null;
-  const latestCached = latest ? value(latest.cached_input_tokens) : null;
-  const requestInput = matched ? value(request && request.inputTokens) : null;
-  const requestCached = matched ? value(request && request.cachedInputTokens) : null;
-  let cache = null;
+  const rolloutCache = (event) => {
+    const input = value(event?.input_tokens);
+    const cached = value(event?.cached_input_tokens);
+    const available = event?.cache_usage_available;
+    return input > 0 && cached !== null && cached <= input && (available === true || (available !== false && cached > 0))
+      ? { input, cached, estimated: available !== true } : null;
+  };
+  let cacheInput = value(cacheTotals?.inputTokens) ?? 0;
+  let cacheHits = value(cacheTotals?.cachedInputTokens) ?? 0;
   let cacheEstimated = false;
-  if (matched && request && request.cacheUsageAvailable !== false) {
-    const cacheWrite = request.cacheWriteTokens === undefined ? 0 : value(request.cacheWriteTokens);
-    if (requestInput > 0 && requestCached !== null && cacheWrite !== null && requestCached + cacheWrite <= requestInput) {
-      cache = percent(requestCached, requestInput);
-      cacheEstimated = request.cacheUsageAvailable !== true || request.estimatedUsage === true;
-    }
-  } else if (!matched && latest?.cache_usage_available !== false) {
-    const available = latest?.cache_usage_available === true || (latestCached || 0) > 0;
-    if (latestInput > 0 && latestCached !== null && latestCached <= latestInput && available) {
-      cache = percent(latestCached, latestInput);
-      cacheEstimated = latest?.cache_usage_available !== true;
+  if (!cacheTotals) {
+    for (const event of list) {
+      const sample = rolloutCache(event);
+      if (!sample) continue;
+      cacheInput += sample.input;
+      cacheHits += sample.cached;
+      if (event !== latest) cacheEstimated ||= sample.estimated;
     }
   }
+  const latestSample = rolloutCache(latest);
+  const requestInput = value(request?.inputTokens);
+  const requestCached = value(request?.cachedInputTokens);
+  const cacheWrite = request?.cacheWriteTokens === undefined ? 0 : value(request.cacheWriteTokens);
+  const requestDuration = value(request?.ms);
+  const sameCompletion = matched && latest && requestInput === latestInput
+    && value(request?.outputTokens) === value(latest.output_tokens)
+    && (requestDuration === null || !(latestTime < requestTime - requestDuration))
+    && (!Number.isFinite(requestTime) || !Number.isFinite(latestTime) || Math.abs(requestTime - latestTime) <= 15000);
+
+  // The gateway can arrive before rollout is written. If both describe the
+  // same completion, replace its rollout contribution rather than adding it.
+  if (matched && request) {
+    if (sameCompletion && latestSample) {
+      cacheInput -= latestSample.input;
+      cacheHits -= latestSample.cached;
+    }
+    if (request.cacheUsageAvailable !== false && requestInput > 0 && requestCached !== null
+      && cacheWrite !== null && requestCached + cacheWrite <= requestInput) {
+      cacheInput += requestInput;
+      cacheHits += requestCached;
+      cacheEstimated ||= request.cacheUsageAvailable !== true || request.estimatedUsage === true;
+    }
+  }
+  if (!cacheTotals && !sameCompletion) cacheEstimated ||= latestSample?.estimated === true;
+  const cache = cacheInput > 0 && cacheHits >= 0 && cacheHits <= cacheInput ? cacheHits * 100 / cacheInput : null;
 
   const latestOutput = latest ? value(latest.output_tokens) : null;
   const requestTotal = matched ? value(request && request.totalTokens) : null;
@@ -107,13 +134,15 @@ function buildUsageStatuslineStyle() {
     + `html[data-theme="light"] #${id},html[data-theme="light"] #${id} *{color:#000!important}`;
 }
 
-function mergeUsageCacheEntry(previous, events, request) {
+function mergeUsageCacheEntry(previous, events, request, cacheTotals) {
   const hasEvents = Array.isArray(events);
   const hasRequest = request && typeof request === 'object';
-  if (!hasEvents && !hasRequest && !(previous?.events || []).length) return null;
+  const totals = hasEvents ? cacheTotals : cacheTotals ?? previous?.cacheTotals;
+  if (!hasEvents && !hasRequest && !totals && !(previous?.events || []).length) return null;
   return {
     events: hasEvents ? events.slice(-24) : (previous?.events || []),
     request: hasRequest ? request : null,
+    cacheTotals: totals,
   };
 }
 

@@ -37,8 +37,8 @@ function buildScriptSources(metrics, balance) {
   };
 }
 
-function applyExpression(id, events, request) {
-  return `globalThis.__gptplusUsageStatusline?.apply?.(${JSON.stringify(String(id))}, ${JSON.stringify(events)}, ${JSON.stringify(request || null)})`;
+function applyExpression(id, events, request, cacheTotals) {
+  return `globalThis.__gptplusUsageStatusline?.apply?.(${JSON.stringify(String(id))}, ${JSON.stringify(events)}, ${JSON.stringify(request || null)}, ${JSON.stringify(cacheTotals || null)})`;
 }
 
 async function ensurePageScript(page, scripts, prepared) {
@@ -251,7 +251,7 @@ function startUsageStatuslineBridge({
               reportError('本机会话用量读取失败，先推送网关请求数据', error);
             }
             if (snapshot?.status === 'ok' && Array.isArray(snapshot.events)) {
-              await evaluateImpl(target, applyExpression(value.id, snapshot.events, request || snapshot.request), { timeoutMs: COMMAND_TIMEOUT_MS });
+              await evaluateImpl(target, applyExpression(value.id, snapshot.events, request || snapshot.request, snapshot.cacheTotals), { timeoutMs: COMMAND_TIMEOUT_MS });
             } else if (request) {
               // 网关请求已经完成时不等 rollout 落盘：先推送速度、缓存和请求总量，
               // 等 token_count 到达后再补充上下文窗口与最新事件。

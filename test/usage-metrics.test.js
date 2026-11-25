@@ -11,7 +11,7 @@ test('token rate is displayed with one decimal place without rounding the measur
   assert.equal(formatTokenRate(0.04), '0.0');
 });
 
-test('usage snapshot uses the latest request instead of mixing a whole turn', () => {
+test('usage snapshot uses session cache totals but keeps the latest speed and context', () => {
   const t = '2026-10-29T02:00:00.000Z';
   const events = [
     { t: '2026-10-29T01:59:58.000Z', turn_id: 'turn_1', turn_output_tokens: 10, input_tokens: 100, cached_input_tokens: 80, output_tokens: 10, total_tokens: 110, context_window: 1000 },
@@ -28,9 +28,9 @@ test('usage snapshot uses the latest request instead of mixing a whole turn', ()
     estimatedUsage: false,
   };
 
-  const value = computeUsageSnapshot(events, request, Date.parse(t) + 1000);
+  const value = computeUsageSnapshot(events, request, Date.parse(t) + 1000, { inputTokens: 400, cachedInputTokens: 230 });
   assert.equal(value.speed, 42);
-  assert.equal(value.cache, 50);
+  assert.equal(value.cache, 57.5, 'the gateway snapshot must not count a request already present in rollout twice');
   assert.equal(value.context, 32);
   assert.equal(value.window, 1000);
   assert.equal(value.speedEstimated, false);
@@ -38,19 +38,19 @@ test('usage snapshot uses the latest request instead of mixing a whole turn', ()
   assert.equal(value.contextEstimated, false);
 });
 
-test('usage snapshot keeps unavailable cache data unavailable instead of reporting zero', () => {
+test('an unavailable latest gateway request does not erase earlier cache data', () => {
   const t = '2026-10-29T02:00:00.000Z';
   const events = [{
     t, turn_id: 'turn_1', turn_output_tokens: 20, input_tokens: 300,
-    cached_input_tokens: 0, output_tokens: 20, total_tokens: 320, context_window: 1000,
+    cached_input_tokens: 0, cache_usage_available: true, output_tokens: 20, total_tokens: 320, context_window: 1000,
   }];
   const request = {
     at: Date.parse(t), speed: 10, inputTokens: 300, cachedInputTokens: 0,
     outputTokens: 20, totalTokens: 320, cacheUsageAvailable: false,
   };
 
-  const value = computeUsageSnapshot(events, request, Date.parse(t) + 1000);
-  assert.equal(value.cache, null);
+  const value = computeUsageSnapshot(events, request, Date.parse(t) + 1000, { inputTokens: 400, cachedInputTokens: 40 });
+  assert.equal(value.cache, 40);
   assert.equal(value.context, 32);
 });
 
@@ -118,7 +118,7 @@ test('an explicitly unavailable request speed does not fall back to rollout esti
   assert.equal(value.speed, null, '明确不可用的网关速度不能回退到误导性的估算值');
 });
 
-test('a newly completed request is shown before its rollout event is written', () => {
+test('a new gateway request is added to history before its rollout event is written', () => {
   const stale = '2026-10-29T02:00:00.000Z';
   const events = [{
     t: stale, turn_id: 'turn_1', turn_output_tokens: 10, input_tokens: 100,
@@ -134,10 +134,19 @@ test('a newly completed request is shown before its rollout event is written', (
     cacheUsageAvailable: true,
   };
 
-  const value = computeUsageSnapshot(events, request, Date.parse(stale) + 31000);
+  const value = computeUsageSnapshot(events, request, Date.parse(stale) + 31000, { inputTokens: 100, cachedInputTokens: 40 });
   assert.equal(value.speed, 25);
-  assert.equal(value.cache, 75);
+  assert.equal(value.cache, 68);
   assert.equal(value.context, 45);
+});
+
+test('a new gateway request with the same token counts does not replace a prior completion', () => {
+  const at = Date.parse('2026-10-29T02:00:00Z');
+  const events = [{ t: new Date(at - 3000).toISOString(), input_tokens: 100,
+    cached_input_tokens: 0, cache_usage_available: true, output_tokens: 10 }];
+  const request = { at, ms: 2000, inputTokens: 100, cachedInputTokens: 80, outputTokens: 10, cacheUsageAvailable: true };
+  const value = computeUsageSnapshot(events, request, at + 100, { inputTokens: 100, cachedInputTokens: 0 });
+  assert.equal(value.cache, 40);
 });
 
 test('usage statusline style never dims stale or empty state', () => {
@@ -150,12 +159,14 @@ test('usage statusline style never dims stale or empty state', () => {
 });
 
 test('request-only bridge updates preserve the last rollout events', () => {
-  const previous = { events: [{ t: '2026-10-29T02:00:00.000Z', input_tokens: 100 }], request: { speed: 10 } };
+  const cacheTotals = { inputTokens: 100, cachedInputTokens: 40 };
+  const previous = { cacheTotals, events: [{ t: '2026-10-29T02:00:00.000Z', input_tokens: 100 }], request: { speed: 10 } };
   const nextRequest = { speed: 25, at: Date.now() };
   const merged = mergeUsageCacheEntry(previous, null, nextRequest);
   assert.equal(merged.events.length, 1);
   assert.equal(merged.events[0].input_tokens, 100);
   assert.equal(merged.request, nextRequest);
+  assert.deepEqual(merged.cacheTotals, cacheTotals);
 
   const first = mergeUsageCacheEntry(undefined, null, nextRequest);
   assert.deepEqual(first.events, []);
