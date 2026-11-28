@@ -3191,3 +3191,25 @@ test('context: 重启后从磁盘回放日志环，使用量统计不再清零�
   assert.equal(JSON.parse(second.stdout).n, 2, '重复启动不会把历史越滚越多（无重复回放）');
 });
 
+test('千问实时识别：凭据加密落盘、重新加载可用，插件界面只拿到 hasKey', (t) => {
+  const dir = tmpDir('voice-qwen');
+  cleanup(t, dir);
+  const configPath = path.join(dir, 'config.json');
+  const secretStorage = createTestSecretStorage();
+  const manager = createPluginManager({ store: createStore({ configPath, secretStorage }) });
+  const realtime = { baseUrl: 'https://maas.qianwenaiapi.com/compatible-mode/v1', model: 'fun-asr-flash-8k-realtime', apiKey: 'example-key-never-in-json' };
+  const updated = manager.setConfig('voice-input', { engine: 'qwen-realtime', realtime });
+  assert.equal(updated.config.engine, 'qwen-realtime');
+  assert.equal(updated.config.realtime.hasKey, true);
+  assert.equal(updated.config.realtime.apiKey, undefined);
+  const bytes = fs.readFileSync(configPath, 'utf8');
+  assert.doesNotMatch(bytes, /example-key-never-in-json/);
+  assert.ok(JSON.parse(bytes).plugins['voice-input'].config.realtime.secret.ciphertext);
+  const reloaded = createPluginManager({ store: createStore({ configPath, secretStorage }) });
+  assert.deepEqual(reloaded.config('voice-input').realtime, realtime);
+  reloaded.setConfig('voice-input', { engine: 'qwen-realtime', realtime: { model: 'paraformer-realtime-v2' } });
+  realtime.model = 'paraformer-realtime-v2';
+  reloaded.setConfig('voice-input', { engine: 'local' });
+  assert.deepEqual(reloaded.config('voice-input').realtime, realtime);
+  assert.throws(() => createStore({ configPath }), /系统安全存储/);
+});

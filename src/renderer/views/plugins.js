@@ -363,13 +363,14 @@ function openVoiceConfig(ctx, plugin) {
     selectedProvider = String(providers[0].id || '');
   }
 
-  let selectedEngine = current.engine === 'provider' ? 'provider' : current.engine === 'system' ? 'system' : 'local';
+  let selectedEngine = ['provider', 'system', 'qwen-realtime'].includes(current.engine) ? current.engine : 'local';
   const enginePicker = createSelectPicker(ctx, {
     className: 'voice-engine-picker',
     value: selectedEngine,
     ariaLabel: '输入方式',
     options: [
       { value: 'local', label: '本地识别（SenseVoice 预览 + Qwen3-ASR 定稿，离线）' },
+      { value: 'qwen-realtime', label: '千问实时识别（边说边出字）' },
       { value: 'provider', label: '提供商音频转写' },
       { value: 'system', label: 'Windows 系统听写（会弹出 Win+H 浮层）' },
     ],
@@ -400,6 +401,19 @@ function openVoiceConfig(ctx, plugin) {
     value: String(current.model || 'whisper-1'),
     placeholder: 'whisper-1',
   });
+  const realtime = current.realtime || {};
+  const realtimeUrl = ctx.el('input', { class: 'input mono', type: 'text', value: realtime.baseUrl || 'https://maas.qianwenaiapi.com/compatible-mode/v1' });
+  const realtimeModels = ['fun-asr-flash-8k-realtime', 'paraformer-realtime-v2'];
+  const selectedRealtimeModel = realtimeModels.includes(realtime.model) ? realtime.model : realtimeModels[0];
+  const realtimeModel = ctx.el('select', { class: 'select mono', value: selectedRealtimeModel, attrs: { 'aria-label': '实时转写模型' } },
+    realtimeModels.map((id) => ctx.el('option', { value: id, text: id, selected: id === selectedRealtimeModel })));
+  const realtimeKey = ctx.el('input', { class: 'input', type: 'password', placeholder: realtime.hasKey ? '已保存，留空保持不变' : '填写千问 MaaS API Key', attrs: { 'aria-label': '千问 API Key', autocomplete: 'off' } });
+  const realtimeFields = ctx.el('div', { class: 'plugin-config-body' }, [
+    ctx.el('label', { class: 'field' }, [ctx.el('span', { class: 'label', text: '千问 API 地址' }), realtimeUrl]),
+    ctx.el('label', { class: 'field' }, [ctx.el('span', { class: 'label', text: '实时转写模型' }), realtimeModel]),
+    ctx.el('label', { class: 'field' }, [ctx.el('span', { class: 'label', text: '千问 API Key' }), realtimeKey]),
+    ctx.el('span', { class: 'hint', text: '录音时将麦克风音频流式发送到千问，Key 仅存于本机系统安全存储。调用按账号额度或价格计费。' }),
+  ]);
   let selectedHotkey = current.hotkey && typeof current.hotkey === 'object'
     ? { code: current.hotkey.code, ctrl: current.hotkey.ctrl === true, shift: current.hotkey.shift === true, alt: current.hotkey.alt === true }
     : { code: 'Alt', ctrl: false, shift: false, alt: false };
@@ -491,14 +505,16 @@ function openVoiceConfig(ctx, plugin) {
     const provider = selectedEngine === 'provider';
     const local = selectedEngine === 'local';
     const system = selectedEngine === 'system';
+    const qwen = selectedEngine === 'qwen-realtime';
+    realtimeFields.style.display = qwen ? '' : 'none';
     providerPickerButton.disabled = !provider || providers.length === 0;
     modelInput.disabled = !provider;
-    languagePickerButton.disabled = system;
+    languagePickerButton.disabled = system || qwen;
     spaceHoldInput.disabled = system;
     hotkeyCapture.disabled = system;
     resetHotkey.disabled = system;
     providerFields.style.display = provider ? '' : 'none';
-    languageField.style.display = system ? 'none' : '';
+    languageField.style.display = system || qwen ? 'none' : '';
     localHint.style.display = local ? '' : 'none';
     systemHint.style.display = system ? '' : 'none';
   };
@@ -516,6 +532,7 @@ function openVoiceConfig(ctx, plugin) {
   const languageSection = ctx.el('section', { class: 'voice-config-section', attrs: { 'aria-label': '识别设置' } }, [
     ctx.el('h3', { class: 'voice-config-section-title', text: '识别设置' }),
     providerFields,
+    realtimeFields,
     languageField,
   ]);
   syncDisabled();
@@ -546,6 +563,10 @@ function openVoiceConfig(ctx, plugin) {
           on: {
             click: () => {
               const engine = selectedEngine;
+              if (engine === 'qwen-realtime' && !realtime.hasKey && !String(realtimeKey.value || '').trim()) {
+                ctx.toast('请填写千问 API Key', 'warn');
+                return;
+              }
               if (engine === 'provider' && !selectedProvider) {
                 ctx.toast('请先选择支持音频转写的提供商', 'warn');
                 return;
@@ -557,6 +578,9 @@ function openVoiceConfig(ctx, plugin) {
               }
               const config = {
                 engine,
+                ...(engine === 'qwen-realtime' ? { realtime: {
+                  baseUrl: String(realtimeUrl.value || '').trim(), model: realtimeModel.value, apiKey: String(realtimeKey.value || '').trim(),
+                } } : {}),
                 providerId: engine === 'provider' ? String(selectedProvider || '') : String(current.providerId || ''),
                 model: String(modelInput.value || 'whisper-1').trim() || 'whisper-1',
                 language: String(selectedLanguage || ''),

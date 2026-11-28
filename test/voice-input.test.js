@@ -50,7 +50,7 @@ test('voice input: 回环开关只随本地流式引擎注入，且运行时自�
   assert.match(script, /loopback-start/);
   assert.match(script, /loopbackReady/);
   assert.match(script, /streamLevel/);
-  assert.match(script, /gptplus-voice-input-v22/);
+  assert.match(script, /gptplus-voice-input-v23/);
   assert.doesNotThrow(() => new Function('return ' + script));
   const provider = buildVoiceInputScript({ engine: 'provider', streaming: true, loopback: true });
   assert.match(provider, /, 1000, false, false, \{\"code\":\"Alt\",\"ctrl\":false,\"shift\":false,\"alt\":false\}\)$/);
@@ -1028,3 +1028,42 @@ async function createVoiceRuntime({ focused = true, hidden = false, contentEdita
     document,
   };
 }
+
+test('voice input: 千问引擎复用麦克风，在停录前改写临时字幕并保留已定稿文字', async () => {
+  const runtime = await createVoiceRuntime({ engine: 'qwen-realtime', loopback: true });
+  runtime.click(runtime.findById('gptplus-voice-input'));
+  await runtime.flush();
+  const { sessionId: id, status, loopback, engine } = runtime.api.context();
+  assert.equal(engine, 'qwen-realtime');
+  assert.equal(status, 'recording');
+  assert.equal(loopback, false);
+  assert.equal(runtime.api.streamCaption(id, '', '今天是'), true);
+  assert.equal(runtime.editor.value, '今天是');
+  assert.equal(runtime.api.streamAppend(id, '今天是个好日子。'), true);
+  runtime.api.streamCaption(id, '今天是个好日子。', '不完整字幕');
+  runtime.api.streamDone(id, { ok: false, error: '网络连接已断开' });
+  assert.equal(runtime.editor.value, '今天是个好日子。');
+  runtime.dispose();
+});
+
+test('voice input: 千问桥在录音中发送临时结果和原始定稿，不依赖本地模型或等待停录', async () => {
+  const env = createFakeBridgeEnv();
+  const realtime = { model: 'fun-asr-flash-8k-realtime', apiKey: 'fake' };
+  env.ctx.plugins.config = () => ({ engine: 'qwen-realtime', language: 'zh', realtime });
+  let cloud;
+  const bridge = startVoiceInputBridge({ cdpPort: 9222, ctx: env.ctx, cdpImpl: env.cdpImpl,
+    startStreamImpl: () => assert.fail('不应启动本地模型'), visibleIntervalMs: 5,
+    startQwenStreamImpl: (options) => { cloud = options; return env.startStreamImpl(options); },
+  });
+  try {
+    env.inbox.push({ type: 'stream', items: [{ type: 'start', id: 'q1' }, { type: 'pcm', id: 'q1', data: 'AAAAAA==' }] });
+    await waitUntil(() => env.pushed.length === 1);
+    assert.equal(cloud.apiKey, 'fake');
+    cloud.onEvent({ kind: 'partial', text: '你好' });
+    await waitUntil(() => env.evaluations.some((e) => e.includes('streamCaption("q1","","你好")')));
+    cloud.onEvent({ kind: 'final', text: '你好！' });
+    await waitUntil(() => env.evaluations.some((e) => e.includes('streamAppend("q1","你好！")')));
+    assert.equal(env.state.ended, 0);
+    assert.ok(env.evaluations.every((e) => !e.includes('fake')));
+  } finally { bridge.stop(); }
+});

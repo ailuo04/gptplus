@@ -1,5 +1,6 @@
 'use strict';
 const { normalizeImageBaseUrl } = require('./base-url.js');
+const { QWEN_SPEECH_BASE, QWEN_SPEECH_MODEL, getQwenSpeechSampleRate, resolveQwenSpeechUrl } = require('./qwen-speech.js');
 
 // The catalog describes capabilities and configuration boundaries. Plugin code stays
 // bundled with the app so the renderer never executes downloaded code.
@@ -91,7 +92,7 @@ const BUILTIN_PLUGIN_DEFINITIONS = Object.freeze([
     category: '效率',
     icon: 'mic',
     description: '在 ChatGPT 输入框的发送键旁加入麦克风按钮，把语音转成文字。',
-    detail: '默认在本机用 SenseVoice 预览、Qwen3-ASR 0.6B INT8 定稿，不弹出系统语音浮层；在 ChatGPT 输入框聚焦时按住 Alt 开始实时录音，按住期间持续录音，松开结束；也可在设置里自定义快捷键；边说话边预览并按停顿分句、补标点，鼠标长按和麦克风按钮仍可使用。点击麦克风、长按输入框空白处和长按快捷键均使用麦克风，单击开始后可点输入框空白处或麦克风结束，长按松开结束。也可以改用支持 /audio/transcriptions 的 OpenAI 兼容提供商（整段转写）。',
+    detail: '默认在本机用 SenseVoice 预览、Qwen3-ASR 0.6B INT8 定稿，不弹出系统语音浮层；在 ChatGPT 输入框聚焦时按住 Alt 开始实时录音，按住期间持续录音，松开结束；也可在设置里自定义快捷键；边说话边预览并按停顿分句、补标点，鼠标长按和麦克风按钮仍可使用。点击麦克风、长按输入框空白处和长按快捷键均使用麦克风，单击开始后可点输入框空白处或麦克风结束，长按松开结束。也可使用千问实时识别（录音期间上传音频并返回字幕），或改用支持 /audio/transcriptions 的 OpenAI 兼容提供商（整段转写）。',
     builtIn: true,
     defaultInstalled: true,
     defaultEnabled: true,
@@ -147,11 +148,22 @@ function normalizeVoiceHotkey(value) {
   return { code, ctrl, shift, alt };
 }
 
+function normalizeVoiceEngine(engine) {
+  return ['provider', 'system', 'qwen-realtime'].includes(engine) ? engine : 'local';
+}
+
 function normalizeVoiceConfig(raw) {
   const source = isPlainObject(raw) ? raw : {};
   const language = String(source.language || '').trim().toLowerCase();
+  const engine = normalizeVoiceEngine(source.engine);
+  const realtime = source.realtime;
   return {
-    engine: source.engine === 'provider' ? 'provider' : source.engine === 'system' ? 'system' : 'local',
+    engine,
+    ...(engine === 'qwen-realtime' || isPlainObject(realtime) ? { realtime: {
+      baseUrl: String(realtime?.baseUrl || '').trim().slice(0, 2048) || QWEN_SPEECH_BASE,
+      model: String(realtime?.model || '').trim().slice(0, 128) || QWEN_SPEECH_MODEL,
+      apiKey: String(realtime?.apiKey || '').trim().slice(0, 8192),
+    } } : {}),
     providerId: String(source.providerId || '').trim().slice(0, 128),
     model: String(source.model || 'whisper-1').trim().slice(0, 128) || 'whisper-1',
     language: /^[a-z]{2,3}(?:-[a-z]{2,4})?$/.test(language) ? language : '',
@@ -247,7 +259,9 @@ function publicPlugin(definition, state) {
     active: state.installed && state.enabled,
     config: definition.id === 'custom-imagegen'
       ? { baseUrl: state.config.baseUrl, model: state.config.model, preferDefault: state.config.preferDefault, resolution: state.config.resolution, aspectRatio: state.config.aspectRatio, quality: state.config.quality, background: state.config.background, hasKey: !!state.config.apiKey }
-      : deepCopy(state.config),
+      : definition.id === 'voice-input' && state.config.realtime
+        ? { ...state.config, realtime: { baseUrl: state.config.realtime.baseUrl, model: state.config.realtime.model, hasKey: !!state.config.realtime.apiKey } }
+        : deepCopy(state.config),
   };
 }
 
@@ -405,6 +419,21 @@ function createPluginManager({ store, definitions = BUILTIN_PLUGIN_DEFINITIONS }
       }), 'configure');
     }
     const current = readState(def.id);
+    if (def.id === 'voice-input') {
+      const draft = { ...current.config, ...rawConfig };
+      if (isPlainObject(current.config.realtime) || isPlainObject(rawConfig?.realtime)) {
+        draft.realtime = { ...current.config.realtime, ...rawConfig?.realtime,
+          apiKey: String(rawConfig?.realtime?.apiKey || '').trim() || current.config.realtime?.apiKey || '',
+        };
+      }
+      const config = normalizeVoiceConfig(draft);
+      if (config.engine === 'qwen-realtime') {
+        resolveQwenSpeechUrl(config.realtime.baseUrl);
+        getQwenSpeechSampleRate(config.realtime.model);
+        if (!config.realtime.apiKey || /[\r\n]/.test(config.realtime.apiKey)) throw new Error('请填写有效的千问 API Key');
+      }
+      return update(def.id, (state) => ({ ...state, config }), 'configure');
+    }
     const source = def.id === 'usage-statusline'
       ? {
         ...current.config,
@@ -456,6 +485,7 @@ module.exports = {
   normalizeImageConfig,
   DEFAULT_IMAGE_CONFIG,
   normalizeVoiceConfig,
+  normalizeVoiceEngine,
   normalizeVoiceHotkey,
   normalizeVoiceSpaceHoldMs,
   normalizeBalanceConfig,

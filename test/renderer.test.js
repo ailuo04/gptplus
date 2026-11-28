@@ -3682,6 +3682,25 @@ test('插件市场：展示三个内置插件并支持配置、启停与卸载�
     await new Promise((resolve) => setImmediate(resolve));
     assert.ok(calls.some((entry) => entry[0] === 'setPluginConfig' && entry[1].id === 'voice-input' && entry[1].config.engine === 'provider' && entry[1].config.providerId === 'p_demo0002' && entry[1].config.language === 'ja' && entry[1].config.spaceHoldMs === 2400 && entry[1].config.hotkey.code === 'KeyV' && entry[1].config.hotkey.ctrl === true && entry[1].config.hotkey.shift === true), '语音插件应保存提供商转写模式、长按时长和组合键');
 
+    voiceConfig.listeners.click[0]();
+    const cloudModal = calls.filter((entry) => entry[0] === 'openModal').at(-1)[1];
+    const cloudEngine = findNodes(cloudModal, (n) => String(n.className || '').split(/\s+/).includes('voice-engine-picker'))[0];
+    click(findNodes(cloudEngine, (n) => n.tagName === 'BUTTON' && n.attributes.role === 'combobox')[0]);
+    click(findNodes(cloudEngine, (n) => n.attributes.role === 'option' && n.textContent.includes('千问实时识别'))[0]);
+    const cloudModel = findNodes(cloudModal, (n) => n.tagName === 'SELECT' && n.attributes['aria-label'] === '实时转写模型')[0];
+    assert.ok(cloudModel.findTag('option').some((option) => option.value === 'paraformer-realtime-v2'));
+    cloudModel.value = 'paraformer-realtime-v2';
+    const cloudKey = findNodes(cloudModal, (n) => n.tagName === 'INPUT' && n.attributes['aria-label'] === '千问 API Key')[0];
+    assert.equal(cloudKey.attributes.type, 'password');
+    cloudKey.value = 'test-key';
+    click(cloudModal.findTag('button').find((n) => n.textContent.includes('保存配置')));
+    await new Promise((resolve) => setImmediate(resolve));
+    const cloudConfig = calls.filter((entry) => entry[0] === 'setPluginConfig').at(-1)[1].config;
+    assert.equal(cloudConfig.engine, 'qwen-realtime');
+    assert.deepEqual(cloudConfig.realtime, {
+      baseUrl: 'https://maas.qianwenaiapi.com/compatible-mode/v1', model: 'paraformer-realtime-v2', apiKey: 'test-key',
+    });
+
     const uninstall = root.findTag('button').find((node) => node.textContent.includes('卸载'));
     assert.ok(uninstall, '已安装插件应有卸载入口');
     await uninstall.listeners.click[0]();

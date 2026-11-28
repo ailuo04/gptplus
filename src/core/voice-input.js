@@ -16,7 +16,8 @@ const { stripEndpoint } = require('./base-url.js');
 const { createSystemProxyFetch } = require('./system-proxy.js');
 const { localSpeechStatus, prepareSpeechModel, startSpeechStream, transcribeLocal } = require('./local-speech.js');
 const { createSegmentComposer, joinClauses, needsSpace } = require('./speech-segmenter.js');
-const { normalizeVoiceHotkey, normalizeVoiceSpaceHoldMs } = require('./plugin-manager.js');
+const { normalizeVoiceEngine, normalizeVoiceHotkey, normalizeVoiceSpaceHoldMs } = require('./plugin-manager.js');
+const { startQwenSpeechStream } = require('./qwen-speech.js');
 const { createLoopbackCapture } = require('./voice-loopback.js');
 
 const DEFAULT_INJECT_TIMEOUT_MS = 30000;
@@ -40,7 +41,7 @@ function sleep(ms) {
 
 /**
  * 页面内运行时。这个函数会被 toString() 后注入 ChatGPT 页面，必须完全自包含。
- * @param {'local'|'system'|'provider'} engine
+ * @param {'local'|'system'|'provider'|'qwen-realtime'} engine
  * @param {number} readyWaitMs
  * @param {boolean} localReady
  * @param {string} language
@@ -52,15 +53,15 @@ function sleep(ms) {
 function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs, streaming, loopback, hotkey) {
   'use strict';
   var READY_WAIT_MS = Math.max(500, Number(readyWaitMs) || 15000);
-  var ENGINE = engine === 'provider' ? 'provider' : engine === 'system' ? 'system' : 'local';
+  var ENGINE = engine;
   var LOCAL_READY = localReady === true;
-  var STREAMING = streaming === true && ENGINE === 'local';
-  var LOOPBACK = loopback === true && STREAMING;
+  var STREAMING = streaming === true;
+  var LOOPBACK = loopback === true && ENGINE === 'local' && STREAMING;
   var ID = 'gptplus-voice-input';
   var WRAP_ID = 'gptplus-voice-input-wrap';
   var STYLE_ID = 'gptplus-voice-input-style';
   var EXT_ATTR = 'data-gptplus-voice-input';
-  var RUNTIME_KEY = 'gptplus-voice-input-v22';
+  var RUNTIME_KEY = 'gptplus-voice-input-v23:' + ENGINE;
   var MAX_RECORD_MS = 120000;
   var MAX_STREAM_MS = 600000;
   var PCM_CHUNK = 2048;
@@ -737,6 +738,7 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
       };
       state.recordMode = 'stream';
       state.startedAt = Date.now();
+      if (ENGINE === 'qwen-realtime') queueItem('start', { id: state.session.id });
       enterStreamRecording();
     } catch (error) {
       stopStream(media);
@@ -950,6 +952,10 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
         await startStreamRecording(attempt);
         return;
       } catch (error) {
+        if (ENGINE === 'qwen-realtime' && error?.streamUnsupported === true) {
+          fail(isZh() ? '当前系统不支持千问实时语音所需的音频采集' : 'Real-time audio capture is unavailable');
+          return;
+        }
         if (!error || error.streamUnsupported !== true) {
           fail((error && error.message) || (isZh() ? '语音输入失败' : 'Voice input failed'));
           return;
@@ -1817,7 +1823,9 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
           if (session.insertedText && result.notice) showToast(result.notice, 'ok');
           return true;
         }
-        rollbackSession(session);
+        if (ENGINE === 'qwen-realtime') {
+          if (session.preview) replaceDictation(session, session.insertedText, session.preview, '');
+        } else rollbackSession(session);
         fail((result && result.error) || (isZh() ? '识别失败' : 'Transcription failed'));
         return true;
       },
@@ -1929,10 +1937,10 @@ function voicePageRuntime(engine, readyWaitMs, localReady, language, spaceHoldMs
 
 function buildVoiceInputScript({ readyWaitMs, engine, localReady, language, spaceHoldMs, streaming, loopback, hotkey } = {}) {
   var wait = Math.max(500, Number(readyWaitMs) || SCRIPT_READY_WAIT_MS);
-  var mode = engine === 'provider' ? 'provider' : engine === 'system' ? 'system' : 'local';
+  var mode = normalizeVoiceEngine(engine);
   var hold = normalizeVoiceSpaceHoldMs(spaceHoldMs);
-  var live = streaming === true && mode === 'local';
-  var systemAudio = loopback === true && live;
+  var live = mode === 'qwen-realtime' || (streaming === true && mode === 'local');
+  var systemAudio = loopback === true && live && mode === 'local';
   var normalizedHotkey = normalizeVoiceHotkey(hotkey);
   return '(' + voicePageRuntime.toString() + ')(' + JSON.stringify(mode) + ', ' + wait + ', ' + JSON.stringify(localReady === true) + ', ' + JSON.stringify(String(language || '')) + ', ' + hold + ', ' + (live ? 'true' : 'false') + ', ' + (systemAudio ? 'true' : 'false') + ', ' + JSON.stringify(normalizedHotkey) + ')';
 }
@@ -1941,7 +1949,8 @@ function voiceConfig(ctx) {
   var config = ctx?.plugins?.config?.('voice-input');
   var source = config && typeof config === 'object' ? config : {};
   return {
-    engine: source.engine === 'provider' ? 'provider' : source.engine === 'system' ? 'system' : 'local',
+    engine: normalizeVoiceEngine(source.engine),
+    ...(source.engine === 'qwen-realtime' ? { realtime: source.realtime } : {}),
     providerId: String(source.providerId || '').trim().slice(0, 128),
     model: String(source.model || 'whisper-1').trim().slice(0, 128) || 'whisper-1',
     language: String(source.language || '').trim().toLowerCase(),
@@ -1951,8 +1960,8 @@ function voiceConfig(ctx) {
 }
 
 function buildScriptSources(config, localReady, loopback) {
-  var streaming = config.engine === 'local';
-  var systemAudio = loopback === true && streaming;
+  var streaming = config.engine === 'local' || config.engine === 'qwen-realtime';
+  var systemAudio = loopback === true && config.engine === 'local';
   return {
     add: buildVoiceInputScript({ readyWaitMs: SCRIPT_READY_WAIT_MS, engine: config.engine, localReady: localReady, language: config.language, spaceHoldMs: config.spaceHoldMs, streaming: streaming, loopback: systemAudio, hotkey: config.hotkey }),
     probe: buildVoiceInputScript({ readyWaitMs: PROBE_READY_WAIT_MS, engine: config.engine, localReady: localReady, language: config.language, spaceHoldMs: config.spaceHoldMs, streaming: streaming, loopback: systemAudio, hotkey: config.hotkey }),
@@ -1973,7 +1982,7 @@ async function ensurePageScript(page, scripts, prepared) {
 async function injectVoiceInput({ cdpPort, target = null, timeoutMs = DEFAULT_INJECT_TIMEOUT_MS, pause = sleep, engine, localReady = false, language = '', spaceHoldMs, loopback = false, hotkey } = {}) {
   var port = Number(cdpPort);
   if (!Number.isInteger(port) || port <= 0) throw new Error('ChatGPT 调试端口无效');
-  var config = { engine: engine === 'provider' ? 'provider' : engine === 'system' ? 'system' : 'local', language: language, spaceHoldMs: spaceHoldMs, hotkey: normalizeVoiceHotkey(hotkey) };
+  var config = { engine: normalizeVoiceEngine(engine), language: language, spaceHoldMs: spaceHoldMs, hotkey: normalizeVoiceHotkey(hotkey) };
   var scripts = buildScriptSources(config, localReady === true, loopback === true);
   var prepared = new Set();
   var deadline = Date.now() + Math.max(1000, Number(timeoutMs) || DEFAULT_INJECT_TIMEOUT_MS);
@@ -2162,12 +2171,13 @@ function takeVoiceEventExpression() {
   return "(() => { const voice = globalThis.__gptplusVoice; if (!voice) return { missing: true }; voice.touch?.(); const items = voice.takeOutbox?.(); if (items && items.length) return { type: 'stream', items }; const pending = voice.takePending?.(); if (pending) return { type: 'audio', pending }; const request = voice.takeRequest?.(); if (request) return { type: 'request', request }; const context = voice.context?.(); return { type: 'idle', context: context || null }; })()";
 }
 
-function startVoiceInputBridge({ cdpPort, ctx, log, visibleIntervalMs = VOICE_POLL_MS, hiddenIntervalMs = VOICE_HIDDEN_POLL_MS, startStreamImpl = startSpeechStream, loopbackImpl = createLoopbackCapture, loopbackEnabled = false, cdpImpl = null } = {}) {
+function startVoiceInputBridge({ cdpPort, ctx, log, visibleIntervalMs = VOICE_POLL_MS, hiddenIntervalMs = VOICE_HIDDEN_POLL_MS, startStreamImpl = startSpeechStream, startQwenStreamImpl = startQwenSpeechStream, loopbackImpl = createLoopbackCapture, loopbackEnabled = false, cdpImpl = null } = {}) {
   var port = Number(cdpPort);
   if (!Number.isInteger(port) || port <= 0) throw new Error('ChatGPT 调试端口无效');
   stopVoiceInputBridge();
   var cdp = cdpImpl || { listTargets: listTargets, pickMainTarget: pickMainTarget, evaluate: evaluate };
   var config = voiceConfig(ctx);
+  var cloud = config.engine === 'qwen-realtime';
   var localReady = config.engine === 'local' ? localSpeechStatus().ready : false;
   var scripts = buildScriptSources(config, localReady, loopbackEnabled === true && config.engine === 'local');
   var prepared = new Set();
@@ -2253,8 +2263,8 @@ function startVoiceInputBridge({ cdpPort, ctx, log, visibleIntervalMs = VOICE_PO
   }
 
   function updateCaption(session, partialText) {
-    var stable = session.composer.committed();
-    var pending = joinClauses(session.composer.preview(), partialText || '');
+    var stable = cloud ? session.committed : session.composer.committed();
+    var pending = cloud ? partialText || '' : joinClauses(session.composer.preview(), partialText || '');
     var tail = pending && needsSpace(stable, pending) ? ' ' + pending : pending;
     pushOp('streamCaption', session.id, [stable, tail]);
   }
@@ -2265,20 +2275,26 @@ function startVoiceInputBridge({ cdpPort, ctx, log, visibleIntervalMs = VOICE_PO
       updateCaption(session, event.text || '');
       return;
     }
-    if (event.kind === 'segment') {
+    if (cloud && event.kind === 'final') {
+      var append = (needsSpace(session.committed, event.text) ? ' ' : '') + event.text;
+      session.committed += append;
+      pushOp('streamAppend', session.id, [append]);
+      return;
+    }
+    if (!cloud && event.kind === 'segment') {
       var emitted = session.composer.push({ text: event.text, pauseMs: event.pauseMs, durationMs: event.durationMs, softCut: event.softCut });
       emitted.forEach(function (item) { pushOp('streamAppend', session.id, [item.append]); });
       updateCaption(session, '');
       return;
     }
     if (event.kind === 'done' || event.kind === 'boundary') {
-      session.composer.flush().forEach(function (item) { pushOp('streamAppend', session.id, [item.append]); });
+      if (!cloud) session.composer.flush().forEach(function (item) { pushOp('streamAppend', session.id, [item.append]); });
       if (event.kind === 'boundary') updateCaption(session, '');
       else finishLive(session, { ok: true });
       return;
     }
     if (event.kind === 'error') {
-      finishLive(session, { ok: false, error: event.error || '本地识别失败' });
+      finishLive(session, { ok: false, error: event.error || (cloud ? '千问实时识别失败' : '本地识别失败') });
     }
   }
 
@@ -2292,12 +2308,15 @@ function startVoiceInputBridge({ cdpPort, ctx, log, visibleIntervalMs = VOICE_PO
       buffer: [],
       pendingEnd: false,
       done: false,
-      composer: createSegmentComposer({ language: config.language }),
+      composer: cloud ? null : createSegmentComposer({ language: config.language }),
+      committed: '',
     };
     live = session;
     session.ready = Promise.resolve()
       .then(function () {
-        return startStreamImpl({ language: config.language, onEvent: function (event) { handleLiveEvent(session, event); } });
+        var onEvent = function (event) { handleLiveEvent(session, event); };
+        return cloud ? startQwenStreamImpl({ ...config.realtime, onEvent: onEvent })
+          : startStreamImpl({ language: config.language, onEvent: onEvent });
       })
       .then(function (stream) {
         if (session.done) {
@@ -2312,7 +2331,7 @@ function startVoiceInputBridge({ cdpPort, ctx, log, visibleIntervalMs = VOICE_PO
         return stream;
       })
       .catch(function (error) {
-        finishLive(session, { ok: false, error: (error && error.message) || '本地识别启动失败' });
+        finishLive(session, { ok: false, error: (error && error.message) || (cloud ? '千问实时识别启动失败' : '本地识别启动失败') });
       });
     return session;
   }
@@ -2326,9 +2345,10 @@ function startVoiceInputBridge({ cdpPort, ctx, log, visibleIntervalMs = VOICE_PO
         cancelLive(id);
         continue;
       }
+      if (cloud && item.type !== 'start' && (!live || live.id !== id)) continue;
       var session = ensureLive(id);
       if (session.done) continue;
-      if (item.type === 'loopback-start') {
+      if (item.type === 'loopback-start' && !cloud) {
         if (!session.loopback) startSessionLoopback(session);
       } else if (item.type === 'pcm') {
         var buffer;
@@ -2363,7 +2383,7 @@ function startVoiceInputBridge({ cdpPort, ctx, log, visibleIntervalMs = VOICE_PO
             delay = 600;
           } else if (event && event.type === 'stream' && Array.isArray(event.items)) {
             handleStreamItems(event.items);
-          } else if (event && event.type === 'audio' && event.pending && !busy) {
+          } else if (!cloud && event && event.type === 'audio' && event.pending && !busy) {
             busy = true;
             var pending = event.pending;
             try {
@@ -2383,7 +2403,7 @@ function startVoiceInputBridge({ cdpPort, ctx, log, visibleIntervalMs = VOICE_PO
               if (request.type === 'system-dictation') {
                 await pressWindowsVoiceTyping();
                 await cdp.evaluate(target, 'globalThis.__gptplusVoice?.complete?.(' + JSON.stringify(String(request.id)) + ', ' + JSON.stringify({ ok: true }) + ')', { timeoutMs: COMMAND_TIMEOUT_MS });
-              } else if (request.type === 'prepare-local') {
+              } else if (!cloud && request.type === 'prepare-local') {
                 var lastProgressAt = 0;
                 var lastProgressPercent = -1;
                 await prepareSpeechModel(function (progress) {

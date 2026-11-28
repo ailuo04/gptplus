@@ -464,7 +464,9 @@ function createStore({ configPath, secretStorage = null } = {}) {
     const hasPeerCredentials = disk.remoteSync.connections.some((connection) => connection.baseUrl || connection.authToken);
     const imageConfig = disk.plugins['custom-imagegen']?.config;
     const hasImageCredentials = !!(imageConfig?.apiKey || imageConfig?.baseUrl);
+    const realtime = disk.plugins['voice-input']?.config?.realtime;
     if (!secretStorage) {
+      if (realtime?.secret || realtime?.apiKey) throw secureStorageError('系统安全存储不可用，无法保存实时语音凭据');
       if (hasImageCredentials) throw secureStorageError('系统安全存储不可用，无法保存生图凭据');
       if (hasPeerCredentials) throw secureStorageError('系统安全存储不可用，无法保存远端连接');
       return disk;
@@ -474,6 +476,10 @@ function createStore({ configPath, secretStorage = null } = {}) {
       imageConfig.secret = encryptProviderSecrets({ ...imageConfig, headers: {} });
       delete imageConfig.baseUrl;
       delete imageConfig.apiKey;
+    }
+    if (realtime?.apiKey) {
+      realtime.secret = encryptProviderSecrets({ apiKey: realtime.apiKey });
+      delete realtime.apiKey;
     }
     for (const provider of disk.providers) {
       provider.secret = encryptProviderSecrets(provider);
@@ -539,6 +545,8 @@ function createStore({ configPath, secretStorage = null } = {}) {
       const connections = raw.remoteSync && Array.isArray(raw.remoteSync.connections) ? raw.remoteSync.connections : [];
       const hasPeerCredentials = connections.some((connection) => isPlainObject(connection)
         && (Object.prototype.hasOwnProperty.call(connection, 'secret') || connection.baseUrl || connection.authToken));
+      const realtime = raw.plugins?.['voice-input']?.config?.realtime;
+      if (realtime?.secret || realtime?.apiKey) throw secureStorageError('需要系统安全存储才能读取实时语音凭据');
       const image = raw.plugins?.['custom-imagegen']?.config;
       if (image?.secret || image?.apiKey || image?.baseUrl) throw secureStorageError('需要系统安全存储才能读取生图凭据');
       if (hasEncryptedProvider || hasPeerCredentials) throw secureStorageError('需要系统安全存储才能读取加密凭据');
@@ -552,6 +560,15 @@ function createStore({ configPath, secretStorage = null } = {}) {
       config.plugins['custom-imagegen'].config = decoded.provider;
       delete config.plugins['custom-imagegen'].config.headers;
       migrated = migrated || decoded.migrated;
+    }
+    const realtime = config.plugins?.['voice-input']?.config?.realtime;
+    if (realtime?.secret) {
+      const { provider } = decodeProviderSecrets({ secret: realtime.secret });
+      migrated = migrated || !!realtime.apiKey;
+      realtime.apiKey = provider.apiKey;
+      delete realtime.secret;
+    } else if (realtime?.apiKey) {
+      migrated = true;
     }
     if (Array.isArray(config.providers)) {
       config.providers = config.providers.map((provider) => {
